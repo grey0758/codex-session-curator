@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex Session Curator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grey
+WorkingDirectory=/home/grey/data/apps/codex-session-curator
+Environment=HOST=127.0.0.1
+Environment=PORT=54177
+Environment=CODEX_HOME=/home/grey/.codex
+Environment=CURATOR_EVALUATION_CONCURRENCY=8
+EnvironmentFile=-/home/grey/.config/codex-session-curator/auth.env
+EnvironmentFile=-/home/grey/.config/codex-session-curator/llm.env
+ExecStart=/usr/bin/npm run server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel for Codex Session Curator
+After=network-online.target codex-session-curator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --protocol http2 --no-autoupdate run --token-file /home/grey/data/apps/codex-session-curator/.cloudflared.token
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
