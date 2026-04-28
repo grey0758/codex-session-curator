@@ -216,10 +216,14 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<number | null>(null);
+  const terminalCleanupRef = useRef<(() => void) | null>(null);
   const [connected, setConnected] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
 
   const disconnect = useCallback(() => {
+    terminalCleanupRef.current?.();
+    terminalCleanupRef.current = null;
     socketRef.current?.close();
     socketRef.current = null;
     resizeObserverRef.current?.disconnect();
@@ -235,8 +239,46 @@ function TerminalConsole({ session }: { session: CodexSession }) {
 
   useEffect(() => disconnect, [disconnect, session.id]);
 
+  const pasteIntoTerminal = useCallback(async () => {
+    const socket = socketRef.current;
+    const terminal = terminalRef.current;
+    if (!socket || !terminal || socket.readyState !== WebSocket.OPEN) {
+      setTerminalNotice('终端未连接');
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) {
+        setTerminalNotice('剪贴板为空');
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'input', data: text }));
+      terminal.focus();
+      setTerminalNotice('已粘贴到终端');
+    } catch {
+      setTerminalNotice('浏览器阻止读取剪贴板，请使用 Ctrl+V 或切换到 HTTPS 隧道');
+    }
+  }, []);
+
+  const copyTerminalSelection = useCallback(async () => {
+    const terminal = terminalRef.current;
+    if (!terminal?.hasSelection()) {
+      setTerminalNotice('没有选中的终端文本');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(terminal.getSelection());
+      terminal.clearSelection();
+      terminal.focus();
+      setTerminalNotice('已复制终端选中文本');
+    } catch {
+      setTerminalNotice('浏览器阻止写入剪贴板');
+    }
+  }, []);
+
   const connect = useCallback(() => {
     if (!containerRef.current || socketRef.current) return;
+    setTerminalNotice(null);
     const terminal = new XTerm({
       cursorBlink: true,
       convertEol: true,
@@ -259,9 +301,46 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     socketRef.current = socket;
     terminalRef.current = terminal;
 
-    terminal.onData((data) => {
+    const container = containerRef.current;
+    const writeInput = (data: string) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }));
+    };
+
+    terminal.onData((data) => {
+      writeInput(data);
     });
+
+    const handlePaste = (event: ClipboardEvent) => {
+      const text = event.clipboardData?.getData('text/plain');
+      if (!text) return;
+      event.preventDefault();
+      writeInput(text);
+      terminal.focus();
+      setTerminalNotice('已粘贴到终端');
+    };
+    const handleContextMenu = (event: MouseEvent) => {
+      if (terminal.hasSelection()) {
+        event.preventDefault();
+        void navigator.clipboard
+          .writeText(terminal.getSelection())
+          .then(() => {
+            terminal.clearSelection();
+            terminal.focus();
+            setTerminalNotice('已复制终端选中文本');
+          })
+          .catch(() => setTerminalNotice('浏览器阻止写入剪贴板'));
+        return;
+      }
+      if (!navigator.clipboard?.readText || !window.isSecureContext) return;
+      event.preventDefault();
+      void pasteIntoTerminal();
+    };
+    container.addEventListener('paste', handlePaste);
+    container.addEventListener('contextmenu', handleContextMenu);
+    terminalCleanupRef.current = () => {
+      container.removeEventListener('paste', handlePaste);
+      container.removeEventListener('contextmenu', handleContextMenu);
+    };
 
     let lastResize = '';
     const sendResize = (cols: number, rows: number) => {
@@ -310,7 +389,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
       terminal.writeln('\r\n[error] WebSocket 连接失败');
       setConnected(false);
     };
-  }, [session]);
+  }, [pasteIntoTerminal, session]);
 
   return (
     <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}`}>
@@ -325,6 +404,12 @@ function TerminalConsole({ session }: { session: CodexSession }) {
         >
           {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
         </button>
+        <button type="button" className="primary-button" onClick={() => void copyTerminalSelection()} disabled={!connected}>
+          复制选中
+        </button>
+        <button type="button" className="primary-button" onClick={() => void pasteIntoTerminal()} disabled={!connected}>
+          粘贴
+        </button>
         <button type="button" className="primary-button" onClick={connect} disabled={connected}>
           打开终端
         </button>
@@ -332,6 +417,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
           断开
         </button>
       </div>
+      {terminalNotice ? <div className="terminal-notice">{terminalNotice}</div> : null}
       <div className="terminal-surface" ref={containerRef} />
     </div>
   );
@@ -352,6 +438,7 @@ function App() {
   const [migrationTargets, setMigrationTargets] = useState<Record<string, string>>({});
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [copiedResumeId, setCopiedResumeId] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
@@ -435,6 +522,19 @@ function App() {
       '')
     : '';
   const migrationAlreadyInPlace = selected ? normalizePath(selected.cwd) === normalizePath(migrationTarget) : false;
+
+  const copyResumeCommand = useCallback(async (session: CodexSession) => {
+    try {
+      await navigator.clipboard.writeText(session.resumeCommand);
+      setCopiedResumeId(session.id);
+      setActionMessage(`已复制恢复命令：${session.resumeCommand}`);
+      window.setTimeout(() => {
+        setCopiedResumeId((current) => (current === session.id ? null : current));
+      }, 1800);
+    } catch {
+      setActionMessage('复制失败：浏览器阻止访问剪贴板');
+    }
+  }, []);
 
   const loadHistory = useCallback(async (session: CodexSession, before: number | null = null) => {
     setHistoryLoading(true);
@@ -802,11 +902,12 @@ function App() {
                 <button
                   type="button"
                   className="icon-button"
-                  title="复制恢复命令"
-                  onClick={() => void navigator.clipboard.writeText(selected.resumeCommand)}
+                  title={copiedResumeId === selected.id ? '已复制' : '复制恢复命令'}
+                  onClick={() => void copyResumeCommand(selected)}
                 >
                   <Copy size={17} />
                 </button>
+                {copiedResumeId === selected.id ? <span className="copy-feedback">已复制</span> : null}
               </div>
 
               <div className="action-row">

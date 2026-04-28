@@ -513,6 +513,17 @@
   color: #d1d5db;
 }
 
+.terminal-notice {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-top: 1px solid #1f2937;
+  background: #111827;
+  color: #a7f3d0;
+  font-size: 12px;
+}
+
 .terminal-surface {
   height: clamp(620px, 78vh, 980px);
   padding: 8px;
@@ -567,6 +578,13 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f8fafc;
+}
+
+.copy-feedback {
+  color: #047857;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .key-block .icon-button {
