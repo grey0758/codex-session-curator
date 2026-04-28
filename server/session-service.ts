@@ -159,6 +159,7 @@ export class SessionService {
 
   getMeta() {
     return {
+      machineId: getMachineId(),
       codexHome: this.codexHome,
       sessionsRoot: this.sessionsRoot,
       recycleRoot: getRecycleRoot(),

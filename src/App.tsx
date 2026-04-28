@@ -81,6 +81,7 @@ interface ApiPayload {
     recycleRoot: string;
     recycleRetentionDays: number;
     deleteMode: string;
+    remoteAgents?: Array<{ id: string; baseUrl: string }>;
   };
   sessions: CodexSession[];
   total: number;
@@ -211,11 +212,14 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<XTerm | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const [connected, setConnected] = useState(false);
 
   const disconnect = useCallback(() => {
     socketRef.current?.close();
     socketRef.current = null;
+    resizeObserverRef.current?.disconnect();
+    resizeObserverRef.current = null;
     terminalRef.current?.dispose();
     terminalRef.current = null;
     setConnected(false);
@@ -228,16 +232,23 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     const terminal = new XTerm({
       cursorBlink: true,
       convertEol: true,
+      scrollback: 5000,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-      fontSize: 13,
+      fontSize: 14,
+      lineHeight: 1.25,
       theme: { background: '#0b1220', foreground: '#d6deeb' },
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(containerRef.current);
     fit.fit();
+    window.setTimeout(() => fit.fit(), 50);
+    const resizeObserver = new ResizeObserver(() => fit.fit());
+    resizeObserver.observe(containerRef.current);
+    resizeObserverRef.current = resizeObserver;
     terminal.focus();
     terminal.writeln(`连接 ${session.id}`);
+    terminal.writeln(`machine: ${session.machineId}`);
     terminal.writeln(`cwd: ${session.cwd ?? 'unknown'}`);
 
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -811,7 +822,7 @@ function App() {
               </div>
             </section>
 
-            <section className="primary-panel">
+            <section className="primary-panel terminal-card">
               <h3>继续这次对话</h3>
               <TerminalConsole session={selected} />
             </section>

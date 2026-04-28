@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath } from './file-ops.js';
+import { fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
@@ -18,6 +19,7 @@ const app = Fastify({ logger: true });
 const codexHome = getCodexHome();
 const store = new CuratorStore(getStatePath(codexHome));
 const service = new SessionService(store);
+const remoteAgents = getRemoteAgents();
 
 const keepSchema = z.object({ kept: z.boolean() });
 const titleSchema = z.object({ title: z.string().max(120) });
@@ -92,7 +94,11 @@ app.get('/api/sessions', async (request) => {
       refresh: z.enum(['0', '1', 'true', 'false']).optional(),
     })
     .parse(request.query);
-  const sessions = await service.listSessions({ refreshWorkflow: query.refresh === '1' || query.refresh === 'true' });
+  const localSessions = await service.listSessions({ refreshWorkflow: query.refresh === '1' || query.refresh === 'true' });
+  const remoteSessions = query.refresh === '1' || query.refresh === 'true'
+    ? []
+    : (await Promise.all(remoteAgents.map((agent) => fetchAgentSessions(agent)))).flat();
+  const sessions = [...localSessions, ...remoteSessions];
   const filtered = sessions.filter((session) => {
     const matchesRecommendation =
       !query.recommendation ||
@@ -119,7 +125,7 @@ app.get('/api/sessions', async (request) => {
   });
 
   return {
-    meta: service.getMeta(),
+    meta: { ...service.getMeta(), remoteAgents: remoteAgents.map((agent) => ({ id: agent.id, baseUrl: agent.baseUrl })) },
     sessions: filtered,
     total: sessions.length,
   };
@@ -143,6 +149,16 @@ app.get('/api/sessions/:id/history', async (request, reply) => {
   try {
     return await service.getSessionHistory(params.id, { limit: query.limit, beforeIndex: query.before ?? null });
   } catch (error) {
+    for (const agent of remoteAgents) {
+      try {
+        const path = `/api/sessions/${encodeURIComponent(params.id)}/history?limit=${query.limit ?? 80}${
+          query.before === undefined ? '' : `&before=${query.before}`
+        }`;
+        return await fetchAgentJson(agent, path);
+      } catch {
+        // Try the next agent.
+      }
+    }
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'History failed' });
   }
 });
@@ -151,6 +167,31 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
   const params = sessionIdSchema.parse(request.params);
   const session = await service.getSession(params.id);
   if (!session) {
+    for (const candidate of remoteAgents) {
+      try {
+        const RemoteWebSocket = globalThis.WebSocket as unknown as new (url: string) => {
+          send(data: string): void;
+          close(): void;
+          addEventListener(type: string, listener: (event: { data?: unknown }) => void): void;
+        };
+        const remoteSocket = new RemoteWebSocket(wsUrlForAgent(candidate, `/api/sessions/${encodeURIComponent(params.id)}/terminal`));
+        remoteSocket.addEventListener('message', (event) => {
+          if (socket.readyState === 1) socket.send(String(event.data ?? ''));
+        });
+        remoteSocket.addEventListener('open', () => {
+          socket.on('message', (raw: { toString(): string }) => remoteSocket.send(raw.toString()));
+          socket.on('close', () => remoteSocket.close());
+          socket.on('error', () => remoteSocket.close());
+        });
+        remoteSocket.addEventListener('error', () => {
+          if (socket.readyState === 1) socket.send(JSON.stringify({ type: 'error', data: `Remote terminal failed: ${candidate.id}` }));
+        });
+        remoteSocket.addEventListener('close', () => socket.close());
+        return;
+      } catch {
+        // Try next remote agent.
+      }
+    }
     socket.send(JSON.stringify({ type: 'error', data: 'Session not found' }));
     socket.close();
     return;

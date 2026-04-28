@@ -355,6 +355,10 @@
   padding: 24px;
 }
 
+.terminal-card {
+  grid-column: 1 / -1;
+}
+
 .secondary-panel,
 .facts-panel,
 .metrics-panel {
@@ -493,7 +497,7 @@
 }
 
 .terminal-surface {
-  height: 380px;
+  height: clamp(520px, 72vh, 820px);
   padding: 8px;
 }
 
