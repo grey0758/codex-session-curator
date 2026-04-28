@@ -215,6 +215,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   const terminalRef = useRef<XTerm | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const resizeTimerRef = useRef<number | null>(null);
   const [connected, setConnected] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
 
@@ -223,6 +224,10 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     socketRef.current = null;
     resizeObserverRef.current?.disconnect();
     resizeObserverRef.current = null;
+    if (resizeTimerRef.current !== null) {
+      window.clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = null;
+    }
     terminalRef.current?.dispose();
     terminalRef.current = null;
     setConnected(false);
@@ -257,26 +262,38 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     terminal.onData((data) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }));
     });
-    terminal.onResize(({ cols, rows }) => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resize', cols, rows }));
-    });
 
-    const sendResize = () => {
-      fit.fit();
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols || 120, rows: terminal.rows || 40 }));
-      }
+    let lastResize = '';
+    const sendResize = (cols: number, rows: number) => {
+      const resize = `${cols}x${rows}`;
+      if (resize === lastResize || socket.readyState !== WebSocket.OPEN) return;
+      lastResize = resize;
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resize', cols, rows }));
     };
-    window.setTimeout(sendResize, 0);
-    window.setTimeout(sendResize, 80);
-    const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(sendResize));
+    const queueResize = (cols: number, rows: number) => {
+      if (resizeTimerRef.current !== null) window.clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = window.setTimeout(() => {
+        resizeTimerRef.current = null;
+        sendResize(cols, rows);
+      }, 120);
+    };
+    terminal.onResize(({ cols, rows }) => queueResize(cols, rows));
+
+    const fitAndQueueResize = () => {
+      fit.fit();
+      queueResize(terminal.cols || 120, terminal.rows || 40);
+    };
+    window.setTimeout(fitAndQueueResize, 0);
+    window.setTimeout(fitAndQueueResize, 120);
+    const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fitAndQueueResize));
     resizeObserver.observe(containerRef.current);
     resizeObserverRef.current = resizeObserver;
 
     socket.onopen = () => {
       setConnected(true);
       terminal.writeln('WebSocket 已连接，启动 codex resume...');
-      sendResize();
+      fit.fit();
+      sendResize(terminal.cols || 120, terminal.rows || 40);
     };
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data as string) as TerminalEvent;
@@ -339,6 +356,7 @@ function App() {
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
 
   const loadSessions = useCallback(async (refreshWorkflow = false) => {
     setLoading(true);
@@ -426,6 +444,7 @@ function App() {
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/history?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = (await response.json()) as HistoryPayload;
+      setHistoryLoadedSessionId(session.id);
       setHistoryMessages((current) => (before === null ? payload.messages : [...payload.messages, ...current]));
       setHistoryBefore(payload.nextBefore);
       setHistoryHasMore(payload.hasMore);
@@ -435,19 +454,14 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!selected || activeTab === 'recycle') {
-      const handle = window.setTimeout(() => {
-        setHistoryMessages([]);
-        setHistoryBefore(null);
-        setHistoryHasMore(false);
-      }, 0);
-      return () => window.clearTimeout(handle);
-    }
     const handle = window.setTimeout(() => {
-      void loadHistory(selected);
+      setHistoryMessages([]);
+      setHistoryBefore(null);
+      setHistoryHasMore(false);
+      setHistoryLoadedSessionId(null);
     }, 0);
     return () => window.clearTimeout(handle);
-  }, [activeTab, loadHistory, selected]);
+  }, [activeTab, selected?.id]);
 
   const stats = useMemo(() => {
     return allSessions
@@ -828,7 +842,15 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={!historyHasMore || historyLoading || historyBefore === null}
+                  disabled={historyLoading || historyLoadedSessionId === selected.id}
+                  onClick={() => void loadHistory(selected)}
+                >
+                  {historyLoadedSessionId === selected.id ? '已加载最近记录' : '加载最近记录'}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={historyLoadedSessionId !== selected.id || !historyHasMore || historyLoading || historyBefore === null}
                   onClick={() => void loadHistory(selected, historyBefore)}
                 >
                   更早记录
@@ -841,7 +863,9 @@ function App() {
                     <p>{message.text}</p>
                   </div>
                 ))}
-                {!historyMessages.length ? <div className="empty compact">暂无可显示的历史</div> : null}
+                {!historyMessages.length ? (
+                  <div className="empty compact">{historyLoading ? '正在加载会话历史...' : '点击“加载最近记录”后查看历史'}</div>
+                ) : null}
               </div>
             </section>
 

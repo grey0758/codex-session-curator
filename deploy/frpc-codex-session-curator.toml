@@ -1,0 +1,15 @@
+serverAddr = "frp.xiannai.me"
+serverPort = 1210
+user = "qobBi3H1Cggw"
+loginFailExit = false
+
+# TCP has the lowest latency for the web terminal. If the path is throttled,
+# switch this to websocket and restart frpc-codex-session-curator.service.
+# transport.protocol = "websocket"
+
+[[proxies]]
+type = "tcp"
+name = "a1D2WBBfFvU6"
+localIP = "127.0.0.1"
+localPort = 54177
+remotePort = 48088

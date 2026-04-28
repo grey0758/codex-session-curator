@@ -1,0 +1,13 @@
+[Unit]
+Description=frpc tunnel for Codex Session Curator
+After=network-online.target codex-session-curator.service
+Wants=codex-session-curator.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c %h/.config/frp/frpc-codex-session-curator.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
