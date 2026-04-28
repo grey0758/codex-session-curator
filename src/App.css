@@ -480,6 +480,15 @@
   background: #0b1220;
 }
 
+.terminal-panel.fullscreen {
+  position: fixed;
+  inset: 18px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.34);
+}
+
 .terminal-toolbar {
   min-height: 44px;
   display: flex;
@@ -496,9 +505,23 @@
   font-size: 12px;
 }
 
+.terminal-icon-button {
+  width: 34px;
+  height: 34px;
+  border-color: #374151;
+  background: #172033;
+  color: #d1d5db;
+}
+
 .terminal-surface {
-  height: clamp(520px, 72vh, 820px);
+  height: clamp(620px, 78vh, 980px);
   padding: 8px;
+}
+
+.terminal-panel.fullscreen .terminal-surface {
+  flex: 1;
+  height: auto;
+  min-height: 0;
 }
 
 .terminal-surface .xterm {

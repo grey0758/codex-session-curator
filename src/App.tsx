@@ -11,6 +11,8 @@ import {
   FolderOpen,
   KeyRound,
   Loader2,
+  Maximize2,
+  Minimize2,
   RefreshCw,
   Search,
   Server,
@@ -121,7 +123,7 @@ interface TerminalEvent {
   type: 'ready' | 'output' | 'exit' | 'error';
   data?: string;
   code?: number | null;
-  signal?: string | null;
+  signal?: string | number | null;
 }
 
 const tabs: Array<{ id: TabId; label: string }> = [
@@ -214,6 +216,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const [connected, setConnected] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
 
   const disconnect = useCallback(() => {
     socketRef.current?.close();
@@ -241,11 +244,6 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(containerRef.current);
-    fit.fit();
-    window.setTimeout(() => fit.fit(), 50);
-    const resizeObserver = new ResizeObserver(() => fit.fit());
-    resizeObserver.observe(containerRef.current);
-    resizeObserverRef.current = resizeObserver;
     terminal.focus();
     terminal.writeln(`连接 ${session.id}`);
     terminal.writeln(`machine: ${session.machineId}`);
@@ -259,10 +257,26 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     terminal.onData((data) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }));
     });
+    terminal.onResize(({ cols, rows }) => {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resize', cols, rows }));
+    });
+
+    const sendResize = () => {
+      fit.fit();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols || 120, rows: terminal.rows || 40 }));
+      }
+    };
+    window.setTimeout(sendResize, 0);
+    window.setTimeout(sendResize, 80);
+    const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(sendResize));
+    resizeObserver.observe(containerRef.current);
+    resizeObserverRef.current = resizeObserver;
 
     socket.onopen = () => {
       setConnected(true);
       terminal.writeln('WebSocket 已连接，启动 codex resume...');
+      sendResize();
     };
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data as string) as TerminalEvent;
@@ -282,9 +296,18 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   }, [session]);
 
   return (
-    <div className="terminal-panel">
+    <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}`}>
       <div className="terminal-toolbar">
         <span>客户端终端代理</span>
+        <button
+          type="button"
+          className="icon-button terminal-icon-button"
+          onClick={() => setFullscreen((value) => !value)}
+          title={fullscreen ? '退出全屏' : '全屏'}
+          aria-label={fullscreen ? '退出全屏' : '全屏'}
+        >
+          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        </button>
         <button type="button" className="primary-button" onClick={connect} disabled={connected}>
           打开终端
         </button>
