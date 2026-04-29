@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath } from './file-ops.js';
-import { fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
+import { deleteAgentSession, fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
@@ -25,7 +25,23 @@ const keepSchema = z.object({ kept: z.boolean() });
 const titleSchema = z.object({ title: z.string().max(120) });
 const migrateSchema = z.object({ targetProjectDir: z.string().min(1).max(1000) });
 const confirmSchema = z.object({ confirm: z.literal(true) });
+const bulkDeleteSchema = z.object({ confirm: z.literal(true), ids: z.array(z.string().min(1).max(160)).min(1).max(200) });
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
+
+async function deleteSessionById(id: string) {
+  try {
+    return await service.deleteSession(id);
+  } catch (localError) {
+    for (const agent of remoteAgents) {
+      try {
+        return await deleteAgentSession(agent, id);
+      } catch {
+        // Try the next remote agent.
+      }
+    }
+    throw localError;
+  }
+}
 
 await service.cleanupRecycleBin();
 setInterval(
@@ -247,7 +263,7 @@ app.delete('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   confirmSchema.parse(request.body);
   try {
-    return await service.deleteSession(params.id);
+    return await deleteSessionById(params.id);
   } catch (error) {
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Delete failed' });
   }
@@ -261,6 +277,24 @@ app.post('/api/sessions/prune', async (request) => {
 app.post('/api/sessions/prune-non-kept', async (request) => {
   confirmSchema.parse(request.body);
   return service.pruneNonKept();
+});
+
+app.post('/api/sessions/bulk-delete', async (request) => {
+  const body = bulkDeleteSchema.parse(request.body);
+  const results = [];
+  for (const id of body.ids) {
+    try {
+      const result = await deleteSessionById(id);
+      results.push({ id, ok: true, result });
+    } catch (error) {
+      results.push({ id, ok: false, error: error instanceof Error ? error.message : 'Delete failed' });
+    }
+  }
+  return {
+    deleted: results.filter((result) => result.ok).length,
+    failed: results.filter((result) => !result.ok).length,
+    results,
+  };
 });
 
 const distPath = join(__dirname, '..', 'dist');

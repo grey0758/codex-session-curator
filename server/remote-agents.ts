@@ -13,11 +13,11 @@ function timeoutMs(envName: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-async function fetchWithTimeout(url: string | URL, timeout: number): Promise<Response> {
+async function fetchWithTimeout(url: string | URL, timeout: number, init: RequestInit = {}): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    return await fetch(url, { signal: controller.signal });
+    return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -63,6 +63,20 @@ export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promi
   const response = await fetchWithTimeout(
     new URL(path, `${agent.baseUrl}/`),
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
+  );
+  if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
+  return (await response.json()) as T;
+}
+
+export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
+  const response = await fetchWithTimeout(
+    new URL(`/api/sessions/${encodeURIComponent(sessionId)}`, `${agent.baseUrl}/`),
+    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+    {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    }
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
   return (await response.json()) as T;

@@ -20,6 +20,7 @@ import {
   Sparkles,
   Terminal as TerminalIcon,
   Trash2,
+  X,
 } from 'lucide-react';
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
@@ -210,9 +211,10 @@ function metricLabel(value: number, label: string) {
   );
 }
 
-function TerminalConsole({ session }: { session: CodexSession }) {
+function TerminalConsole({ session, active, onClose }: { session: CodexSession; active: boolean; onClose: () => void }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<XTerm | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<number | null>(null);
@@ -234,10 +236,20 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     }
     terminalRef.current?.dispose();
     terminalRef.current = null;
+    fitRef.current = null;
     setConnected(false);
   }, []);
 
-  useEffect(() => disconnect, [disconnect, session.id]);
+  useEffect(() => disconnect, [disconnect]);
+
+  useEffect(() => {
+    if (!active) return;
+    const handle = window.setTimeout(() => {
+      fitRef.current?.fit();
+      terminalRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [active]);
 
   const pasteIntoTerminal = useCallback(async () => {
     const socket = socketRef.current;
@@ -290,6 +302,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
+    fitRef.current = fit;
     terminal.open(containerRef.current);
     terminal.focus();
     terminal.writeln(`连接 ${session.id}`);
@@ -320,26 +333,40 @@ function TerminalConsole({ session }: { session: CodexSession }) {
     };
     const handleContextMenu = (event: MouseEvent) => {
       if (terminal.hasSelection()) {
+        if (!navigator.clipboard?.writeText || !window.isSecureContext) {
+          terminal.focus();
+          setTerminalNotice('已选中文本，可使用 Ctrl+C 或浏览器右键菜单复制');
+          return;
+        }
         event.preventDefault();
-        void navigator.clipboard
-          .writeText(terminal.getSelection())
-          .then(() => {
-            terminal.clearSelection();
-            terminal.focus();
-            setTerminalNotice('已复制终端选中文本');
-          })
-          .catch(() => setTerminalNotice('浏览器阻止写入剪贴板'));
+        void navigator.clipboard.writeText(terminal.getSelection()).then(() => {
+          terminal.clearSelection();
+          terminal.focus();
+          setTerminalNotice('已复制终端选中文本');
+        });
         return;
       }
-      if (!navigator.clipboard?.readText || !window.isSecureContext) return;
+      terminal.focus();
+      if (!navigator.clipboard?.readText || !window.isSecureContext) {
+        setTerminalNotice('HTTP 环境无法直接读取剪贴板，请用 Ctrl+V 或右键菜单粘贴');
+        return;
+      }
       event.preventDefault();
       void pasteIntoTerminal();
     };
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
+      terminal.scrollLines(event.deltaY > 0 ? lines : -lines);
+    };
     container.addEventListener('paste', handlePaste);
     container.addEventListener('contextmenu', handleContextMenu);
+    container.addEventListener('wheel', handleWheel, { capture: true, passive: false });
     terminalCleanupRef.current = () => {
       container.removeEventListener('paste', handlePaste);
       container.removeEventListener('contextmenu', handleContextMenu);
+      container.removeEventListener('wheel', handleWheel, true);
     };
 
     let lastResize = '';
@@ -392,7 +419,7 @@ function TerminalConsole({ session }: { session: CodexSession }) {
   }, [pasteIntoTerminal, session]);
 
   return (
-    <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}`}>
+    <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}${active ? '' : ' inactive'}`}>
       <div className="terminal-toolbar">
         <span>客户端终端代理</span>
         <button
@@ -415,6 +442,9 @@ function TerminalConsole({ session }: { session: CodexSession }) {
         </button>
         <button type="button" className="danger-button" onClick={disconnect} disabled={!connected}>
           断开
+        </button>
+        <button type="button" className="icon-button terminal-icon-button" onClick={onClose} title="关闭终端标签" aria-label="关闭终端标签">
+          <X size={16} />
         </button>
       </div>
       {terminalNotice ? <div className="terminal-notice">{terminalNotice}</div> : null}
@@ -439,6 +469,9 @@ function App() {
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [copiedResumeId, setCopiedResumeId] = useState<string | null>(null);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
+  const [openedTerminalIds, setOpenedTerminalIds] = useState<string[]>([]);
+  const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
@@ -512,6 +545,21 @@ function App() {
     () => visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0] ?? null,
     [selectedId, visibleSessions]
   );
+  const visibleSessionIds = useMemo(() => visibleSessions.map((session) => session.id), [visibleSessions]);
+  const selectedIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
+  const selectedVisibleCount = useMemo(
+    () => visibleSessionIds.filter((id) => selectedIdSet.has(id)).length,
+    [selectedIdSet, visibleSessionIds]
+  );
+  const allVisibleSelected = visibleSessionIds.length > 0 && selectedVisibleCount === visibleSessionIds.length;
+  const openedTerminalSessions = useMemo(
+    () =>
+      openedTerminalIds
+        .map((id) => allSessions.find((session) => session.id === id))
+        .filter((session): session is CodexSession => Boolean(session)),
+    [allSessions, openedTerminalIds]
+  );
+  const activeTerminalSession = openedTerminalSessions.find((session) => session.id === activeTerminalId) ?? openedTerminalSessions[0] ?? null;
 
   const titleDraft = selected ? (titleDrafts[selected.id] ?? selected.customTitle ?? selected.title) : '';
   const migrationTarget = selected
@@ -522,6 +570,35 @@ function App() {
       '')
     : '';
   const migrationAlreadyInPlace = selected ? normalizePath(selected.cwd) === normalizePath(migrationTarget) : false;
+
+  const toggleSessionSelection = useCallback((id: string) => {
+    setSelectedSessionIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }, []);
+
+  const toggleVisibleSelection = useCallback(() => {
+    setSelectedSessionIds((current) => {
+      const currentSet = new Set(current);
+      const shouldSelect = !visibleSessionIds.every((id) => currentSet.has(id));
+      for (const id of visibleSessionIds) {
+        if (shouldSelect) currentSet.add(id);
+        else currentSet.delete(id);
+      }
+      return [...currentSet];
+    });
+  }, [visibleSessionIds]);
+
+  const openTerminal = useCallback((session: CodexSession) => {
+    setOpenedTerminalIds((current) => (current.includes(session.id) ? current : [...current, session.id]));
+    setActiveTerminalId(session.id);
+  }, []);
+
+  const closeTerminal = useCallback((id: string) => {
+    setOpenedTerminalIds((current) => {
+      const next = current.filter((item) => item !== id);
+      setActiveTerminalId((active) => (active === id ? next[0] ?? null : active));
+      return next;
+    });
+  }, []);
 
   const copyResumeCommand = useCallback(async (session: CodexSession) => {
     try {
@@ -606,6 +683,29 @@ function App() {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await loadSessions();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function deleteSelectedSessions() {
+    if (!selectedSessionIds.length) return;
+    if (!window.confirm(`将已选中的 ${selectedSessionIds.length} 个会话移入回收站？原位置会被清除。`)) return;
+    setBusyId('bulk-delete');
+    setActionMessage(null);
+    try {
+      const response = await fetch('/api/sessions/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, ids: selectedSessionIds }),
+      });
+      const payload = (await response.json()) as { deleted?: number; failed?: number; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`已移入回收站 ${payload.deleted ?? 0} 个会话，失败 ${payload.failed ?? 0} 个`);
+      setSelectedSessionIds([]);
+      await loadSessions();
+    } catch (err) {
+      setActionMessage(`批量删除失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
@@ -739,6 +839,22 @@ function App() {
 
         <div className="filter-note">保留面板是手动标签；推荐保留、复核、建议删除是 AI 分类，可与机器和搜索筛选叠加。</div>
 
+        {activeTab !== 'recycle' ? (
+          <div className="bulk-toolbar">
+            <button type="button" className="primary-button" disabled={!visibleSessionIds.length} onClick={toggleVisibleSelection}>
+              {allVisibleSelected ? '取消当前列表' : '选择当前列表'}
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={!selectedSessionIds.length || busyId === 'bulk-delete'}
+              onClick={() => void deleteSelectedSessions()}
+            >
+              删除已选 {selectedSessionIds.length}
+            </button>
+          </div>
+        ) : null}
+
         <div className="session-list" aria-busy={loading}>
           {loading ? (
             <div className="empty">
@@ -757,7 +873,7 @@ function App() {
                 </div>
               ))
             : groupedSessions.map((group) => {
-                const collapsed = collapsedGroups[group.key] ?? false;
+                const collapsed = collapsedGroups[group.key] ?? true;
                 return (
                   <div key={group.key} className="session-group">
                     <button
@@ -773,12 +889,27 @@ function App() {
                     {collapsed
                       ? null
                       : group.sessions.map((session) => (
-                          <button
+                          <div
                             key={session.id}
-                            type="button"
                             className={`session-row ${selected?.id === session.id ? 'selected' : ''}`}
                             onClick={() => setSelectedId(session.id)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                setSelectedId(session.id);
+                              }
+                            }}
+                            role="button"
+                            tabIndex={0}
                           >
+                            <input
+                              type="checkbox"
+                              className="session-checkbox"
+                              checked={selectedIdSet.has(session.id)}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={() => toggleSessionSelection(session.id)}
+                              aria-label={`选择 ${session.title}`}
+                            />
                             <span className={`dot ${recommendationTone[session.evaluation.recommendation]}`} />
                             <span className="session-main">
                               <span className="session-key">{session.title}</span>
@@ -788,7 +919,7 @@ function App() {
                               {session.kept ? '已保留 · ' : ''}
                               {session.activityStatus === 'active' ? '活跃' : '非活跃'} · {formatDate(session.updatedAt)}
                             </span>
-                          </button>
+                          </div>
                         ))}
                   </div>
                 );
@@ -929,6 +1060,10 @@ function App() {
                   <Trash2 size={17} />
                   移入回收站
                 </button>
+                <button type="button" className="primary-button" onClick={() => openTerminal(selected)}>
+                  <TerminalIcon size={17} />
+                  打开/查看终端
+                </button>
               </div>
             </section>
 
@@ -968,11 +1103,6 @@ function App() {
                   <div className="empty compact">{historyLoading ? '正在加载会话历史...' : '点击“加载最近记录”后查看历史'}</div>
                 ) : null}
               </div>
-            </section>
-
-            <section className="primary-panel terminal-card">
-              <h3>继续这次对话</h3>
-              <TerminalConsole session={selected} />
             </section>
 
             <section className="secondary-panel">
@@ -1104,6 +1234,46 @@ function App() {
         ) : (
           <div className="blank-state">没有可显示的 Codex 会话</div>
         )}
+
+        {openedTerminalSessions.length ? (
+          <div className="detail-grid terminal-dock-grid">
+            <section className="primary-panel terminal-card">
+              <div className="panel-heading terminal-dock-heading">
+                <h3>已打开终端</h3>
+                {activeTerminalSession ? <span>{activeTerminalSession.resumeCommand}</span> : null}
+              </div>
+              <div className="terminal-tabs">
+                {openedTerminalSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className={activeTerminalSession?.id === session.id ? 'active' : ''}
+                    onClick={() => setActiveTerminalId(session.id)}
+                  >
+                    <span>{session.title}</span>
+                    <X
+                      size={14}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTerminal(session.id);
+                      }}
+                    />
+                  </button>
+                ))}
+              </div>
+              <div className="terminal-stack">
+                {openedTerminalSessions.map((session) => (
+                  <TerminalConsole
+                    key={session.id}
+                    session={session}
+                    active={activeTerminalSession?.id === session.id}
+                    onClose={() => closeTerminal(session.id)}
+                  />
+                ))}
+              </div>
+            </section>
+          </div>
+        ) : null}
 
         <footer className="footer">
           <span>Codex home: {meta?.codexHome ?? 'loading'}</span>

@@ -138,6 +138,13 @@
   line-height: 1.45;
 }
 
+.bulk-toolbar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 0 20px 14px;
+}
+
 .metric {
   min-height: 54px;
   border: 1px solid var(--line);
@@ -166,7 +173,7 @@
 .session-row {
   width: 100%;
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 10px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   text-align: left;
@@ -175,6 +182,13 @@
   background: transparent;
   padding: 12px;
   cursor: pointer;
+}
+
+.session-checkbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #0f766e;
 }
 
 .session-group {
@@ -480,6 +494,10 @@
   background: #0b1220;
 }
 
+.terminal-panel.inactive {
+  display: none;
+}
+
 .terminal-panel.fullscreen {
   position: fixed;
   inset: 18px;
@@ -497,6 +515,12 @@
   padding: 0 10px;
   background: #111827;
   color: #d1d5db;
+}
+
+.terminal-toolbar .primary-button,
+.terminal-toolbar .danger-button {
+  min-height: 34px;
+  padding: 0 10px;
 }
 
 .terminal-toolbar span {
@@ -537,6 +561,56 @@
 
 .terminal-surface .xterm {
   height: 100%;
+}
+
+.terminal-dock-grid {
+  padding-top: 0;
+}
+
+.terminal-dock-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.terminal-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  overflow-x: auto;
+}
+
+.terminal-tabs button {
+  min-width: 160px;
+  max-width: 280px;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #f8fafc;
+  color: #334155;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.terminal-tabs button.active {
+  border-color: #0f766e;
+  background: #ecfdf5;
+  color: #0f3f2f;
+}
+
+.terminal-tabs button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .title-editor {
