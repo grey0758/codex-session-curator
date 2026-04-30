@@ -432,6 +432,12 @@ app.post('/api/sessions/bulk-delete', async (request) => {
   };
 });
 
+app.post('/api/evaluations/retry-failed', async () => {
+  const result = await service.queueFailedSummaryRetry();
+  clearSessionCaches();
+  return result;
+});
+
 const distPath = join(__dirname, '..', 'dist');
 if (existsSync(distPath)) {
   await app.register(fastifyStatic, {

@@ -77,4 +77,14 @@ export class CuratorStore {
     state.evaluations[id] = evaluation;
     await this.save(state);
   }
+
+  async clearFailedEvaluations(): Promise<string[]> {
+    const state = await this.load();
+    const failedIds = Object.entries(state.evaluations)
+      .filter(([, evaluation]) => evaluation.status === 'failed')
+      .map(([id]) => id);
+    for (const id of failedIds) delete state.evaluations[id];
+    if (failedIds.length) await this.save(state);
+    return failedIds;
+  }
 }

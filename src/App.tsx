@@ -888,6 +888,22 @@ function App() {
     }
   }
 
+  async function retryFailedSummaries() {
+    setBusyId('retry-failed');
+    setActionMessage(null);
+    try {
+      const response = await fetch('/api/evaluations/retry-failed', { method: 'POST' });
+      const payload = (await response.json()) as { queued?: number; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`已加入摘要重试队列 ${payload.queued ?? 0} 个；下次刷新或 AI 重算时会重新生成。`);
+      await loadSessions(true);
+    } catch (err) {
+      setActionMessage(`摘要重试失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function saveTitle(session: CodexSession) {
     setBusyId(`${session.id}:title`);
     try {
@@ -1197,6 +1213,16 @@ function App() {
             >
               <Sparkles size={17} />
               AI 重算
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              disabled={busyId === 'retry-failed'}
+              title="只清空失败摘要缓存，然后重新进入总结工作流"
+              onClick={() => void retryFailedSummaries()}
+            >
+              <RefreshCw size={17} />
+              重试失败摘要
             </button>
             <button
               type="button"

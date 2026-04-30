@@ -455,6 +455,11 @@ export class SessionService {
     return purgeExpiredArchives({ recycleRoot: getRecycleRoot() });
   }
 
+  async queueFailedSummaryRetry() {
+    const queuedIds = await this.store.clearFailedEvaluations();
+    return { queuedIds, queued: queuedIds.length };
+  }
+
   async listRecycleBin() {
     return listRecycleArchives({ recycleRoot: getRecycleRoot() });
   }
