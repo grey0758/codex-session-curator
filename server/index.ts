@@ -1,4 +1,5 @@
 import cors from '@fastify/cors';
+import compress from '@fastify/compress';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
@@ -20,6 +21,11 @@ const codexHome = getCodexHome();
 const store = new CuratorStore(getStatePath(codexHome));
 const service = new SessionService(store);
 const remoteAgents = getRemoteAgents();
+
+const sessionCacheTtlMs = Number(process.env.CURATOR_SESSION_CACHE_TTL_MS || 8000);
+const remoteSessionCacheTtlMs = Number(process.env.CURATOR_REMOTE_SESSION_CACHE_TTL_MS || 15000);
+let localSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnType<SessionService['listSessions']>>> } | null = null;
+let remoteSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnType<typeof fetchAgentSessions>>[]> } | null = null;
 
 const keepSchema = z.object({ kept: z.boolean() });
 const titleSchema = z.object({ title: z.string().max(120) });
@@ -43,6 +49,39 @@ async function deleteSessionById(id: string) {
   }
 }
 
+function clearSessionCaches(): void {
+  localSessionsCache = null;
+  remoteSessionsCache = null;
+}
+
+async function getLocalSessionsCached(refreshWorkflow: boolean) {
+  if (refreshWorkflow || sessionCacheTtlMs <= 0) {
+    clearSessionCaches();
+    return service.listSessions({ refreshWorkflow });
+  }
+  const now = Date.now();
+  if (!localSessionsCache || localSessionsCache.expiresAt <= now) {
+    localSessionsCache = {
+      expiresAt: now + sessionCacheTtlMs,
+      promise: service.listSessions({ refreshWorkflow: false }),
+    };
+  }
+  return localSessionsCache.promise;
+}
+
+async function getRemoteSessionsCached() {
+  if (!remoteAgents.length) return [];
+  if (remoteSessionCacheTtlMs <= 0) return (await Promise.all(remoteAgents.map((agent) => fetchAgentSessions(agent)))).flat();
+  const now = Date.now();
+  if (!remoteSessionsCache || remoteSessionsCache.expiresAt <= now) {
+    remoteSessionsCache = {
+      expiresAt: now + remoteSessionCacheTtlMs,
+      promise: Promise.all(remoteAgents.map((agent) => fetchAgentSessions(agent))),
+    };
+  }
+  return (await remoteSessionsCache.promise).flat();
+}
+
 await service.cleanupRecycleBin();
 setInterval(
   () => {
@@ -54,7 +93,18 @@ setInterval(
 ).unref();
 
 await app.register(cors, { origin: true });
+await app.register(compress, { global: true, encodings: ['br', 'gzip', 'deflate'] });
 await app.register(websocket);
+
+app.addHook('onSend', async (request, reply, payload) => {
+  if (request.url.startsWith('/assets/')) {
+    reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+  if (request.url === '/' || request.url.startsWith('/?')) {
+    reply.header('Cache-Control', 'no-cache');
+  }
+  return payload;
+});
 
 app.addHook('onRequest', async (request, reply) => {
   const authUser = process.env.CURATOR_AUTH_USER;
@@ -108,12 +158,15 @@ app.get('/api/sessions', async (request) => {
       q: z.string().optional(),
       recommendation: z.enum(['all', 'keep', 'review', 'delete']).optional(),
       refresh: z.enum(['0', '1', 'true', 'false']).optional(),
+      remote: z.enum(['0', '1', 'true', 'false']).optional(),
     })
     .parse(request.query);
-  const localSessions = await service.listSessions({ refreshWorkflow: query.refresh === '1' || query.refresh === 'true' });
-  const remoteSessions = query.refresh === '1' || query.refresh === 'true'
+  const refreshWorkflow = query.refresh === '1' || query.refresh === 'true';
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const localSessions = await getLocalSessionsCached(refreshWorkflow);
+  const remoteSessions = refreshWorkflow || !includeRemote
     ? []
-    : (await Promise.all(remoteAgents.map((agent) => fetchAgentSessions(agent)))).flat();
+    : await getRemoteSessionsCached();
   const sessions = [...localSessions, ...remoteSessions];
   const filtered = sessions.filter((session) => {
     const matchesRecommendation =
@@ -238,6 +291,7 @@ app.post('/api/sessions/:id/keep', async (request, reply) => {
   const body = keepSchema.parse(request.body);
   const session = await service.setKept(params.id, body.kept);
   if (!session) return reply.code(404).send({ error: 'Session not found' });
+  clearSessionCaches();
   return session;
 });
 
@@ -246,6 +300,7 @@ app.post('/api/sessions/:id/title', async (request, reply) => {
   const body = titleSchema.parse(request.body);
   const session = await service.setTitle(params.id, body.title);
   if (!session) return reply.code(404).send({ error: 'Session not found' });
+  clearSessionCaches();
   return session;
 });
 
@@ -253,7 +308,9 @@ app.post('/api/sessions/:id/migrate', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = migrateSchema.parse(request.body);
   try {
-    return await service.migrateSessionToProject(params.id, body.targetProjectDir);
+    const result = await service.migrateSessionToProject(params.id, body.targetProjectDir);
+    clearSessionCaches();
+    return result;
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : 'Migrate failed' });
   }
@@ -263,7 +320,9 @@ app.delete('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   confirmSchema.parse(request.body);
   try {
-    return await deleteSessionById(params.id);
+    const result = await deleteSessionById(params.id);
+    clearSessionCaches();
+    return result;
   } catch (error) {
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Delete failed' });
   }
@@ -271,12 +330,16 @@ app.delete('/api/sessions/:id', async (request, reply) => {
 
 app.post('/api/sessions/prune', async (request) => {
   confirmSchema.parse(request.body);
-  return service.pruneRecommended('delete');
+  const result = await service.pruneRecommended('delete');
+  clearSessionCaches();
+  return result;
 });
 
 app.post('/api/sessions/prune-non-kept', async (request) => {
   confirmSchema.parse(request.body);
-  return service.pruneNonKept();
+  const result = await service.pruneNonKept();
+  clearSessionCaches();
+  return result;
 });
 
 app.post('/api/sessions/bulk-delete', async (request) => {
@@ -290,6 +353,7 @@ app.post('/api/sessions/bulk-delete', async (request) => {
       results.push({ id, ok: false, error: error instanceof Error ? error.message : 'Delete failed' });
     }
   }
+  clearSessionCaches();
   return {
     deleted: results.filter((result) => result.ok).length,
     failed: results.filter((result) => !result.ok).length,
@@ -299,7 +363,17 @@ app.post('/api/sessions/bulk-delete', async (request) => {
 
 const distPath = join(__dirname, '..', 'dist');
 if (existsSync(distPath)) {
-  await app.register(fastifyStatic, { root: distPath, prefix: '/' });
+  await app.register(fastifyStatic, {
+    root: distPath,
+    prefix: '/',
+    setHeaders(response, pathName) {
+      if (pathName.includes('/assets/')) {
+        response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      } else {
+        response.setHeader('Cache-Control', 'no-cache');
+      }
+    },
+  });
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api/')) {
       reply.code(404).send({ error: 'Not found' });

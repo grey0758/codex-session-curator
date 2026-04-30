@@ -481,24 +481,35 @@ function App() {
   const loadSessions = useCallback(async (refreshWorkflow = false) => {
     setLoading(true);
     setError(null);
-    const params = new URLSearchParams();
-    if (refreshWorkflow) params.set('refresh', '1');
+    const baseParams = new URLSearchParams();
+    if (refreshWorkflow) baseParams.set('refresh', '1');
 
     try {
-      const [response, recycleResponse] = await Promise.all([
-        fetch(`/api/sessions?${params.toString()}`),
+      const localParams = new URLSearchParams(baseParams);
+      localParams.set('remote', '0');
+      const [localResponse, recycleResponse] = await Promise.all([
+        fetch(`/api/sessions?${localParams.toString()}`),
         fetch('/api/recycle-bin'),
       ]);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!localResponse.ok) throw new Error(`HTTP ${localResponse.status}`);
       if (!recycleResponse.ok) throw new Error(`Recycle HTTP ${recycleResponse.status}`);
-      const payload = (await response.json()) as ApiPayload;
+      const payload = (await localResponse.json()) as ApiPayload;
       const recyclePayload = (await recycleResponse.json()) as RecyclePayload;
       setAllSessions(payload.sessions);
       setRecycleArchives(recyclePayload.archives);
       setMeta(payload.meta);
+      setLoading(false);
+
+      if (!refreshWorkflow) {
+        const remoteResponse = await fetch('/api/sessions');
+        if (remoteResponse.ok) {
+          const remotePayload = (await remoteResponse.json()) as ApiPayload;
+          setAllSessions(remotePayload.sessions);
+          setMeta(remotePayload.meta);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败');
-    } finally {
       setLoading(false);
     }
   }, []);
