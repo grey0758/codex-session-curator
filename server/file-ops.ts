@@ -319,6 +319,52 @@ export async function listRecycleArchives(input: { recycleRoot?: string } = {}):
   return archives.sort((a, b) => Date.parse(b.deletedAt ?? '') - Date.parse(a.deletedAt ?? ''));
 }
 
+async function findArchiveBySessionId(recycleRoot: string, sessionId: string): Promise<RecycleArchive | null> {
+  const archives = await listRecycleArchives({ recycleRoot });
+  return archives.find((archive) => archive.sessionId === sessionId) ?? null;
+}
+
+export async function restoreArchive(input: {
+  codexHome: string;
+  recycleRoot?: string;
+  sessionId: string;
+}): Promise<{ sessionId: string; restoredFiles: string[]; archiveDir: string }> {
+  const recycleRoot = input.recycleRoot ?? getRecycleRoot();
+  const archive = await findArchiveBySessionId(recycleRoot, input.sessionId);
+  if (!archive) throw new Error(`Recycle archive not found: ${input.sessionId}`);
+
+  const sessionsRoot = getSessionsRoot(input.codexHome);
+  const snapshotsRoot = getShellSnapshotsRoot(input.codexHome);
+  const restoredFiles: string[] = [];
+
+  for (const archivedFile of archive.archivedFiles) {
+    assertInside(archivedFile, archive.archiveDir);
+    const fileName = basename(archivedFile);
+    const targetRoot = archivedFile.includes('/shell_snapshots/') ? snapshotsRoot : sessionsRoot;
+    const preferredOriginal = archive.removedOriginalFiles.find((file) => basename(file) === fileName);
+    const target = preferredOriginal ?? join(targetRoot, fileName);
+    assertInside(target, targetRoot);
+    await mkdir(dirname(target), { recursive: true });
+    await moveFileToArchive(archivedFile, target);
+    restoredFiles.push(target);
+  }
+
+  await rm(archive.archiveDir, { recursive: true, force: true });
+  return { sessionId: input.sessionId, restoredFiles, archiveDir: archive.archiveDir };
+}
+
+export async function permanentlyDeleteArchive(input: {
+  recycleRoot?: string;
+  sessionId: string;
+}): Promise<{ sessionId: string; purgedArchive: string }> {
+  const recycleRoot = input.recycleRoot ?? getRecycleRoot();
+  const archive = await findArchiveBySessionId(recycleRoot, input.sessionId);
+  if (!archive) throw new Error(`Recycle archive not found: ${input.sessionId}`);
+  assertInside(archive.archiveDir, recycleRoot);
+  await rm(archive.archiveDir, { recursive: true, force: true });
+  return { sessionId: input.sessionId, purgedArchive: archive.archiveDir };
+}
+
 export function sameResolvedPath(a: string | null | undefined, b: string | null | undefined): boolean {
   if (!a || !b) return false;
   return resolve(a).replace(/\/+$/, '') === resolve(b).replace(/\/+$/, '');

@@ -26,6 +26,9 @@ export interface Evaluation {
   remoteMachines: RemoteMachine[];
   evaluatedAt: string;
   workflow: string;
+  model: string;
+  status: 'ok' | 'fallback' | 'failed';
+  error: string | null;
 }
 
 export interface RemoteMachine {

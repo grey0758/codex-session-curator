@@ -52,6 +52,9 @@ interface Evaluation {
   remoteMachines: RemoteMachine[];
   evaluatedAt: string;
   workflow: string;
+  model: string;
+  status: 'ok' | 'fallback' | 'failed';
+  error: string | null;
 }
 
 interface CodexSession {
@@ -88,6 +91,9 @@ interface ApiPayload {
   };
   sessions: CodexSession[];
   total: number;
+  filteredTotal?: number;
+  page?: number;
+  pageSize?: number;
 }
 
 interface RecycleArchive {
@@ -126,6 +132,24 @@ interface TerminalEvent {
   code?: number | null;
   signal?: string | number | null;
 }
+
+interface RemoteAgentStatus {
+  id: string;
+  baseUrl: string;
+  online: boolean;
+  latencyMs: number | null;
+  error: string | null;
+  machineId: string | null;
+}
+
+type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
+
+const terminalStatusLabel: Record<TerminalStatus, string> = {
+  disconnected: '断开',
+  connecting: '连接中',
+  connected: '已连接',
+  'codex-running': 'Codex 运行中',
+};
 
 const tabs: Array<{ id: TabId; label: string }> = [
   { id: 'all', label: '全部' },
@@ -218,12 +242,32 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<number | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
   const terminalCleanupRef = useRef<(() => void) | null>(null);
-  const [connected, setConnected] = useState(false);
+  const connectRef = useRef<() => void>(() => {});
+  const activeRef = useRef(active);
+  const manualCloseRef = useRef(false);
+  const [terminalStatus, setTerminalStatus] = useState<TerminalStatus>('disconnected');
   const [fullscreen, setFullscreen] = useState(false);
   const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
-  const disconnect = useCallback(() => {
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', close);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', close);
+    };
+  }, [contextMenu]);
+
+  const closeSocketAndPty = useCallback(() => {
     terminalCleanupRef.current?.();
     terminalCleanupRef.current = null;
     socketRef.current?.close();
@@ -237,19 +281,19 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     terminalRef.current?.dispose();
     terminalRef.current = null;
     fitRef.current = null;
-    setConnected(false);
+    setTerminalStatus('disconnected');
   }, []);
 
-  useEffect(() => disconnect, [disconnect]);
+  const disconnect = useCallback(() => {
+    manualCloseRef.current = true;
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    closeSocketAndPty();
+  }, [closeSocketAndPty]);
 
-  useEffect(() => {
-    if (!active) return;
-    const handle = window.setTimeout(() => {
-      fitRef.current?.fit();
-      terminalRef.current?.focus();
-    }, 0);
-    return () => window.clearTimeout(handle);
-  }, [active]);
+  useEffect(() => disconnect, [disconnect]);
 
   const pasteIntoTerminal = useCallback(async () => {
     const socket = socketRef.current;
@@ -290,6 +334,8 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
 
   const connect = useCallback(() => {
     if (!containerRef.current || socketRef.current) return;
+    manualCloseRef.current = false;
+    setTerminalStatus('connecting');
     setTerminalNotice(null);
     const terminal = new XTerm({
       cursorBlink: true,
@@ -332,27 +378,9 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
       setTerminalNotice('已粘贴到终端');
     };
     const handleContextMenu = (event: MouseEvent) => {
-      if (terminal.hasSelection()) {
-        if (!navigator.clipboard?.writeText || !window.isSecureContext) {
-          terminal.focus();
-          setTerminalNotice('已选中文本，可使用 Ctrl+C 或浏览器右键菜单复制');
-          return;
-        }
-        event.preventDefault();
-        void navigator.clipboard.writeText(terminal.getSelection()).then(() => {
-          terminal.clearSelection();
-          terminal.focus();
-          setTerminalNotice('已复制终端选中文本');
-        });
-        return;
-      }
-      terminal.focus();
-      if (!navigator.clipboard?.readText || !window.isSecureContext) {
-        setTerminalNotice('HTTP 环境无法直接读取剪贴板，请用 Ctrl+V 或右键菜单粘贴');
-        return;
-      }
       event.preventDefault();
-      void pasteIntoTerminal();
+      terminal.focus();
+      setContextMenu({ x: event.clientX, y: event.clientY });
     };
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
@@ -396,7 +424,7 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     resizeObserverRef.current = resizeObserver;
 
     socket.onopen = () => {
-      setConnected(true);
+      setTerminalStatus('connected');
       terminal.writeln('WebSocket 已连接，启动 codex resume...');
       fit.fit();
       sendResize(terminal.cols || 120, terminal.rows || 40);
@@ -404,24 +432,63 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data as string) as TerminalEvent;
       if (message.type === 'output' && message.data) terminal.write(message.data);
-      if (message.type === 'ready' && message.data) terminal.writeln(`\r\n$ ${message.data}`);
+      if (message.type === 'ready' && message.data) {
+        setTerminalStatus('codex-running');
+        terminal.writeln(`\r\n$ ${message.data}`);
+      }
       if (message.type === 'error') terminal.writeln(`\r\n[error] ${message.data ?? 'unknown error'}`);
       if (message.type === 'exit') {
         terminal.writeln(`\r\n[exit] code=${message.code ?? 'null'} signal=${message.signal ?? 'null'}`);
-        setConnected(false);
+        setTerminalStatus('disconnected');
       }
     };
-    socket.onclose = () => setConnected(false);
+    socket.onclose = () => {
+      socketRef.current = null;
+      setTerminalStatus('disconnected');
+      if (!manualCloseRef.current && activeRef.current) {
+        setTerminalNotice('连接已断开，正在自动重连到 tmux...');
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectRef.current();
+        }, 1200);
+      }
+    };
     socket.onerror = () => {
       terminal.writeln('\r\n[error] WebSocket 连接失败');
-      setConnected(false);
+      setTerminalStatus('disconnected');
     };
-  }, [pasteIntoTerminal, session]);
+  }, [session]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
+  const reconnect = useCallback(() => {
+    manualCloseRef.current = false;
+    closeSocketAndPty();
+    window.setTimeout(() => connectRef.current(), 80);
+  }, [closeSocketAndPty]);
+
+  const clearTerminal = useCallback(() => {
+    terminalRef.current?.clear();
+    terminalRef.current?.focus();
+    setContextMenu(null);
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    const handle = window.setTimeout(() => {
+      if (!socketRef.current) connect();
+      fitRef.current?.fit();
+      terminalRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [active, connect]);
 
   return (
     <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}${active ? '' : ' inactive'}`}>
       <div className="terminal-toolbar">
-        <span>客户端终端代理</span>
+        <span>客户端终端代理 · {terminalStatusLabel[terminalStatus]}</span>
         <button
           type="button"
           className="icon-button terminal-icon-button"
@@ -431,16 +498,16 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
         >
           {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
         </button>
-        <button type="button" className="primary-button" onClick={() => void copyTerminalSelection()} disabled={!connected}>
+        <button type="button" className="primary-button" onClick={() => void copyTerminalSelection()} disabled={terminalStatus === 'disconnected'}>
           复制选中
         </button>
-        <button type="button" className="primary-button" onClick={() => void pasteIntoTerminal()} disabled={!connected}>
+        <button type="button" className="primary-button" onClick={() => void pasteIntoTerminal()} disabled={terminalStatus === 'disconnected'}>
           粘贴
         </button>
-        <button type="button" className="primary-button" onClick={connect} disabled={connected}>
-          打开终端
+        <button type="button" className="primary-button" onClick={reconnect}>
+          重连
         </button>
-        <button type="button" className="danger-button" onClick={disconnect} disabled={!connected}>
+        <button type="button" className="danger-button" onClick={disconnect} disabled={terminalStatus === 'disconnected'}>
           断开
         </button>
         <button type="button" className="icon-button terminal-icon-button" onClick={onClose} title="关闭终端标签" aria-label="关闭终端标签">
@@ -448,6 +515,15 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
         </button>
       </div>
       {terminalNotice ? <div className="terminal-notice">{terminalNotice}</div> : null}
+      {contextMenu ? (
+        <div className="terminal-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
+          <button type="button" onClick={() => { setContextMenu(null); void copyTerminalSelection(); }}>复制</button>
+          <button type="button" onClick={() => { setContextMenu(null); void pasteIntoTerminal(); }}>粘贴</button>
+          <button type="button" onClick={clearTerminal}>清屏</button>
+          <button type="button" onClick={() => { setContextMenu(null); reconnect(); }}>重连</button>
+          <button type="button" onClick={() => { setContextMenu(null); onClose(); }}>关闭</button>
+        </div>
+      ) : null}
       <div className="terminal-surface" ref={containerRef} />
     </div>
   );
@@ -455,7 +531,9 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
 
 function App() {
   const [allSessions, setAllSessions] = useState<CodexSession[]>([]);
+  const [sessionDetails, setSessionDetails] = useState<Record<string, CodexSession>>({});
   const [recycleArchives, setRecycleArchives] = useState<RecycleArchive[]>([]);
+  const [remoteStatuses, setRemoteStatuses] = useState<RemoteAgentStatus[]>([]);
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
   const [machineFilter, setMachineFilter] = useState('all');
@@ -477,6 +555,18 @@ function App() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
+  const [recycleQuery, setRecycleQuery] = useState('');
+
+  const refreshRemoteStatuses = useCallback(async () => {
+    try {
+      const response = await fetch('/api/remote-agents');
+      if (!response.ok) return;
+      const payload = (await response.json()) as { agents: RemoteAgentStatus[] };
+      setRemoteStatuses(payload.agents);
+    } catch {
+      setRemoteStatuses((current) => current.map((agent) => ({ ...agent, online: false, error: '状态刷新失败', latencyMs: null })));
+    }
+  }, []);
 
   const loadSessions = useCallback(async (refreshWorkflow = false) => {
     setLoading(true);
@@ -487,6 +577,7 @@ function App() {
     try {
       const localParams = new URLSearchParams(baseParams);
       localParams.set('remote', '0');
+      localParams.set('detail', '0');
       const [localResponse, recycleResponse] = await Promise.all([
         fetch(`/api/sessions?${localParams.toString()}`),
         fetch('/api/recycle-bin'),
@@ -499,9 +590,10 @@ function App() {
       setRecycleArchives(recyclePayload.archives);
       setMeta(payload.meta);
       setLoading(false);
+      void refreshRemoteStatuses();
 
       if (!refreshWorkflow) {
-        const remoteResponse = await fetch('/api/sessions');
+        const remoteResponse = await fetch('/api/sessions?detail=0');
         if (remoteResponse.ok) {
           const remotePayload = (await remoteResponse.json()) as ApiPayload;
           setAllSessions(remotePayload.sessions);
@@ -512,7 +604,7 @@ function App() {
       setError(err instanceof Error ? err.message : '加载失败');
       setLoading(false);
     }
-  }, []);
+  }, [refreshRemoteStatuses]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
@@ -552,10 +644,11 @@ function App() {
     return [...groups.values()].sort((a, b) => b.sessions.length - a.sessions.length || a.cwd.localeCompare(b.cwd));
   }, [visibleSessions]);
 
-  const selected = useMemo(
+  const selectedSummary = useMemo(
     () => visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0] ?? null,
     [selectedId, visibleSessions]
   );
+  const selected = selectedSummary ? (sessionDetails[selectedSummary.id] ?? selectedSummary) : null;
   const visibleSessionIds = useMemo(() => visibleSessions.map((session) => session.id), [visibleSessions]);
   const selectedIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedVisibleCount = useMemo(
@@ -571,6 +664,16 @@ function App() {
     [allSessions, openedTerminalIds]
   );
   const activeTerminalSession = openedTerminalSessions.find((session) => session.id === activeTerminalId) ?? openedTerminalSessions[0] ?? null;
+  const visibleRecycleArchives = useMemo(() => {
+    const needle = (recycleQuery || query).trim().toLowerCase();
+    if (!needle) return recycleArchives;
+    return recycleArchives.filter((archive) =>
+      [archive.sessionId, archive.archiveDir, archive.originalSessionFile ?? '', ...archive.archivedFiles, ...archive.removedOriginalFiles]
+        .join(' ')
+        .toLowerCase()
+        .includes(needle)
+    );
+  }, [query, recycleArchives, recycleQuery]);
 
   const titleDraft = selected ? (titleDrafts[selected.id] ?? selected.customTitle ?? selected.title) : '';
   const migrationTarget = selected
@@ -597,6 +700,18 @@ function App() {
       return [...currentSet];
     });
   }, [visibleSessionIds]);
+
+  const toggleGroupSelection = useCallback((ids: string[]) => {
+    setSelectedSessionIds((current) => {
+      const currentSet = new Set(current);
+      const shouldSelect = !ids.every((id) => currentSet.has(id));
+      for (const id of ids) {
+        if (shouldSelect) currentSet.add(id);
+        else currentSet.delete(id);
+      }
+      return [...currentSet];
+    });
+  }, []);
 
   const openTerminal = useCallback((session: CodexSession) => {
     setOpenedTerminalIds((current) => (current.includes(session.id) ? current : [...current, session.id]));
@@ -651,6 +766,25 @@ function App() {
     return () => window.clearTimeout(handle);
   }, [activeTab, selected?.id]);
 
+  useEffect(() => {
+    if (!selectedSummary || activeTab === 'recycle' || sessionDetails[selectedSummary.id]) return;
+    let cancelled = false;
+    void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}`)
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<CodexSession>;
+      })
+      .then((session) => {
+        if (!cancelled) setSessionDetails((current) => ({ ...current, [session.id]: session }));
+      })
+      .catch(() => {
+        // Detail loading is opportunistic; the summary row remains usable.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, selectedSummary, sessionDetails]);
+
   const stats = useMemo(() => {
     return allSessions
       .filter((session) => (machineFilter === 'all' || session.machineId === machineFilter) && matchesSearch(session, query))
@@ -684,7 +818,7 @@ function App() {
   }
 
   async function deleteSession(session: CodexSession) {
-    if (!window.confirm(`移入回收站并清除本机 Codex 原会话：${session.id}？回收站保留 30 天。`)) return;
+    if (!window.confirm(`只删除当前机器 ${session.machineId} 上的会话：${session.id}？会先移入回收站，原 Codex 活跃目录会被清除。`)) return;
     setBusyId(session.id);
     try {
       const response = await fetch(`/api/sessions/${session.id}`, {
@@ -799,6 +933,67 @@ function App() {
     }
   }
 
+  async function migrateSelectedSameDirectory(session: CodexSession) {
+    const target = migrationTarget.trim();
+    if (!target || !selectedSessionIds.length) return;
+    const targetIds = allSessions
+      .filter((item) => selectedSessionIds.includes(item.id) && item.machineId === session.machineId && normalizePath(item.cwd) === normalizePath(session.cwd))
+      .map((item) => item.id);
+    if (!targetIds.length) return;
+    if (!window.confirm(`将当前目录下已选中的 ${targetIds.length} 个会话批量迁移到：${target}？`)) return;
+    setBusyId('bulk-migrate');
+    let ok = 0;
+    let failed = 0;
+    for (const id of targetIds) {
+      try {
+        const response = await fetch(`/api/sessions/${id}/migrate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetProjectDir: target }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        ok += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    setActionMessage(`批量迁移完成：成功 ${ok} 个，失败 ${failed} 个`);
+    setBusyId(null);
+    await loadSessions();
+  }
+
+  async function restoreArchive(archive: RecycleArchive) {
+    if (!window.confirm(`恢复回收站会话 ${archive.sessionId} 到原 Codex 目录？`)) return;
+    setBusyId(`${archive.sessionId}:restore`);
+    try {
+      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadSessions();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function purgeArchive(archive: RecycleArchive) {
+    if (!window.confirm(`立即永久删除回收站归档 ${archive.sessionId}？这个操作不可恢复。`)) return;
+    setBusyId(`${archive.sessionId}:purge`);
+    try {
+      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadSessions();
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="rail">
@@ -828,6 +1023,18 @@ function App() {
           </select>
         </div>
 
+        {remoteStatuses.length ? (
+          <div className="remote-status-list">
+            {remoteStatuses.map((agent) => (
+              <button type="button" key={agent.id} onClick={() => void refreshRemoteStatuses()} title="刷新远端机器状态">
+                <span className={`remote-dot ${agent.online ? 'online' : 'offline'}`} />
+                <strong>{agent.machineId ?? agent.id}</strong>
+                <em>{agent.online ? `${agent.latencyMs ?? '?'}ms` : `${agent.id} 暂不可用`}</em>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         <div className="tabs" role="tablist" aria-label="session filters">
           {tabs.map((tab) => (
             <button
@@ -842,7 +1049,7 @@ function App() {
         </div>
 
         <div className="summary-strip">
-          {metricLabel(activeTab === 'recycle' ? recycleArchives.length : visibleSessions.length, '当前列表')}
+          {metricLabel(activeTab === 'recycle' ? visibleRecycleArchives.length : visibleSessions.length, '当前列表')}
           {metricLabel(stats.kept, '手动保留')}
           {metricLabel(stats.active, '三天活跃')}
           {metricLabel(stats.delete, '删除')}
@@ -874,29 +1081,62 @@ function App() {
             </div>
           ) : null}
           {!loading && activeTab !== 'recycle' && visibleSessions.length === 0 ? <div className="empty">没有匹配的会话</div> : null}
-          {!loading && activeTab === 'recycle' && recycleArchives.length === 0 ? <div className="empty">回收站为空</div> : null}
+          {!loading && activeTab === 'recycle' ? (
+            <div className="recycle-search">
+              <Search size={16} />
+              <input value={recycleQuery} onChange={(event) => setRecycleQuery(event.target.value)} placeholder="搜索回收站 session / 路径" />
+            </div>
+          ) : null}
+          {!loading && activeTab === 'recycle' && visibleRecycleArchives.length === 0 ? <div className="empty">回收站为空</div> : null}
           {activeTab === 'recycle'
-            ? recycleArchives.map((archive) => (
+            ? visibleRecycleArchives.map((archive) => (
                 <div key={archive.archiveDir} className="archive-row">
                   <span className="session-key">{archive.sessionId}</span>
                   <span className="session-summary">删除：{formatDate(archive.deletedAt)} · 过期：{formatDate(archive.expiresAt)}</span>
                   <span className="session-summary">{archive.archiveDir}</span>
+                  <span className="archive-actions">
+                    <button type="button" className="primary-button" disabled={busyId === `${archive.sessionId}:restore`} onClick={() => void restoreArchive(archive)}>
+                      恢复
+                    </button>
+                    <button type="button" className="danger-button" disabled={busyId === `${archive.sessionId}:purge`} onClick={() => void purgeArchive(archive)}>
+                      永久删除
+                    </button>
+                  </span>
                 </div>
               ))
             : groupedSessions.map((group) => {
                 const collapsed = collapsedGroups[group.key] ?? true;
+                const groupIds = group.sessions.map((session) => session.id);
+                const selectedInGroup = groupIds.filter((id) => selectedIdSet.has(id)).length;
+                const groupChecked = selectedInGroup === groupIds.length && groupIds.length > 0;
                 return (
                   <div key={group.key} className="session-group">
-                    <button
-                      type="button"
+                    <div
                       className="group-header"
                       onClick={() => setCollapsedGroups((current) => ({ ...current, [group.key]: !collapsed }))}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setCollapsedGroups((current) => ({ ...current, [group.key]: !collapsed }));
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
                     >
+                      <input
+                        type="checkbox"
+                        className="session-checkbox"
+                        checked={groupChecked}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={() => toggleGroupSelection(groupIds)}
+                        aria-label={`选择目录 ${group.cwd}`}
+                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupIds.length}` : '选择这个目录'}
+                      />
                       {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
                       <span>{group.machineId}</span>
                       <strong>{group.cwd}</strong>
                       <em>{group.sessions.length}</em>
-                    </button>
+                    </div>
                     {collapsed
                       ? null
                       : group.sessions.map((session) => (
@@ -981,6 +1221,46 @@ function App() {
 
         {error ? <div className="notice danger">加载失败：{error}</div> : null}
 
+        {openedTerminalSessions.length ? (
+          <div className="detail-grid terminal-dock-grid">
+            <section className="primary-panel terminal-card">
+              <div className="panel-heading terminal-dock-heading">
+                <h3>已打开终端</h3>
+                {activeTerminalSession ? <span>{activeTerminalSession.resumeCommand}</span> : null}
+              </div>
+              <div className="terminal-tabs">
+                {openedTerminalSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className={activeTerminalSession?.id === session.id ? 'active' : ''}
+                    onClick={() => setActiveTerminalId(session.id)}
+                  >
+                    <span>{session.title}</span>
+                    <X
+                      size={14}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTerminal(session.id);
+                      }}
+                    />
+                  </button>
+                ))}
+              </div>
+              <div className="terminal-stack">
+                {openedTerminalSessions.map((session) => (
+                  <TerminalConsole
+                    key={session.id}
+                    session={session}
+                    active={activeTerminalSession?.id === session.id}
+                    onClose={() => closeTerminal(session.id)}
+                  />
+                ))}
+              </div>
+            </section>
+          </div>
+        ) : null}
+
         {activeTab === 'recycle' ? (
           <div className="detail-grid">
             <section className="primary-panel">
@@ -989,12 +1269,20 @@ function App() {
                 回收站只展示归档元数据和路径；原始会话已从 Codex 活跃目录清除，归档文件会在过期时间后自动删除。
               </p>
               <div className="archive-detail-list">
-                {recycleArchives.map((archive) => (
+                {visibleRecycleArchives.map((archive) => (
                   <div className="archive-detail" key={archive.archiveDir}>
                     <strong>{archive.sessionId}</strong>
                     <span>删除时间：{formatDate(archive.deletedAt)}</span>
                     <span>自动清理：{formatDate(archive.expiresAt)}</span>
                     <code>{archive.archiveDir}</code>
+                    <div className="archive-actions">
+                      <button type="button" className="primary-button" onClick={() => void restoreArchive(archive)}>
+                        恢复
+                      </button>
+                      <button type="button" className="danger-button" onClick={() => void purgeArchive(archive)}>
+                        立即永久删除
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1153,6 +1441,14 @@ function App() {
                     : `建议迁移/继续工作目录：${selected.evaluation.recommendedWorkdir}`}
                 </div>
               ) : null}
+              <div className="notice inline-info migration-basis">
+                迁移依据：
+                {selected.evaluation.recommendedWorkdir
+                  ? 'AI 从整段会话识别出推荐继续目录'
+                  : selected.evaluation.actualWorkdirs.length
+                    ? 'AI 从整段会话识别出实际工作目录'
+                    : '未识别到明确目录，默认使用会话 cwd'}
+              </div>
               <div className="migration-box">
                 <input
                   value={migrationTarget}
@@ -1168,6 +1464,14 @@ function App() {
                   onClick={() => void migrateSession(selected)}
                 >
                   {migrationAlreadyInPlace ? '无需迁移' : '迁移到目录'}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={busyId === 'bulk-migrate' || !selectedSessionIds.length || !migrationTarget.trim()}
+                  onClick={() => void migrateSelectedSameDirectory(selected)}
+                >
+                  批量迁移同目录
                 </button>
               </div>
               {actionMessage ? <div className="notice inline-info">{actionMessage}</div> : null}
@@ -1185,8 +1489,11 @@ function App() {
               </ul>
               <div className="workflow">
                 <Sparkles size={16} />
-                {selected.evaluation.workflow}
+                摘要版本：{selected.evaluation.workflow} · 模型：{selected.evaluation.model} · 状态：
+                {selected.evaluation.status === 'ok' ? '成功' : selected.evaluation.status === 'failed' ? '失败后回退' : '规则回退'} · 更新时间：
+                {formatDate(selected.evaluation.evaluatedAt)}
               </div>
+              {selected.evaluation.error ? <div className="notice inline-warning">摘要失败原因：{selected.evaluation.error}</div> : null}
             </section>
 
             <section className="facts-panel">
@@ -1245,46 +1552,6 @@ function App() {
         ) : (
           <div className="blank-state">没有可显示的 Codex 会话</div>
         )}
-
-        {openedTerminalSessions.length ? (
-          <div className="detail-grid terminal-dock-grid">
-            <section className="primary-panel terminal-card">
-              <div className="panel-heading terminal-dock-heading">
-                <h3>已打开终端</h3>
-                {activeTerminalSession ? <span>{activeTerminalSession.resumeCommand}</span> : null}
-              </div>
-              <div className="terminal-tabs">
-                {openedTerminalSessions.map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    className={activeTerminalSession?.id === session.id ? 'active' : ''}
-                    onClick={() => setActiveTerminalId(session.id)}
-                  >
-                    <span>{session.title}</span>
-                    <X
-                      size={14}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        closeTerminal(session.id);
-                      }}
-                    />
-                  </button>
-                ))}
-              </div>
-              <div className="terminal-stack">
-                {openedTerminalSessions.map((session) => (
-                  <TerminalConsole
-                    key={session.id}
-                    session={session}
-                    active={activeTerminalSession?.id === session.id}
-                    onClose={() => closeTerminal(session.id)}
-                  />
-                ))}
-              </div>
-            </section>
-          </div>
-        ) : null}
 
         <footer className="footer">
           <span>Codex home: {meta?.codexHome ?? 'loading'}</span>

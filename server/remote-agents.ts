@@ -5,6 +5,15 @@ export interface RemoteAgent {
   baseUrl: string;
 }
 
+export interface RemoteAgentStatus {
+  id: string;
+  baseUrl: string;
+  online: boolean;
+  latencyMs: number | null;
+  error: string | null;
+  machineId: string | null;
+}
+
 const DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS = 3500;
 const DEFAULT_REMOTE_JSON_TIMEOUT_MS = 8000;
 
@@ -56,6 +65,36 @@ export async function fetchAgentSessions(agent: RemoteAgent): Promise<CodexSessi
   } catch (error) {
     console.warn('[RemoteAgents] Failed to fetch sessions:', agent.id, error instanceof Error ? error.message : error);
     return [];
+  }
+}
+
+export async function checkRemoteAgent(agent: RemoteAgent): Promise<RemoteAgentStatus> {
+  const started = Date.now();
+  try {
+    const response = await fetchWithTimeout(
+      `${agent.baseUrl}/api/meta`,
+      timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
+    );
+    const latencyMs = Date.now() - started;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const meta = (await response.json()) as { machineId?: string };
+    return {
+      id: agent.id,
+      baseUrl: agent.baseUrl,
+      online: true,
+      latencyMs,
+      error: null,
+      machineId: meta.machineId ?? agent.id,
+    };
+  } catch (error) {
+    return {
+      id: agent.id,
+      baseUrl: agent.baseUrl,
+      online: false,
+      latencyMs: null,
+      error: error instanceof Error ? error.message : 'remote unavailable',
+      machineId: null,
+    };
   }
 }
 

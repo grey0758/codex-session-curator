@@ -25,6 +25,9 @@ interface WorkflowState {
   cwdMatchesWorkdir?: boolean | null;
   recommendedWorkdir?: string | null;
   remoteMachines?: RemoteMachine[];
+  model?: string;
+  status?: 'ok' | 'fallback' | 'failed';
+  error?: string | null;
 }
 
 interface LlmEvaluation {
@@ -55,7 +58,14 @@ const WorkflowAnnotation = Annotation.Root({
   cwdMatchesWorkdir: Annotation<boolean | null | undefined>(),
   recommendedWorkdir: Annotation<string | null | undefined>(),
   remoteMachines: Annotation<RemoteMachine[] | undefined>(),
+  model: Annotation<string | undefined>(),
+  status: Annotation<'ok' | 'fallback' | 'failed' | undefined>(),
+  error: Annotation<string | null | undefined>(),
 });
+
+export function getEvaluatorModel(): string {
+  return process.env.CURATOR_LLM_MODEL || process.env.MODEL || 'gpt-5.4';
+}
 
 const CODE_TERMS = [
   'implement',
@@ -300,7 +310,7 @@ function parseJsonObject(text: string): LlmEvaluation | null {
 
 async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
   const apiKey = process.env.CURATOR_LLM_API_KEY || process.env.API_KEY;
-  const model = process.env.CURATOR_LLM_MODEL || process.env.MODEL || 'gpt-5.4';
+  const model = getEvaluatorModel();
   const baseUrl = (process.env.CURATOR_LLM_BASE_URL || process.env.BASE_URL || 'https://api.opencodex.uk/v1').replace(
     /\/$/,
     ''
@@ -457,6 +467,7 @@ function decisionNode(state: WorkflowState): Partial<WorkflowState> {
 }
 
 async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
+  const model = getEvaluatorModel();
   try {
     const llm = await callLlm(state);
     if (llm) {
@@ -472,10 +483,22 @@ async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowSta
         cwdMatchesWorkdir,
         recommendedWorkdir: llm.recommendedWorkdir ?? (cwdMatchesWorkdir === false ? actualWorkdirs[0] ?? null : null),
         remoteMachines,
+        model,
+        status: 'ok',
+        error: null,
       };
     }
   } catch (error) {
     console.warn('[Evaluator] GPT summary failed:', error instanceof Error ? error.message : error);
+    const summary = summarize(state.messages, state.cwd);
+    return {
+      title: fallbackTitle(summary, state.cwd),
+      summary,
+      detailedSummary: fallbackDetailedSummary(state.messages, state.cwd),
+      model,
+      status: 'failed',
+      error: error instanceof Error ? error.message.slice(0, 240) : 'GPT summary failed',
+    };
   }
 
   const summary = summarize(state.messages, state.cwd);
@@ -483,6 +506,9 @@ async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowSta
     title: fallbackTitle(summary, state.cwd),
     summary,
     detailedSummary: fallbackDetailedSummary(state.messages, state.cwd),
+    model,
+    status: 'fallback',
+    error: null,
   };
 }
 
@@ -517,5 +543,8 @@ export async function evaluateSession(input: {
     remoteMachines: result.remoteMachines ?? [],
     evaluatedAt: new Date().toISOString(),
     workflow: EVALUATOR_WORKFLOW,
+    model: result.model ?? getEvaluatorModel(),
+    status: result.status ?? 'fallback',
+    error: result.error ?? null,
   };
 }

@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath } from './file-ops.js';
-import { deleteAgentSession, fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
+import { checkRemoteAgent, deleteAgentSession, fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
@@ -25,6 +25,7 @@ const remoteAgents = getRemoteAgents();
 const sessionCacheTtlMs = Number(process.env.CURATOR_SESSION_CACHE_TTL_MS || 8000);
 const remoteSessionCacheTtlMs = Number(process.env.CURATOR_REMOTE_SESSION_CACHE_TTL_MS || 15000);
 let localSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnType<SessionService['listSessions']>>> } | null = null;
+let localFastSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnType<SessionService['listSessions']>>> } | null = null;
 let remoteSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnType<typeof fetchAgentSessions>>[]> } | null = null;
 
 const keepSchema = z.object({ kept: z.boolean() });
@@ -33,6 +34,19 @@ const migrateSchema = z.object({ targetProjectDir: z.string().min(1).max(1000) }
 const confirmSchema = z.object({ confirm: z.literal(true) });
 const bulkDeleteSchema = z.object({ confirm: z.literal(true), ids: z.array(z.string().min(1).max(160)).min(1).max(200) });
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
+
+function toSessionSummary(session: Awaited<ReturnType<SessionService['listSessions']>>[number]) {
+  return {
+    ...session,
+    evaluation: {
+      ...session.evaluation,
+      detailedSummary: '',
+      reasons: session.evaluation.reasons.slice(0, 2),
+      actualWorkdirs: session.evaluation.actualWorkdirs.slice(0, 4),
+      remoteMachines: session.evaluation.remoteMachines.slice(0, 3),
+    },
+  };
+}
 
 async function deleteSessionById(id: string) {
   try {
@@ -51,15 +65,25 @@ async function deleteSessionById(id: string) {
 
 function clearSessionCaches(): void {
   localSessionsCache = null;
+  localFastSessionsCache = null;
   remoteSessionsCache = null;
 }
 
-async function getLocalSessionsCached(refreshWorkflow: boolean) {
+async function getLocalSessionsCached(refreshWorkflow: boolean, fast: boolean) {
   if (refreshWorkflow || sessionCacheTtlMs <= 0) {
     clearSessionCaches();
-    return service.listSessions({ refreshWorkflow });
+    return service.listSessions({ refreshWorkflow, fast: false });
   }
   const now = Date.now();
+  if (fast) {
+    if (!localFastSessionsCache || localFastSessionsCache.expiresAt <= now) {
+      localFastSessionsCache = {
+        expiresAt: now + sessionCacheTtlMs,
+        promise: service.listSessions({ refreshWorkflow: false, fast: true }),
+      };
+    }
+    return localFastSessionsCache.promise;
+  }
   if (!localSessionsCache || localSessionsCache.expiresAt <= now) {
     localSessionsCache = {
       expiresAt: now + sessionCacheTtlMs,
@@ -159,11 +183,15 @@ app.get('/api/sessions', async (request) => {
       recommendation: z.enum(['all', 'keep', 'review', 'delete']).optional(),
       refresh: z.enum(['0', '1', 'true', 'false']).optional(),
       remote: z.enum(['0', '1', 'true', 'false']).optional(),
+      detail: z.enum(['0', '1', 'true', 'false']).optional(),
+      page: z.coerce.number().int().min(1).optional(),
+      pageSize: z.coerce.number().int().min(1).max(500).optional(),
     })
     .parse(request.query);
   const refreshWorkflow = query.refresh === '1' || query.refresh === 'true';
   const includeRemote = query.remote !== '0' && query.remote !== 'false';
-  const localSessions = await getLocalSessionsCached(refreshWorkflow);
+  const includeDetails = query.detail !== '0' && query.detail !== 'false';
+  const localSessions = await getLocalSessionsCached(refreshWorkflow, !includeDetails);
   const remoteSessions = refreshWorkflow || !includeRemote
     ? []
     : await getRemoteSessionsCached();
@@ -193,17 +221,37 @@ app.get('/api/sessions', async (request) => {
     return matchesRecommendation && matchesQuery;
   });
 
+  const page = query.page ?? 1;
+  const pageSize = query.pageSize ?? (filtered.length || 1);
+  const paged = filtered.slice((page - 1) * pageSize, page * pageSize);
+
   return {
     meta: { ...service.getMeta(), remoteAgents: remoteAgents.map((agent) => ({ id: agent.id, baseUrl: agent.baseUrl })) },
-    sessions: filtered,
+    sessions: includeDetails ? paged : paged.map(toSessionSummary),
     total: sessions.length,
+    filteredTotal: filtered.length,
+    page,
+    pageSize,
   };
 });
+
+app.get('/api/remote-agents', async () => ({
+  agents: await Promise.all(remoteAgents.map((agent) => checkRemoteAgent(agent))),
+}));
 
 app.get('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const session = await service.getSession(params.id);
-  if (!session) return reply.code(404).send({ error: 'Session not found' });
+  if (!session) {
+    for (const agent of remoteAgents) {
+      try {
+        return await fetchAgentJson(agent, `/api/sessions/${encodeURIComponent(params.id)}`);
+      } catch {
+        // Try the next remote agent.
+      }
+    }
+    return reply.code(404).send({ error: 'Session not found' });
+  }
   return session;
 });
 
@@ -285,6 +333,29 @@ app.get('/api/recycle-bin', async () => ({
   meta: service.getMeta(),
   archives: await service.listRecycleBin(),
 }));
+
+app.post('/api/recycle-bin/:id/restore', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  confirmSchema.parse(request.body);
+  try {
+    const result = await service.restoreRecycleArchive(params.id);
+    clearSessionCaches();
+    return result;
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : 'Restore failed' });
+  }
+});
+
+app.delete('/api/recycle-bin/:id', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  confirmSchema.parse(request.body);
+  try {
+    const result = await service.purgeRecycleArchive(params.id);
+    return result;
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : 'Purge failed' });
+  }
+});
 
 app.post('/api/sessions/:id/keep', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);

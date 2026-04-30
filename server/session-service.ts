@@ -1,4 +1,5 @@
 import { stat } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import {
   archiveSessionFiles,
@@ -10,6 +11,8 @@ import {
   getSessionsRoot,
   listRecycleArchives,
   purgeExpiredArchives,
+  permanentlyDeleteArchive,
+  restoreArchive,
   sameResolvedPath,
 } from './file-ops.js';
 import { EVALUATOR_WORKFLOW, evaluateSession } from './evaluator.js';
@@ -74,6 +77,27 @@ function getActivity(updatedAt: string | null): { activityStatus: ActivityStatus
   };
 }
 
+function getCodexBin(): string {
+  return process.env.CODEX_BIN || 'codex';
+}
+
+function verifyResumeCommand(cwd: string | null, id: string): { ok: boolean; output: string } {
+  if (!cwd) return { ok: false, output: '缺少 cwd，无法验证 resume 命令' };
+  const result = spawnSync('timeout', ['5', getCodexBin(), 'resume', '-C', cwd, id], {
+    cwd,
+    env: { ...process.env, TERM: process.env.TERM || 'xterm-256color' },
+    encoding: 'utf8',
+    input: '\u0003',
+    maxBuffer: 200_000,
+  });
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
+  const missing = /No saved session found|no saved session/i.test(output);
+  return {
+    ok: !missing && (result.status === 0 || result.status === 124 || output.length > 0),
+    output: output.slice(0, 1200),
+  };
+}
+
 function cleanRemoteMachines(machines: RemoteMachine[] | undefined): RemoteMachine[] {
   const result: RemoteMachine[] = [];
   const seen = new Set<string>();
@@ -120,6 +144,39 @@ function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation
     remoteMachines: cleanRemoteMachines(evaluation.remoteMachines),
     evaluatedAt: evaluation.evaluatedAt,
     workflow: evaluation.workflow,
+    model: evaluation.model ?? process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
+    status: evaluation.status ?? 'fallback',
+    error: evaluation.error ?? null,
+  };
+}
+
+function fastEvaluation(input: {
+  id: string;
+  cwd: string | null;
+  cached?: StoredEvaluation;
+  userTurns: number;
+  assistantTurns: number;
+  messageCount: number;
+}): Evaluation {
+  if (input.cached?.summary) return publicEvaluation(input.cached);
+  const title = input.cwd?.split('/').filter(Boolean).at(-1) ?? input.id.slice(0, 12);
+  const lowSubstance = input.userTurns <= 2 && input.messageCount <= 5;
+  return {
+    title,
+    summary: input.cwd ? `会话位于 ${input.cwd}，尚未生成完整 AI 摘要。` : '尚未生成完整 AI 摘要。',
+    detailedSummary: '',
+    recommendation: lowSubstance ? 'delete' : 'review',
+    score: lowSubstance ? 1 : 3,
+    reasons: ['轻量列表快速扫描，点击详情或执行 AI 重算后生成完整依据'],
+    actualWorkdirs: input.cwd ? [input.cwd] : [],
+    cwdMatchesWorkdir: input.cwd ? true : null,
+    recommendedWorkdir: null,
+    remoteMachines: [],
+    evaluatedAt: new Date().toISOString(),
+    workflow: `${EVALUATOR_WORKFLOW}:fast-list`,
+    model: process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
+    status: 'fallback',
+    error: null,
   };
 }
 
@@ -168,7 +225,7 @@ export class SessionService {
     };
   }
 
-  async listSessions(options: { refreshWorkflow?: boolean } = {}): Promise<CodexSession[]> {
+  async listSessions(options: { refreshWorkflow?: boolean; fast?: boolean } = {}): Promise<CodexSession[]> {
     const state = await this.store.load();
     const files = await findJsonlFiles(this.sessionsRoot);
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
@@ -187,19 +244,12 @@ export class SessionService {
           cached &&
           cached.filePath === filePath &&
           hasCachedMetadata(cached) &&
-          (!options.refreshWorkflow ||
-            (cached.workflow === EVALUATOR_WORKFLOW &&
-              cached.bytes === fileStat.size &&
-              cached.mtimeMs === fileStat.mtimeMs));
+          !options.refreshWorkflow &&
+          cached.workflow === EVALUATOR_WORKFLOW &&
+          cached.bytes === fileStat.size &&
+          cached.mtimeMs === fileStat.mtimeMs;
 
         if (canUseCache) {
-          if (!options.refreshWorkflow && (cached.bytes !== fileStat.size || cached.mtimeMs !== fileStat.mtimeMs)) {
-            cached.bytes = fileStat.size;
-            cached.mtimeMs = fileStat.mtimeMs;
-            cached.updatedAt = new Date(fileStat.mtimeMs).toISOString();
-            state.evaluations[id] = cached;
-            stateChanged = true;
-          }
           sessions.push(enrichSession({
             id,
             filePath,
@@ -253,7 +303,19 @@ export class SessionService {
               remoteMachines: cached.remoteMachines ?? [],
               evaluatedAt: cached.evaluatedAt,
               workflow: cached.workflow,
+              model: cached.model ?? process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
+              status: cached.status ?? 'fallback',
+              error: cached.error ?? null,
             }
+          : options.fast
+            ? fastEvaluation({
+                id: parsed.id,
+                cwd: parsed.cwd,
+                cached,
+                userTurns: parsed.userTurns,
+                assistantTurns: parsed.assistantTurns,
+                messageCount: parsed.messageCount,
+              })
           : await evaluateSession({
               messages: parsed.messages,
               userTurns: parsed.userTurns,
@@ -374,6 +436,7 @@ export class SessionService {
         verifiedCwd: session.cwd,
         resumeCommand: `codex resume -C ${session.cwd} ${id}`,
         alreadyInTarget: true,
+        verifyResume: verifyResumeCommand(session.cwd, id),
       };
     }
     const result = await copySessionToProject({
@@ -382,7 +445,10 @@ export class SessionService {
       filePath: session.filePath,
       targetProjectDir,
     });
-    return result;
+    return {
+      ...result,
+      verifyResume: verifyResumeCommand(result.targetProjectDir, result.newSessionId),
+    };
   }
 
   async cleanupRecycleBin() {
@@ -391,6 +457,20 @@ export class SessionService {
 
   async listRecycleBin() {
     return listRecycleArchives({ recycleRoot: getRecycleRoot() });
+  }
+
+  async restoreRecycleArchive(sessionId: string) {
+    const result = await restoreArchive({
+      codexHome: this.codexHome,
+      recycleRoot: getRecycleRoot(),
+      sessionId,
+    });
+    await this.store.unmarkDeleted(sessionId);
+    return result;
+  }
+
+  async purgeRecycleArchive(sessionId: string) {
+    return permanentlyDeleteArchive({ recycleRoot: getRecycleRoot(), sessionId });
   }
 
   async pruneRecommended(recommendation: Recommendation = 'delete') {

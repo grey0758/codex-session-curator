@@ -56,6 +56,13 @@ export class CuratorStore {
     return state;
   }
 
+  async unmarkDeleted(id: string): Promise<PersistedState> {
+    const state = await this.load();
+    state.deletedIds = state.deletedIds.filter((deletedId) => deletedId !== id);
+    await this.save(state);
+    return state;
+  }
+
   async setTitle(id: string, title: string): Promise<PersistedState> {
     const state = await this.load();
     const cleanTitle = title.trim();
