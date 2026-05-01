@@ -98,6 +98,9 @@ function hasTmux(): boolean {
 
 function configureTmuxSession(name: string, env: NodeJS.ProcessEnv): void {
   spawnSync('tmux', ['set-option', '-t', name, 'status', 'off'], { env, stdio: 'ignore' });
+  spawnSync('tmux', ['set-option', '-t', name, 'mouse', 'off'], { env, stdio: 'ignore' });
+  spawnSync('tmux', ['set-option', '-t', name, 'history-limit', '50000'], { env, stdio: 'ignore' });
+  spawnSync('tmux', ['set-window-option', '-t', name, 'alternate-screen', 'off'], { env, stdio: 'ignore' });
 }
 
 function ensureTmuxSession(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv): string | null {

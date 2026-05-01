@@ -380,21 +380,34 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     const handleContextMenu = (event: MouseEvent) => {
       event.preventDefault();
       terminal.focus();
-      setContextMenu({ x: event.clientX, y: event.clientY });
+      if (event.shiftKey || event.ctrlKey || event.metaKey) {
+        setContextMenu({ x: event.clientX, y: event.clientY });
+        return;
+      }
+      if (terminal.hasSelection()) {
+        void copyTerminalSelection();
+        return;
+      }
+      void pasteIntoTerminal();
     };
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
       event.stopPropagation();
+      event.stopImmediatePropagation();
       const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
       terminal.scrollLines(event.deltaY > 0 ? lines : -lines);
     };
     container.addEventListener('paste', handlePaste);
     container.addEventListener('contextmenu', handleContextMenu);
-    container.addEventListener('wheel', handleWheel, { capture: true, passive: false });
+    const wheelTarget = (container.querySelector('.xterm-viewport') as HTMLElement | null) ?? container;
+    const wheelListener = handleWheel as EventListener;
+    container.addEventListener('wheel', wheelListener, { capture: true, passive: false });
+    wheelTarget.addEventListener('wheel', wheelListener, { capture: true, passive: false });
     terminalCleanupRef.current = () => {
       container.removeEventListener('paste', handlePaste);
       container.removeEventListener('contextmenu', handleContextMenu);
-      container.removeEventListener('wheel', handleWheel, true);
+      container.removeEventListener('wheel', wheelListener, true);
+      wheelTarget.removeEventListener('wheel', wheelListener, true);
     };
 
     let lastResize = '';
@@ -457,7 +470,7 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
       terminal.writeln('\r\n[error] WebSocket 连接失败');
       setTerminalStatus('disconnected');
     };
-  }, [session]);
+  }, [copyTerminalSelection, pasteIntoTerminal, session]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -549,7 +562,6 @@ function App() {
   const [copiedResumeId, setCopiedResumeId] = useState<string | null>(null);
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [openedTerminalIds, setOpenedTerminalIds] = useState<string[]>([]);
-  const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
@@ -663,7 +675,7 @@ function App() {
         .filter((session): session is CodexSession => Boolean(session)),
     [allSessions, openedTerminalIds]
   );
-  const activeTerminalSession = openedTerminalSessions.find((session) => session.id === activeTerminalId) ?? openedTerminalSessions[0] ?? null;
+  const selectedTerminalSession = openedTerminalSessions.find((session) => session.id === selected?.id) ?? null;
   const visibleRecycleArchives = useMemo(() => {
     const needle = (recycleQuery || query).trim().toLowerCase();
     if (!needle) return recycleArchives;
@@ -715,15 +727,10 @@ function App() {
 
   const openTerminal = useCallback((session: CodexSession) => {
     setOpenedTerminalIds((current) => (current.includes(session.id) ? current : [...current, session.id]));
-    setActiveTerminalId(session.id);
   }, []);
 
   const closeTerminal = useCallback((id: string) => {
-    setOpenedTerminalIds((current) => {
-      const next = current.filter((item) => item !== id);
-      setActiveTerminalId((active) => (active === id ? next[0] ?? null : active));
-      return next;
-    });
+    setOpenedTerminalIds((current) => current.filter((item) => item !== id));
   }, []);
 
   const copyResumeCommand = useCallback(async (session: CodexSession) => {
@@ -1248,37 +1255,18 @@ function App() {
         {error ? <div className="notice danger">加载失败：{error}</div> : null}
 
         {openedTerminalSessions.length ? (
-          <div className="detail-grid terminal-dock-grid">
+          <div className={`detail-grid terminal-dock-grid${selectedTerminalSession ? '' : ' terminal-dock-hidden'}`}>
             <section className="primary-panel terminal-card">
               <div className="panel-heading terminal-dock-heading">
-                <h3>已打开终端</h3>
-                {activeTerminalSession ? <span>{activeTerminalSession.resumeCommand}</span> : null}
-              </div>
-              <div className="terminal-tabs">
-                {openedTerminalSessions.map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    className={activeTerminalSession?.id === session.id ? 'active' : ''}
-                    onClick={() => setActiveTerminalId(session.id)}
-                  >
-                    <span>{session.title}</span>
-                    <X
-                      size={14}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        closeTerminal(session.id);
-                      }}
-                    />
-                  </button>
-                ))}
+                <h3>当前会话终端</h3>
+                {selectedTerminalSession ? <span>{selectedTerminalSession.resumeCommand}</span> : null}
               </div>
               <div className="terminal-stack">
                 {openedTerminalSessions.map((session) => (
                   <TerminalConsole
                     key={session.id}
                     session={session}
-                    active={activeTerminalSession?.id === session.id}
+                    active={selected?.id === session.id}
                     onClose={() => closeTerminal(session.id)}
                   />
                 ))}

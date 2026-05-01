@@ -678,6 +678,10 @@
   padding-top: 0;
 }
 
+.terminal-dock-hidden {
+  display: none;
+}
+
 .terminal-dock-heading span {
   min-width: 0;
   overflow: hidden;
