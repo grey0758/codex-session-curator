@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
 import {
   Archive,
   AlertTriangle,
@@ -30,6 +31,9 @@ import './App.css';
 type Recommendation = 'keep' | 'review' | 'delete';
 type ActivityStatus = 'active' | 'inactive';
 type TabId = 'all' | 'kept' | 'recycle' | Recommendation;
+type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
+type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
+type SessionListViewMode = 'folder' | 'activityDate';
 
 interface RemoteMachine {
   label: string | null;
@@ -47,6 +51,13 @@ interface Evaluation {
   score: number;
   reasons: string[];
   actualWorkdirs: string[];
+  directoryIndex: string[];
+  techStack: string[];
+  keywords: string[];
+  searchText: string;
+  updateCadence: UpdateCadence;
+  reviewPriority: ReviewPriority;
+  reviewSignals: string[];
   cwdMatchesWorkdir: boolean | null;
   recommendedWorkdir: string | null;
   remoteMachines: RemoteMachine[];
@@ -144,6 +155,12 @@ interface RemoteAgentStatus {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
 
+interface LoginPanelProps {
+  busy: boolean;
+  message: string | null;
+  onLogin: (username: string, password: string) => Promise<void>;
+}
+
 const terminalStatusLabel: Record<TerminalStatus, string> = {
   disconnected: '断开',
   connecting: '连接中',
@@ -172,6 +189,21 @@ const recommendationTone: Record<Recommendation, string> = {
   delete: 'tone-delete',
 };
 
+const cadenceLabel: Record<UpdateCadence, string> = {
+  new: '新会话',
+  quiet: '无新增',
+  low: '低频更新',
+  medium: '中频更新',
+  high: '高频更新',
+};
+
+const priorityLabel: Record<ReviewPriority, string> = {
+  low: '低复核',
+  normal: '常规复核',
+  review: '需要复核新增',
+  reunderstand: '需要重新理解',
+};
+
 function formatDate(value: string | null): string {
   if (!value) return '未知时间';
   const date = new Date(value);
@@ -194,8 +226,79 @@ function normalizePath(value: string | null | undefined): string {
   return (value ?? '').replace(/\/+$/, '');
 }
 
+function LoginPanel({ busy, message, onLogin }: LoginPanelProps) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await onLogin(username, password);
+  }
+
+  return (
+    <main className="login-shell">
+      <section className="login-panel">
+        <div className="login-brand">
+          <div className="brand-mark">
+            <KeyRound size={22} />
+          </div>
+          <div>
+            <h1>Codex Session Curator</h1>
+            <p>整理、检索和归档本机 Codex 会话</p>
+          </div>
+        </div>
+        <form className="login-form" onSubmit={submit}>
+          <label>
+            <span>用户名</span>
+            <input value={username} autoComplete="username" onChange={(event) => setUsername(event.target.value)} />
+          </label>
+          <label>
+            <span>密码</span>
+            <input
+              value={password}
+              type="password"
+              autoComplete="current-password"
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </label>
+          {message ? <div className="login-message">{message}</div> : null}
+          <button type="submit" className="primary-button login-submit" disabled={busy || !username || !password}>
+            {busy ? <Loader2 size={17} className="spin" /> : <ShieldCheck size={17} />}
+            登录
+          </button>
+        </form>
+        <p className="login-note">也可以通过管理员 token 链接进入，服务端会换取 HttpOnly 登录 cookie。</p>
+      </section>
+    </main>
+  );
+}
+
 function sessionGroupKey(session: CodexSession): string {
-  return `${session.machineId}|||${normalizePath(session.cwd) || 'unknown cwd'}`;
+  return `folder|||${session.machineId}|||${normalizePath(session.cwd) || 'unknown cwd'}`;
+}
+
+function activityDateGroup(session: CodexSession): { key: string; label: string; title: string; sortTime: number } {
+  const raw = session.lastActiveAt ?? session.updatedAt ?? session.startedAt;
+  if (!raw) return { key: 'activity|||unknown', label: '活跃日期', title: '未知活跃时间', sortTime: 0 };
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return { key: `activity|||${raw}`, label: '活跃日期', title: raw, sortTime: 0 };
+  const dateKey = [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const dayDiff = Math.round((todayStart - dayStart) / 86_400_000);
+  const weekday = new Intl.DateTimeFormat('zh-CN', { weekday: 'short' }).format(date);
+  const prefix = dayDiff === 0 ? '今天' : dayDiff === 1 ? '昨天' : dayDiff > 1 && dayDiff <= 6 ? `${dayDiff}天前` : dateKey;
+  return {
+    key: `activity|||${dateKey}`,
+    label: '活跃日期',
+    title: `${prefix} · ${weekday}`,
+    sortTime: dayStart,
+  };
 }
 
 function matchesSearch(session: CodexSession, query: string): boolean {
@@ -208,7 +311,11 @@ function matchesSearch(session: CodexSession, query: string): boolean {
     session.machineId,
     session.evaluation.summary,
     session.evaluation.detailedSummary,
+    session.evaluation.searchText ?? '',
     ...session.evaluation.actualWorkdirs,
+    ...(session.evaluation.directoryIndex ?? []),
+    ...(session.evaluation.techStack ?? []),
+    ...(session.evaluation.keywords ?? []),
     session.evaluation.recommendedWorkdir ?? '',
     ...session.evaluation.remoteMachines.map((machine) =>
       [machine.label, machine.host, machine.ip, machine.user].filter(Boolean).join(' ')
@@ -550,6 +657,7 @@ function App() {
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
   const [machineFilter, setMachineFilter] = useState('all');
+  const [listViewMode, setListViewMode] = useState<SessionListViewMode>('folder');
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -568,6 +676,9 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
   const [recycleQuery, setRecycleQuery] = useState('');
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
 
   const refreshRemoteStatuses = useCallback(async () => {
     try {
@@ -594,10 +705,17 @@ function App() {
         fetch(`/api/sessions?${localParams.toString()}`),
         fetch('/api/recycle-bin'),
       ]);
+      if (localResponse.status === 401 || recycleResponse.status === 401) {
+        setAuthRequired(true);
+        setLoading(false);
+        return;
+      }
       if (!localResponse.ok) throw new Error(`HTTP ${localResponse.status}`);
       if (!recycleResponse.ok) throw new Error(`Recycle HTTP ${recycleResponse.status}`);
       const payload = (await localResponse.json()) as ApiPayload;
       const recyclePayload = (await recycleResponse.json()) as RecyclePayload;
+      setAuthRequired(false);
+      setAuthMessage(null);
       setAllSessions(payload.sessions);
       setRecycleArchives(recyclePayload.archives);
       setMeta(payload.meta);
@@ -617,6 +735,37 @@ function App() {
       setLoading(false);
     }
   }, [refreshRemoteStatuses]);
+
+  async function login(username: string, password: string) {
+    setAuthBusy(true);
+    setAuthMessage(null);
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      if (!response.ok) {
+        setAuthMessage(response.status === 401 ? '用户名或密码不正确' : `登录失败：HTTP ${response.status}`);
+        return;
+      }
+      setAuthRequired(false);
+      await loadSessions();
+    } catch (err) {
+      setAuthMessage(err instanceof Error ? err.message : '登录失败');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function logout() {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
+    setAuthRequired(true);
+    setAllSessions([]);
+    setSessionDetails({});
+    setRecycleArchives([]);
+    setSelectedId(null);
+  }
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
@@ -639,22 +788,37 @@ function App() {
   );
 
   const groupedSessions = useMemo(() => {
-    const groups = new Map<string, { key: string; machineId: string; cwd: string; sessions: CodexSession[] }>();
+    const groups = new Map<string, { key: string; label: string; title: string; sortTime: number; sessions: CodexSession[] }>();
     for (const session of visibleSessions) {
-      const key = sessionGroupKey(session);
+      const group =
+        listViewMode === 'activityDate'
+          ? activityDateGroup(session)
+          : {
+              key: sessionGroupKey(session),
+              label: session.machineId,
+              title: normalizePath(session.cwd) || 'unknown cwd',
+              sortTime: Date.parse(session.updatedAt ?? session.startedAt ?? '') || 0,
+            };
+      const key = group.key;
       const current =
         groups.get(key) ??
         {
           key,
-          machineId: session.machineId,
-          cwd: normalizePath(session.cwd) || 'unknown cwd',
+          label: group.label,
+          title: group.title,
+          sortTime: group.sortTime,
           sessions: [],
         };
       current.sessions.push(session);
+      current.sortTime = Math.max(current.sortTime, group.sortTime);
       groups.set(key, current);
     }
-    return [...groups.values()].sort((a, b) => b.sessions.length - a.sessions.length || a.cwd.localeCompare(b.cwd));
-  }, [visibleSessions]);
+    return [...groups.values()].sort((a, b) =>
+      listViewMode === 'activityDate'
+        ? b.sortTime - a.sortTime || b.sessions.length - a.sessions.length
+        : b.sessions.length - a.sessions.length || a.title.localeCompare(b.title)
+    );
+  }, [listViewMode, visibleSessions]);
 
   const selectedSummary = useMemo(
     () => visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0] ?? null,
@@ -824,6 +988,20 @@ function App() {
     }
   }
 
+  function removeSessionsFromPanel(ids: string[]) {
+    const removedIds = new Set(ids);
+    if (!removedIds.size) return;
+    setAllSessions((current) => current.filter((item) => !removedIds.has(item.id)));
+    setSessionDetails((current) => {
+      const next = { ...current };
+      for (const id of removedIds) delete next[id];
+      return next;
+    });
+    setSelectedSessionIds((current) => current.filter((id) => !removedIds.has(id)));
+    setOpenedTerminalIds((current) => current.filter((id) => !removedIds.has(id)));
+    setSelectedId((current) => (current && removedIds.has(current) ? null : current));
+  }
+
   async function deleteSession(session: CodexSession) {
     if (!window.confirm(`只删除当前机器 ${session.machineId} 上的会话：${session.id}？会先移入回收站，原 Codex 活跃目录会被清除。`)) return;
     setBusyId(session.id);
@@ -834,7 +1012,8 @@ function App() {
         body: JSON.stringify({ confirm: true }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await loadSessions();
+      removeSessionsFromPanel([session.id]);
+      void loadSessions();
     } finally {
       setBusyId(null);
     }
@@ -851,11 +1030,18 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true, ids: selectedSessionIds }),
       });
-      const payload = (await response.json()) as { deleted?: number; failed?: number; error?: string };
+      const payload = (await response.json()) as {
+        deleted?: number;
+        failed?: number;
+        error?: string;
+        results?: Array<{ id: string; ok: boolean }>;
+      };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      const deletedIds = (payload.results ?? []).filter((item) => item.ok).map((item) => item.id);
+      removeSessionsFromPanel(deletedIds);
       setActionMessage(`已移入回收站 ${payload.deleted ?? 0} 个会话，失败 ${payload.failed ?? 0} 个`);
       setSelectedSessionIds([]);
-      await loadSessions();
+      void loadSessions();
     } catch (err) {
       setActionMessage(`批量删除失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
@@ -1017,6 +1203,10 @@ function App() {
     }
   }
 
+  if (authRequired) {
+    return <LoginPanel busy={authBusy} message={authMessage} onLogin={login} />;
+  }
+
   return (
     <main className="shell">
       <aside className="rail">
@@ -1032,7 +1222,7 @@ function App() {
 
         <div className="search-box">
           <Search size={18} />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 key / cwd / 机器 / 摘要" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 key / cwd / 机器 / 技术栈 / 关键词" />
         </div>
 
         <div className="machine-filter">
@@ -1044,6 +1234,25 @@ function App() {
               </option>
             ))}
           </select>
+        </div>
+
+        <div className="view-switch" role="group" aria-label="列表显示方式">
+          <button
+            type="button"
+            className={listViewMode === 'folder' ? 'active' : ''}
+            onClick={() => setListViewMode('folder')}
+          >
+            <FolderOpen size={15} />
+            按文件夹
+          </button>
+          <button
+            type="button"
+            className={listViewMode === 'activityDate' ? 'active' : ''}
+            onClick={() => setListViewMode('activityDate')}
+          >
+            <Clock3 size={15} />
+            按活跃日期
+          </button>
         </div>
 
         {remoteStatuses.length ? (
@@ -1152,12 +1361,12 @@ function App() {
                         checked={groupChecked}
                         onClick={(event) => event.stopPropagation()}
                         onChange={() => toggleGroupSelection(groupIds)}
-                        aria-label={`选择目录 ${group.cwd}`}
-                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupIds.length}` : '选择这个目录'}
+                        aria-label={`选择分组 ${group.title}`}
+                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupIds.length}` : '选择这个分组'}
                       />
                       {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
-                      <span>{group.machineId}</span>
-                      <strong>{group.cwd}</strong>
+                      <span>{group.label}</span>
+                      <strong>{group.title}</strong>
                       <em>{group.sessions.length}</em>
                     </div>
                     {collapsed
@@ -1215,7 +1424,7 @@ function App() {
               type="button"
               className="primary-button"
               disabled={loading}
-              title="并发 8 个会话调用 GPT-5.4，重算整段摘要和目录识别"
+              title="调用当前 AI 模型，重算整段摘要和目录识别"
               onClick={() => void loadSessions(true)}
             >
               <Sparkles size={17} />
@@ -1248,6 +1457,9 @@ function App() {
             >
               <Archive size={17} />
               清理非保留
+            </button>
+            <button type="button" className="icon-button" title="退出登录" onClick={() => void logout()}>
+              <KeyRound size={18} />
             </button>
           </div>
         </header>
@@ -1312,6 +1524,12 @@ function App() {
                 <span className="score">score {selected.evaluation.score}</span>
                 <span className={`activity ${selected.activityStatus}`}>
                   {selected.activityStatus === 'active' ? '三天内活跃' : `非活跃${selected.inactiveDays ?? '?'}天`}
+                </span>
+                <span className={`activity cadence-${selected.evaluation.updateCadence ?? 'quiet'}`}>
+                  {cadenceLabel[selected.evaluation.updateCadence ?? 'quiet']}
+                </span>
+                <span className={`activity priority-${selected.evaluation.reviewPriority ?? 'normal'}`}>
+                  {priorityLabel[selected.evaluation.reviewPriority ?? 'normal']}
                 </span>
                 {selected.kept ? <span className="kept">手动保留</span> : null}
               </div>
@@ -1383,6 +1601,40 @@ function App() {
             <section className="primary-panel">
               <h3>整段会话做了什么</h3>
               <p className="long-summary">{selected.evaluation.detailedSummary || selected.evaluation.summary}</p>
+            </section>
+
+            <section className="primary-panel">
+              <h3>搜索索引</h3>
+              <div className="index-section">
+                <span>技术栈</span>
+                <div className="chip-row">
+                  {(selected.evaluation.techStack ?? []).length ? (
+                    (selected.evaluation.techStack ?? []).map((item) => <em key={item}>{item}</em>)
+                  ) : (
+                    <strong>未识别到明确技术栈</strong>
+                  )}
+                </div>
+              </div>
+              <div className="index-section">
+                <span>关键词</span>
+                <div className="chip-row">
+                  {(selected.evaluation.keywords ?? []).length ? (
+                    (selected.evaluation.keywords ?? []).slice(0, 18).map((item) => <em key={item}>{item}</em>)
+                  ) : (
+                    <strong>暂无关键词</strong>
+                  )}
+                </div>
+              </div>
+              <div className="index-section">
+                <span>目录索引</span>
+                <div className="chip-row">
+                  {(selected.evaluation.directoryIndex ?? []).length ? (
+                    (selected.evaluation.directoryIndex ?? []).slice(0, 16).map((item) => <em key={item}>{item}</em>)
+                  ) : (
+                    <strong>暂无目录索引</strong>
+                  )}
+                </div>
+              </div>
             </section>
 
             <section className="primary-panel">
@@ -1501,6 +1753,13 @@ function App() {
                   </li>
                 ))}
               </ul>
+              {(selected.evaluation.reviewSignals ?? []).length ? (
+                <div className="review-signals">
+                  {(selected.evaluation.reviewSignals ?? []).map((signal) => (
+                    <span key={signal}>{signal}</span>
+                  ))}
+                </div>
+              ) : null}
               <div className="workflow">
                 <Sparkles size={16} />
                 摘要版本：{selected.evaluation.workflow} · 模型：{selected.evaluation.model} · 状态：

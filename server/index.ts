@@ -3,15 +3,32 @@ import compress from '@fastify/compress';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
+import type { FastifyRequest } from 'fastify';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath } from './file-ops.js';
-import { checkRemoteAgent, deleteAgentSession, fetchAgentJson, fetchAgentSessions, getRemoteAgents, wsUrlForAgent } from './remote-agents.js';
+import { readAnalysisRuns } from './analysis-log.js';
+import {
+  checkRemoteAgent,
+  deleteAgentSession,
+  deleteAgentSessionsBulk,
+  fetchAgentJson,
+  fetchAgentSessions,
+  getRemoteAgents,
+  wsUrlForAgent,
+} from './remote-agents.js';
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
+import {
+  getEvaluatorBaseUrl,
+  getEvaluatorModel,
+  getEvaluatorProvider,
+  getEvaluatorRpmLimit,
+  getRecommendedEvaluationConcurrency,
+} from './evaluator.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -30,8 +47,13 @@ let remoteSessionsCache: { expiresAt: number; promise: Promise<Awaited<ReturnTyp
 
 const keepSchema = z.object({ kept: z.boolean() });
 const titleSchema = z.object({ title: z.string().max(120) });
+const loginSchema = z.object({ username: z.string().min(1).max(120), password: z.string().min(1).max(300) });
 const migrateSchema = z.object({ targetProjectDir: z.string().min(1).max(1000) });
 const confirmSchema = z.object({ confirm: z.literal(true) });
+const backfillSchema = z.object({
+  limit: z.number().int().min(1).max(200).optional(),
+  includeFailed: z.boolean().optional(),
+});
 const bulkDeleteSchema = z.object({ confirm: z.literal(true), ids: z.array(z.string().min(1).max(160)).min(1).max(200) });
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
 
@@ -43,6 +65,10 @@ function toSessionSummary(session: Awaited<ReturnType<SessionService['listSessio
       detailedSummary: '',
       reasons: session.evaluation.reasons.slice(0, 2),
       actualWorkdirs: session.evaluation.actualWorkdirs.slice(0, 4),
+      directoryIndex: (session.evaluation.directoryIndex ?? []).slice(0, 16),
+      techStack: (session.evaluation.techStack ?? []).slice(0, 12),
+      keywords: (session.evaluation.keywords ?? []).slice(0, 18),
+      reviewSignals: (session.evaluation.reviewSignals ?? []).slice(0, 3),
       remoteMachines: session.evaluation.remoteMachines.slice(0, 3),
     },
   };
@@ -61,6 +87,43 @@ async function deleteSessionById(id: string) {
     }
     throw localError;
   }
+}
+
+async function deleteSessionsByIdsBulk(ids: string[], includeRemote: boolean) {
+  const cleanIds = [...new Set(ids)];
+  const resultsById = new Map<string, { id: string; ok: boolean; result?: unknown; error?: string }>();
+  const local = await service.deleteSessionsBulk(cleanIds);
+
+  for (const item of local.deleted) {
+    resultsById.set(item.sessionId, { id: item.sessionId, ok: true, result: item });
+  }
+
+  let unresolvedIds = local.missingIds;
+  if (includeRemote) {
+    for (const agent of remoteAgents) {
+      if (!unresolvedIds.length) break;
+      try {
+        const payload = await deleteAgentSessionsBulk<{
+          results?: Array<{ id: string; ok: boolean; result?: unknown; error?: string }>;
+        }>(agent, unresolvedIds);
+        const deletedOnAgent = new Set<string>();
+        for (const item of payload.results ?? []) {
+          if (!item.ok) continue;
+          deletedOnAgent.add(item.id);
+          resultsById.set(item.id, { id: item.id, ok: true, result: item.result });
+        }
+        unresolvedIds = unresolvedIds.filter((id) => !deletedOnAgent.has(id));
+      } catch {
+        // Try the next remote agent.
+      }
+    }
+  }
+
+  for (const id of unresolvedIds) {
+    resultsById.set(id, { id, ok: false, error: `Session not found: ${id}` });
+  }
+
+  return cleanIds.map((id) => resultsById.get(id) ?? { id, ok: false, error: `Session not found: ${id}` });
 }
 
 function clearSessionCaches(): void {
@@ -120,6 +183,60 @@ await app.register(cors, { origin: true });
 await app.register(compress, { global: true, encodings: ['br', 'gzip', 'deflate'] });
 await app.register(websocket);
 
+function parseCookies(header: string | undefined): Record<string, string> {
+  return Object.fromEntries(
+    (header ?? '')
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const index = part.indexOf('=');
+        return index === -1 ? [part, ''] : [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+      })
+  );
+}
+
+function isHttpsRequest(request: FastifyRequest): boolean {
+  return request.headers['x-forwarded-proto'] === 'https' || request.headers['cf-visitor']?.includes('https') === true;
+}
+
+function authCookie(value: string, request: FastifyRequest, maxAge = 2_592_000): string {
+  const secure = isHttpsRequest(request) ? ' Secure;' : '';
+  return `curator_admin=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge};${secure}`;
+}
+
+function authState(request: FastifyRequest): {
+  enabled: boolean;
+  authenticated: boolean;
+  user: string | null;
+  token: string | null;
+} {
+  const authUser = process.env.CURATOR_AUTH_USER;
+  const authPassword = process.env.CURATOR_AUTH_PASSWORD;
+  const adminToken = process.env.CURATOR_ADMIN_TOKEN;
+  if (!authUser || !authPassword || !adminToken) {
+    return { enabled: false, authenticated: true, user: null, token: adminToken ?? null };
+  }
+
+  const url = new URL(request.url, 'http://127.0.0.1');
+  if (url.searchParams.get('admin_token') === adminToken) {
+    return { enabled: true, authenticated: true, user: authUser, token: adminToken };
+  }
+
+  const cookies = parseCookies(request.headers.cookie);
+  if (cookies.curator_admin === adminToken) {
+    return { enabled: true, authenticated: true, user: authUser, token: adminToken };
+  }
+
+  const header = request.headers.authorization;
+  const expected = `Basic ${Buffer.from(`${authUser}:${authPassword}`).toString('base64')}`;
+  if (header === expected) {
+    return { enabled: true, authenticated: true, user: authUser, token: adminToken };
+  }
+
+  return { enabled: true, authenticated: false, user: null, token: adminToken };
+}
+
 app.addHook('onSend', async (request, reply, payload) => {
   if (request.url.startsWith('/assets/')) {
     reply.header('Cache-Control', 'public, max-age=31536000, immutable');
@@ -131,50 +248,94 @@ app.addHook('onSend', async (request, reply, payload) => {
 });
 
 app.addHook('onRequest', async (request, reply) => {
-  const authUser = process.env.CURATOR_AUTH_USER;
-  const authPassword = process.env.CURATOR_AUTH_PASSWORD;
-  const adminToken = process.env.CURATOR_ADMIN_TOKEN;
-  if (!authUser || !authPassword || !adminToken) return;
+  const auth = authState(request);
+  if (!auth.enabled) return;
 
   const url = new URL(request.url, 'http://127.0.0.1');
+  const isAuthRoute = url.pathname === '/api/auth/status' || url.pathname === '/api/auth/login' || url.pathname === '/api/auth/logout';
+  const isAsset = url.pathname.startsWith('/assets/') || url.pathname === '/favicon.ico';
+  const isPage = request.method === 'GET' && !url.pathname.startsWith('/api/') && !request.headers.upgrade;
+  if (isAuthRoute || isAsset || isPage) {
+    const adminToken = process.env.CURATOR_ADMIN_TOKEN;
+    if (adminToken && url.searchParams.get('admin_token') === adminToken) {
+      url.searchParams.delete('admin_token');
+      reply.header('Set-Cookie', authCookie(adminToken, request));
+      if (request.method === 'GET' && url.pathname === '/' && !request.headers.upgrade) {
+        await reply.redirect(`${url.pathname}${url.search}${url.hash}` || '/');
+        return;
+      }
+    }
+    return;
+  }
+
   const requestToken = url.searchParams.get('admin_token');
-  if (requestToken === adminToken) {
+  const adminToken = process.env.CURATOR_ADMIN_TOKEN;
+  if (adminToken && requestToken === adminToken) {
     url.searchParams.delete('admin_token');
     const cleanPath = `${url.pathname}${url.search}${url.hash}`;
-    const isHttps = request.headers['x-forwarded-proto'] === 'https' || request.headers['cf-visitor']?.includes('https');
-    const secure = isHttps ? ' Secure;' : '';
-    reply.header(
-      'Set-Cookie',
-      `curator_admin=${encodeURIComponent(adminToken)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000;${secure}`
-    );
-    if (request.method === 'GET') {
+    reply.header('Set-Cookie', authCookie(adminToken, request));
+    if (request.method === 'GET' && url.pathname === '/' && !request.headers.upgrade) {
       await reply.redirect(cleanPath || '/');
       return;
     }
     return;
   }
 
-  const cookies = Object.fromEntries(
-    (request.headers.cookie ?? '')
-      .split(';')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const index = part.indexOf('=');
-        return index === -1 ? [part, ''] : [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
-      })
-  );
-  if (cookies.curator_admin === adminToken) return;
+  if (auth.authenticated) return;
 
-  const header = request.headers.authorization;
-  const expected = `Basic ${Buffer.from(`${authUser}:${authPassword}`).toString('base64')}`;
-  if (header === expected) return;
-
-  reply.header('WWW-Authenticate', 'Basic realm="Codex Session Curator"');
   await reply.code(401).send({ error: 'Authentication required' });
 });
 
+app.get('/api/auth/status', async (request) => {
+  const auth = authState(request);
+  return {
+    enabled: auth.enabled,
+    authenticated: auth.authenticated,
+    user: auth.authenticated ? auth.user : null,
+    tokenLogin: Boolean(process.env.CURATOR_ADMIN_TOKEN),
+  };
+});
+
+app.post('/api/auth/login', async (request, reply) => {
+  const authUser = process.env.CURATOR_AUTH_USER;
+  const authPassword = process.env.CURATOR_AUTH_PASSWORD;
+  const adminToken = process.env.CURATOR_ADMIN_TOKEN;
+  if (!authUser || !authPassword || !adminToken) {
+    return { ok: true, authenticated: true, user: null };
+  }
+
+  const body = loginSchema.parse(request.body);
+  if (body.username !== authUser || body.password !== authPassword) {
+    return reply.code(401).send({ error: 'Invalid username or password' });
+  }
+  reply.header('Set-Cookie', authCookie(adminToken, request));
+  return { ok: true, authenticated: true, user: authUser };
+});
+
+app.post('/api/auth/logout', async (request, reply) => {
+  reply.header('Set-Cookie', authCookie('', request, 0));
+  return { ok: true };
+});
+
 app.get('/api/meta', async () => service.getMeta());
+
+app.get('/api/analysis-runs', async () => {
+  const records = await readAnalysisRuns(160);
+  const now = Date.now();
+  const lastHourRecords = records.filter((record) => now - Date.parse(record.timestamp) <= 60 * 60_000);
+  return {
+    provider: getEvaluatorProvider(),
+    model: getEvaluatorModel(),
+    baseUrl: getEvaluatorBaseUrl(),
+    rpmLimit: getEvaluatorRpmLimit(),
+    concurrency: getRecommendedEvaluationConcurrency(),
+    records: records.slice(-40).reverse(),
+    lastMinute: records.filter((record) => now - Date.parse(record.timestamp) <= 60_000).length,
+    lastHour: lastHourRecords.length,
+    successLastHour: lastHourRecords.filter((record) => record.status === 'ok').length,
+    failedLastHour: lastHourRecords.filter((record) => record.status === 'failed').length,
+  };
+});
 
 app.get('/api/sessions', async (request) => {
   const query = z
@@ -209,7 +370,11 @@ app.get('/api/sessions', async (request) => {
       session.machineId,
       session.evaluation.summary,
       session.evaluation.detailedSummary,
+      session.evaluation.searchText ?? '',
       ...session.evaluation.actualWorkdirs,
+      ...(session.evaluation.directoryIndex ?? []),
+      ...(session.evaluation.techStack ?? []),
+      ...(session.evaluation.keywords ?? []),
       session.evaluation.recommendedWorkdir ?? '',
       ...session.evaluation.remoteMachines.map((machine) =>
         [machine.label, machine.host, machine.ip, machine.user].filter(Boolean).join(' ')
@@ -282,7 +447,7 @@ app.get('/api/sessions/:id/history', async (request, reply) => {
 
 app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, request) => {
   const params = sessionIdSchema.parse(request.params);
-  const session = await service.getSession(params.id);
+  const session = await service.getSessionFast(params.id);
   if (!session) {
     for (const candidate of remoteAgents) {
       try {
@@ -415,15 +580,8 @@ app.post('/api/sessions/prune-non-kept', async (request) => {
 
 app.post('/api/sessions/bulk-delete', async (request) => {
   const body = bulkDeleteSchema.parse(request.body);
-  const results = [];
-  for (const id of body.ids) {
-    try {
-      const result = await deleteSessionById(id);
-      results.push({ id, ok: true, result });
-    } catch (error) {
-      results.push({ id, ok: false, error: error instanceof Error ? error.message : 'Delete failed' });
-    }
-  }
+  const query = request.query as { remote?: string };
+  const results = await deleteSessionsByIdsBulk(body.ids, query.remote !== '0');
   clearSessionCaches();
   return {
     deleted: results.filter((result) => result.ok).length,
@@ -434,6 +592,13 @@ app.post('/api/sessions/bulk-delete', async (request) => {
 
 app.post('/api/evaluations/retry-failed', async () => {
   const result = await service.queueFailedSummaryRetry();
+  clearSessionCaches();
+  return result;
+});
+
+app.post('/api/evaluations/backfill', async (request) => {
+  const body = backfillSchema.parse(request.body ?? {});
+  const result = await service.backfillEvaluations({ limit: body.limit, includeFailed: body.includeFailed });
   clearSessionCaches();
   return result;
 });

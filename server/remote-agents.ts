@@ -48,15 +48,26 @@ export function getRemoteAgents(): RemoteAgent[] {
 }
 
 export function wsUrlForAgent(agent: RemoteAgent, path: string): string {
-  const url = new URL(path, `${agent.baseUrl}/`);
+  const url = remoteUrl(agent, path);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
+}
+
+function getRemoteAdminToken(): string | null {
+  return process.env.CURATOR_REMOTE_ADMIN_TOKEN || process.env.CURATOR_ADMIN_TOKEN || null;
+}
+
+function remoteUrl(agent: RemoteAgent, path: string): URL {
+  const url = new URL(path, `${agent.baseUrl}/`);
+  const token = getRemoteAdminToken();
+  if (token && !url.searchParams.has('admin_token')) url.searchParams.set('admin_token', token);
+  return url;
 }
 
 export async function fetchAgentSessions(agent: RemoteAgent): Promise<CodexSession[]> {
   try {
     const response = await fetchWithTimeout(
-      `${agent.baseUrl}/api/sessions`,
+      remoteUrl(agent, '/api/sessions?detail=0&remote=0'),
       timeoutMs('CURATOR_REMOTE_SESSIONS_TIMEOUT_MS', DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS)
     );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -72,7 +83,7 @@ export async function checkRemoteAgent(agent: RemoteAgent): Promise<RemoteAgentS
   const started = Date.now();
   try {
     const response = await fetchWithTimeout(
-      `${agent.baseUrl}/api/meta`,
+      remoteUrl(agent, '/api/meta'),
       timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
     );
     const latencyMs = Date.now() - started;
@@ -100,7 +111,7 @@ export async function checkRemoteAgent(agent: RemoteAgent): Promise<RemoteAgentS
 
 export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promise<T> {
   const response = await fetchWithTimeout(
-    new URL(path, `${agent.baseUrl}/`),
+    remoteUrl(agent, path),
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
@@ -109,12 +120,26 @@ export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promi
 
 export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
   const response = await fetchWithTimeout(
-    new URL(`/api/sessions/${encodeURIComponent(sessionId)}`, `${agent.baseUrl}/`),
+    remoteUrl(agent, `/api/sessions/${encodeURIComponent(sessionId)}`),
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ confirm: true }),
+    }
+  );
+  if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
+  return (await response.json()) as T;
+}
+
+export async function deleteAgentSessionsBulk<T>(agent: RemoteAgent, sessionIds: string[]): Promise<T> {
+  const response = await fetchWithTimeout(
+    remoteUrl(agent, '/api/sessions/bulk-delete?remote=0'),
+    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true, ids: sessionIds }),
     }
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);

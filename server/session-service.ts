@@ -2,6 +2,7 @@ import { stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import {
+  archiveSessionFilesBulk,
   archiveSessionFiles,
   copySessionToProject,
   countShellSnapshots,
@@ -15,15 +16,22 @@ import {
   restoreArchive,
   sameResolvedPath,
 } from './file-ops.js';
-import { EVALUATOR_WORKFLOW, evaluateSession } from './evaluator.js';
+import { EVALUATOR_WORKFLOW, evaluateSession, getRecommendedEvaluationConcurrency } from './evaluator.js';
 import { extractSessionId, parseSessionFile, parseSessionHistory } from './session-parser.js';
 import { CuratorStore } from './store.js';
-import type { ActivityStatus, CodexSession, Evaluation, Recommendation, RemoteMachine, StoredEvaluation } from './types.js';
+import type {
+  ActivityStatus,
+  CodexSession,
+  Evaluation,
+  Recommendation,
+  RemoteMachine,
+  ReviewPriority,
+  StoredEvaluation,
+  UpdateCadence,
+} from './types.js';
 
 function getEvaluationConcurrency(): number {
-  const raw = Number(process.env.CURATOR_EVALUATION_CONCURRENCY || 8);
-  if (!Number.isFinite(raw)) return 8;
-  return Math.max(1, Math.min(16, Math.floor(raw)));
+  return getRecommendedEvaluationConcurrency();
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -123,6 +131,118 @@ function cleanRemoteMachines(machines: RemoteMachine[] | undefined): RemoteMachi
   return result.slice(0, 8);
 }
 
+function buildEvaluationSearchText(input: {
+  id?: string;
+  title?: string;
+  resumeCommand?: string;
+  cwd?: string | null;
+  machineId?: string;
+  evaluation: Partial<Evaluation>;
+}): string {
+  const evaluation = input.evaluation;
+  return [
+    input.id ?? '',
+    input.title ?? '',
+    input.resumeCommand ?? '',
+    input.cwd ?? '',
+    input.machineId ?? '',
+    evaluation.title ?? '',
+    evaluation.summary ?? '',
+    evaluation.detailedSummary ?? '',
+    ...(evaluation.actualWorkdirs ?? []),
+    ...(evaluation.directoryIndex ?? []),
+    ...(evaluation.techStack ?? []),
+    ...(evaluation.keywords ?? []),
+    evaluation.recommendedWorkdir ?? '',
+    ...(evaluation.remoteMachines ?? []).map((machine) =>
+      [machine.label, machine.host, machine.ip, machine.user].filter(Boolean).join(' ')
+    ),
+  ]
+    .join(' ')
+    .toLowerCase();
+}
+
+function classifyUpdate(input: {
+  cached?: StoredEvaluation;
+  bytes: number;
+  mtimeMs: number;
+  userTurns: number;
+  messageCount: number;
+}): { updateCadence: UpdateCadence; reviewPriority: ReviewPriority; reviewSignals: string[] } {
+  if (!input.cached) {
+    const activeStart = input.userTurns >= 12 || input.bytes >= 60_000;
+    return {
+      updateCadence: 'new',
+      reviewPriority: activeStart ? 'review' : 'normal',
+      reviewSignals: activeStart ? ['新会话信息量较大，建议完成一次完整理解和标题生成'] : ['新会话，等待首次完整评估'],
+    };
+  }
+
+  const deltaTurns = Math.max(0, input.userTurns - (input.cached.userTurns ?? 0));
+  const deltaMessages = Math.max(0, input.messageCount - (input.cached.messageCount ?? 0));
+  const deltaBytes = Math.max(0, input.bytes - input.cached.bytes);
+  const changed = input.bytes !== input.cached.bytes || input.mtimeMs !== input.cached.mtimeMs;
+  const minutesSinceEvaluation = Math.max(0, (Date.now() - Date.parse(input.cached.evaluatedAt ?? '')) / 60_000);
+  const recentlyEvaluated = Number.isFinite(minutesSinceEvaluation) && minutesSinceEvaluation <= 120;
+
+  if (!changed && input.cached.workflow !== EVALUATOR_WORKFLOW) {
+    return {
+      updateCadence: input.cached.updateCadence ?? 'new',
+      reviewPriority: input.cached.reviewPriority ?? 'normal',
+      reviewSignals: input.cached.reviewSignals?.length
+        ? input.cached.reviewSignals
+        : ['上次只是轻量扫描或待刷新标记，详情页需要完成完整评估'],
+    };
+  }
+
+  if (!changed || (deltaTurns === 0 && deltaMessages === 0 && deltaBytes < 1200)) {
+    return {
+      updateCadence: 'quiet',
+      reviewPriority: 'low',
+      reviewSignals: ['会话未出现有效新增内容，降低复核频率'],
+    };
+  }
+
+  if (deltaTurns >= 6 || deltaMessages >= 12 || deltaBytes >= 18_000 || (recentlyEvaluated && deltaTurns >= 2)) {
+    return {
+      updateCadence: 'high',
+      reviewPriority: 'reunderstand',
+      reviewSignals: [
+        `新增 ${deltaTurns} 个用户回合、${deltaMessages} 条消息、${Math.round(deltaBytes / 1024)} KB 内容`,
+        '会话更新频繁，需要重新理解整段目标并刷新标题、摘要和索引',
+      ],
+    };
+  }
+
+  if (deltaTurns >= 2 || deltaMessages >= 5 || deltaBytes >= 5_000) {
+    return {
+      updateCadence: 'medium',
+      reviewPriority: 'review',
+      reviewSignals: [
+        `新增 ${deltaTurns} 个用户回合、${deltaMessages} 条消息`,
+        '会话有实质变化，建议复核新增内容后再决定保留或删除',
+      ],
+    };
+  }
+
+  return {
+    updateCadence: 'low',
+    reviewPriority: 'normal',
+    reviewSignals: ['会话仅低频小幅更新，保留旧摘要并等待详情页或手动重算'],
+  };
+}
+
+function applyUpdateMeta(evaluation: Evaluation, updateMeta: ReturnType<typeof classifyUpdate>): Evaluation {
+  const reviewSignals = updateMeta.reviewSignals.length ? updateMeta.reviewSignals : evaluation.reviewSignals;
+  return {
+    ...evaluation,
+    updateCadence: updateMeta.updateCadence,
+    reviewPriority: updateMeta.reviewPriority,
+    reviewSignals,
+    searchText: buildEvaluationSearchText({ evaluation }),
+  };
+}
+
 function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation {
   const summary = evaluation.summary || 'No summary available.';
   const recommendation =
@@ -139,6 +259,13 @@ function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation
     score: evaluation.score,
     reasons,
     actualWorkdirs: evaluation.actualWorkdirs ?? [],
+    directoryIndex: evaluation.directoryIndex ?? evaluation.actualWorkdirs ?? [],
+    techStack: evaluation.techStack ?? [],
+    keywords: evaluation.keywords ?? [],
+    searchText: evaluation.searchText ?? buildEvaluationSearchText({ evaluation }),
+    updateCadence: evaluation.updateCadence ?? 'quiet',
+    reviewPriority: evaluation.reviewPriority ?? 'normal',
+    reviewSignals: evaluation.reviewSignals ?? [],
     cwdMatchesWorkdir: evaluation.cwdMatchesWorkdir ?? null,
     recommendedWorkdir: evaluation.recommendedWorkdir ?? null,
     remoteMachines: cleanRemoteMachines(evaluation.remoteMachines),
@@ -157,18 +284,52 @@ function fastEvaluation(input: {
   userTurns: number;
   assistantTurns: number;
   messageCount: number;
+  updateMeta?: ReturnType<typeof classifyUpdate>;
 }): Evaluation {
-  if (input.cached?.summary) return publicEvaluation(input.cached);
+  if (input.cached?.summary) {
+    const cached = publicEvaluation(input.cached);
+    const updateMeta = input.updateMeta ?? {
+      updateCadence: cached.updateCadence,
+      reviewPriority: cached.reviewPriority,
+      reviewSignals: cached.reviewSignals,
+    };
+    return {
+      ...cached,
+      ...updateMeta,
+      workflow:
+        updateMeta.updateCadence === 'quiet'
+          ? cached.workflow
+          : `${EVALUATOR_WORKFLOW}:needs-refresh:${updateMeta.updateCadence}`,
+      reasons:
+        updateMeta.updateCadence === 'quiet'
+          ? cached.reasons
+          : [...cached.reasons, ...updateMeta.reviewSignals].slice(-8),
+    };
+  }
   const title = input.cwd?.split('/').filter(Boolean).at(-1) ?? input.id.slice(0, 12);
   const lowSubstance = input.userTurns <= 2 && input.messageCount <= 5;
-  return {
+  const actualWorkdirs = input.cwd ? [input.cwd] : [];
+  const directoryIndex = input.cwd ? input.cwd.split('/').filter(Boolean).slice(-4) : [];
+  const updateMeta = input.updateMeta ?? {
+    updateCadence: 'new' as const,
+    reviewPriority: 'normal' as const,
+    reviewSignals: ['轻量列表快速扫描，等待完整 AI 摘要'],
+  };
+  const evaluation: Evaluation = {
     title,
     summary: input.cwd ? `会话位于 ${input.cwd}，尚未生成完整 AI 摘要。` : '尚未生成完整 AI 摘要。',
     detailedSummary: '',
     recommendation: lowSubstance ? 'delete' : 'review',
     score: lowSubstance ? 1 : 3,
-    reasons: ['轻量列表快速扫描，点击详情或执行 AI 重算后生成完整依据'],
-    actualWorkdirs: input.cwd ? [input.cwd] : [],
+    reasons: ['轻量列表快速扫描，点击详情或执行 AI 重算后生成完整依据', ...updateMeta.reviewSignals],
+    actualWorkdirs,
+    directoryIndex,
+    techStack: [],
+    keywords: directoryIndex,
+    searchText: '',
+    updateCadence: updateMeta.updateCadence,
+    reviewPriority: updateMeta.reviewPriority,
+    reviewSignals: updateMeta.reviewSignals,
     cwdMatchesWorkdir: input.cwd ? true : null,
     recommendedWorkdir: null,
     remoteMachines: [],
@@ -177,6 +338,10 @@ function fastEvaluation(input: {
     model: process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
     status: 'fallback',
     error: null,
+  };
+  return {
+    ...evaluation,
+    searchText: buildEvaluationSearchText({ id: input.id, cwd: input.cwd, evaluation }),
   };
 }
 
@@ -223,6 +388,25 @@ export class SessionService {
       recycleRetentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
       deleteMode: 'archive-then-local-clean',
     };
+  }
+
+  private async findSessionFilesByIds(ids: string[]): Promise<{
+    found: Array<{ sessionId: string; filePath: string }>;
+    missingIds: string[];
+  }> {
+    const targetIds = new Set(ids.filter(Boolean));
+    const foundById = new Map<string, string>();
+    if (!targetIds.size) return { found: [], missingIds: [] };
+
+    const files = await findJsonlFiles(this.sessionsRoot);
+    for (const filePath of files) {
+      const id = extractSessionId(filePath);
+      if (targetIds.has(id) && !foundById.has(id)) foundById.set(id, filePath);
+    }
+
+    const found = [...foundById.entries()].map(([sessionId, filePath]) => ({ sessionId, filePath }));
+    const missingIds = [...targetIds].filter((id) => !foundById.has(id));
+    return { found, missingIds };
   }
 
   async listSessions(options: { refreshWorkflow?: boolean; fast?: boolean } = {}): Promise<CodexSession[]> {
@@ -284,12 +468,22 @@ export class SessionService {
     const evaluated = await mapLimit(parseQueue, getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
       const cached = state.evaluations[parsed.id];
-      const evaluation =
+      const updateMeta = classifyUpdate({
+        cached,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        userTurns: parsed.userTurns,
+        messageCount: parsed.messageCount,
+      });
+      const canReuseParsedCache =
         cached &&
         cached.filePath === parsed.filePath &&
         cached.mtimeMs === parsed.mtimeMs &&
         cached.bytes === parsed.bytes &&
-        (!options.refreshWorkflow || cached.workflow === EVALUATOR_WORKFLOW)
+        cached.workflow === EVALUATOR_WORKFLOW &&
+        hasCachedMetadata(cached);
+      const evaluation =
+        canReuseParsedCache && !options.refreshWorkflow
           ? {
               title: cached.title ?? cached.summary.slice(0, 42) ?? '未命名会话',
               summary: cached.summary,
@@ -298,6 +492,13 @@ export class SessionService {
               score: cached.score,
               reasons: cached.reasons,
               actualWorkdirs: cached.actualWorkdirs ?? [],
+              directoryIndex: cached.directoryIndex ?? cached.actualWorkdirs ?? [],
+              techStack: cached.techStack ?? [],
+              keywords: cached.keywords ?? [],
+              searchText: cached.searchText ?? buildEvaluationSearchText({ id: parsed.id, cwd: parsed.cwd, evaluation: cached }),
+              updateCadence: cached.updateCadence ?? 'quiet',
+              reviewPriority: cached.reviewPriority ?? 'normal',
+              reviewSignals: cached.reviewSignals ?? [],
               cwdMatchesWorkdir: cached.cwdMatchesWorkdir ?? null,
               recommendedWorkdir: cached.recommendedWorkdir ?? null,
               remoteMachines: cached.remoteMachines ?? [],
@@ -315,20 +516,24 @@ export class SessionService {
                 userTurns: parsed.userTurns,
                 assistantTurns: parsed.assistantTurns,
                 messageCount: parsed.messageCount,
+                updateMeta,
               })
-          : await evaluateSession({
-              messages: parsed.messages,
-              userTurns: parsed.userTurns,
-              assistantTurns: parsed.assistantTurns,
-              cwd: parsed.cwd,
-            });
+            : applyUpdateMeta(
+                await evaluateSession({
+                  messages: parsed.messages,
+                  userTurns: parsed.userTurns,
+                  assistantTurns: parsed.assistantTurns,
+                  cwd: parsed.cwd,
+                }),
+                updateMeta
+              );
 
       if (
         !cached ||
         cached.filePath !== parsed.filePath ||
         cached.mtimeMs !== parsed.mtimeMs ||
         cached.bytes !== parsed.bytes ||
-        cached.workflow !== EVALUATOR_WORKFLOW ||
+        cached.workflow !== evaluation.workflow ||
         !hasCachedMetadata(cached)
       ) {
         const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
@@ -382,6 +587,11 @@ export class SessionService {
     return sessions.find((session) => session.id === id) ?? null;
   }
 
+  async getSessionFast(id: string): Promise<CodexSession | null> {
+    const sessions = await this.listSessions({ fast: true });
+    return sessions.find((session) => session.id === id) ?? null;
+  }
+
   async getSessionHistory(id: string, options: { limit?: number; beforeIndex?: number | null } = {}) {
     const session = await this.getSession(id);
     if (!session) throw new Error(`Session not found: ${id}`);
@@ -410,7 +620,8 @@ export class SessionService {
     removedHistoryEntries: number;
     expiresAt: string;
   }> {
-    const session = await this.getSession(id);
+    const { found } = await this.findSessionFilesByIds([id]);
+    const session = found[0];
     if (!session) throw new Error(`Session not found: ${id}`);
     const result = await archiveSessionFiles({
       codexHome: this.codexHome,
@@ -420,6 +631,30 @@ export class SessionService {
     });
     await this.store.markDeleted(id);
     return { sessionId: id, ...result };
+  }
+
+  async deleteSessionsBulk(ids: string[]): Promise<{
+    deleted: Array<{
+      sessionId: string;
+      archiveDir: string;
+      archivedFiles: string[];
+      removedOriginalFiles: string[];
+      removedHistoryEntries: number;
+      expiresAt: string;
+    }>;
+    missingIds: string[];
+  }> {
+    const cleanIds = [...new Set(ids.filter(Boolean))];
+    const { found, missingIds } = await this.findSessionFilesByIds(cleanIds);
+    if (!found.length) return { deleted: [], missingIds };
+
+    const deleted = await archiveSessionFilesBulk({
+      codexHome: this.codexHome,
+      sessions: found,
+      retentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
+    });
+    await this.store.markDeletedMany(deleted.map((item) => item.sessionId));
+    return { deleted, missingIds };
   }
 
   async migrateSessionToProject(id: string, targetProjectDir: string) {
@@ -460,6 +695,93 @@ export class SessionService {
     return { queuedIds, queued: queuedIds.length };
   }
 
+  async backfillEvaluations(options: { limit?: number; includeFailed?: boolean } = {}) {
+    const state = await this.store.load();
+    const files = await findJsonlFiles(this.sessionsRoot);
+    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; updatedAt: string | null }> = [];
+
+    for (const filePath of files) {
+      try {
+        const fileStat = await stat(filePath);
+        const id = extractSessionId(filePath);
+        const cached = state.evaluations[id];
+        const needsBackfill =
+          !cached ||
+          cached.filePath !== filePath ||
+          cached.bytes !== fileStat.size ||
+          cached.mtimeMs !== fileStat.mtimeMs ||
+          cached.workflow !== EVALUATOR_WORKFLOW ||
+          (options.includeFailed === true && cached.status === 'failed') ||
+          !hasCachedMetadata(cached);
+        if (!needsBackfill) continue;
+        candidates.push({ filePath, id, bytes: fileStat.size, mtimeMs: fileStat.mtimeMs, updatedAt: cached?.updatedAt ?? null });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        console.warn('[SessionService] Skipping unreadable session file:', filePath, error);
+      }
+    }
+
+    candidates.sort((a, b) => Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? ''));
+    const limit = Math.max(1, Math.min(200, Math.floor(options.limit ?? 8)));
+    const batch = candidates.slice(0, limit);
+    let stateChanged = false;
+
+    const results = await mapLimit(batch, getEvaluationConcurrency(), async (item) => {
+      const parsed = await parseSessionFile(item.filePath);
+      const cached = state.evaluations[parsed.id];
+      const updateMeta = classifyUpdate({
+        cached,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        userTurns: parsed.userTurns,
+        messageCount: parsed.messageCount,
+      });
+      const evaluation = applyUpdateMeta(
+        await evaluateSession({
+          messages: parsed.messages,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          cwd: parsed.cwd,
+        }),
+        updateMeta
+      );
+      const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
+      state.evaluations[parsed.id] = {
+        ...evaluation,
+        filePath: parsed.filePath,
+        mtimeMs: parsed.mtimeMs,
+        bytes: parsed.bytes,
+        cwd: parsed.cwd,
+        startedAt: parsed.startedAt,
+        updatedAt: parsed.updatedAt,
+        messageCount: parsed.messageCount,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        shellSnapshotCount,
+      };
+      stateChanged = true;
+      return {
+        id: parsed.id,
+        status: evaluation.status,
+        title: evaluation.title,
+        model: evaluation.model,
+        error: evaluation.error,
+      };
+    });
+
+    if (stateChanged) await this.store.save(state);
+    return {
+      requested: limit,
+      processed: results.length,
+      remainingEstimate: Math.max(0, candidates.length - results.length),
+      ok: results.filter((item) => item.status === 'ok').length,
+      failed: results.filter((item) => item.status === 'failed').length,
+      fallback: results.filter((item) => item.status === 'fallback').length,
+      results,
+    };
+  }
+
   async listRecycleBin() {
     return listRecycleArchives({ recycleRoot: getRecycleRoot() });
   }
@@ -481,21 +803,13 @@ export class SessionService {
   async pruneRecommended(recommendation: Recommendation = 'delete') {
     const sessions = await this.listSessions();
     const targets = sessions.filter((session) => !session.kept && session.evaluation.recommendation === recommendation);
-    const results = [];
-    for (const session of targets) {
-      results.push(await this.deleteSession(session.id));
-    }
-    return results;
+    return (await this.deleteSessionsBulk(targets.map((session) => session.id))).deleted;
   }
 
   async pruneNonKept() {
     const sessions = await this.listSessions();
     const targets = sessions.filter((session) => !session.kept);
-    const results = [];
-    for (const session of targets) {
-      results.push(await this.deleteSession(session.id));
-    }
-    return results;
+    return (await this.deleteSessionsBulk(targets.map((session) => session.id))).deleted;
   }
 
   async countExistingSessionFiles(): Promise<number> {

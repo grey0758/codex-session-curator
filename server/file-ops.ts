@@ -84,18 +84,21 @@ export async function countShellSnapshots(codexHome: string): Promise<Map<string
   return counts;
 }
 
-export async function removeHistoryEntries(codexHome: string, sessionId: string): Promise<number> {
+export async function removeHistoryEntriesBatch(codexHome: string, sessionIds: string[]): Promise<Map<string, number>> {
+  const targetIds = new Set(sessionIds.filter(Boolean));
+  const removedBySessionId = new Map<string, number>();
+  if (!targetIds.size) return removedBySessionId;
+
   const historyPath = join(codexHome, 'history.jsonl');
   let historyStat;
   try {
     historyStat = await stat(historyPath);
   } catch {
-    return 0;
+    return removedBySessionId;
   }
 
   const backupPath = `${historyPath}.bak`;
-  const tempPath = `${historyPath}.tmp`;
-  let removed = 0;
+  const tempPath = `${historyPath}.tmp-${process.pid}-${Date.now()}`;
   const keptLines: string[] = [];
   const rl = createInterface({ input: createReadStream(historyPath, { encoding: 'utf8' }), crlfDelay: Infinity });
 
@@ -103,8 +106,8 @@ export async function removeHistoryEntries(codexHome: string, sessionId: string)
     if (!line.trim()) continue;
     try {
       const record = JSON.parse(line) as { session_id?: string };
-      if (record.session_id === sessionId) {
-        removed += 1;
+      if (record.session_id && targetIds.has(record.session_id)) {
+        removedBySessionId.set(record.session_id, (removedBySessionId.get(record.session_id) ?? 0) + 1);
         continue;
       }
     } catch {
@@ -113,7 +116,7 @@ export async function removeHistoryEntries(codexHome: string, sessionId: string)
     keptLines.push(line);
   }
 
-  if (removed === 0) return 0;
+  if (removedBySessionId.size === 0) return removedBySessionId;
   await writeFile(tempPath, `${keptLines.join('\n')}${keptLines.length ? '\n' : ''}`, 'utf8');
   try {
     await readFile(backupPath);
@@ -122,7 +125,11 @@ export async function removeHistoryEntries(codexHome: string, sessionId: string)
   }
   await rename(tempPath, historyPath);
   await writeFile(`${historyPath}.mtime`, `${historyStat.mtimeMs}\n`, 'utf8');
-  return removed;
+  return removedBySessionId;
+}
+
+export async function removeHistoryEntries(codexHome: string, sessionId: string): Promise<number> {
+  return (await removeHistoryEntriesBatch(codexHome, [sessionId])).get(sessionId) ?? 0;
 }
 
 export async function deleteSessionFiles(input: {
@@ -165,6 +172,7 @@ export async function archiveSessionFiles(input: {
   filePath: string;
   recycleRoot?: string;
   retentionDays?: number;
+  skipHistoryCleanup?: boolean;
 }): Promise<{
   archiveDir: string;
   archivedFiles: string[];
@@ -200,7 +208,7 @@ export async function archiveSessionFiles(input: {
     removedOriginalFiles.push(snapshot);
   }
 
-  const removedHistoryEntries = await removeHistoryEntries(input.codexHome, input.sessionId);
+  const removedHistoryEntries = input.skipHistoryCleanup ? 0 : await removeHistoryEntries(input.codexHome, input.sessionId);
   await writeFile(
     join(archiveDir, 'manifest.json'),
     `${JSON.stringify(
@@ -221,6 +229,51 @@ export async function archiveSessionFiles(input: {
   );
 
   return { archiveDir, archivedFiles, removedOriginalFiles, removedHistoryEntries, expiresAt };
+}
+
+async function updateArchiveHistoryCount(archiveDir: string, removedHistoryEntries: number): Promise<void> {
+  const manifestPath = join(archiveDir, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+  manifest.removedHistoryEntries = removedHistoryEntries;
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+}
+
+export async function archiveSessionFilesBulk(input: {
+  codexHome: string;
+  sessions: Array<{ sessionId: string; filePath: string }>;
+  recycleRoot?: string;
+  retentionDays?: number;
+}): Promise<Array<{
+  sessionId: string;
+  archiveDir: string;
+  archivedFiles: string[];
+  removedOriginalFiles: string[];
+  removedHistoryEntries: number;
+  expiresAt: string;
+}>> {
+  const archived = [];
+  for (const session of input.sessions) {
+    const result = await archiveSessionFiles({
+      codexHome: input.codexHome,
+      sessionId: session.sessionId,
+      filePath: session.filePath,
+      recycleRoot: input.recycleRoot,
+      retentionDays: input.retentionDays,
+      skipHistoryCleanup: true,
+    });
+    archived.push({ sessionId: session.sessionId, ...result });
+  }
+
+  const removedBySessionId = await removeHistoryEntriesBatch(
+    input.codexHome,
+    archived.map((item) => item.sessionId)
+  );
+  for (const item of archived) {
+    item.removedHistoryEntries = removedBySessionId.get(item.sessionId) ?? 0;
+    await updateArchiveHistoryCount(item.archiveDir, item.removedHistoryEntries);
+  }
+
+  return archived;
 }
 
 export async function purgeExpiredArchives(input: {

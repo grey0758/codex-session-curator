@@ -56,6 +56,23 @@ export class CuratorStore {
     return state;
   }
 
+  async markDeletedMany(ids: string[]): Promise<PersistedState> {
+    const cleanIds = ids.filter(Boolean);
+    if (!cleanIds.length) return this.load();
+    const state = await this.load();
+    const deletedIds = new Set(state.deletedIds);
+    const removedIds = new Set(cleanIds);
+    for (const id of cleanIds) {
+      deletedIds.add(id);
+      delete state.evaluations[id];
+      delete state.titles[id];
+    }
+    state.deletedIds = [...deletedIds].sort();
+    state.keptIds = state.keptIds.filter((keptId) => !removedIds.has(keptId));
+    await this.save(state);
+    return state;
+  }
+
   async unmarkDeleted(id: string): Promise<PersistedState> {
     const state = await this.load();
     state.deletedIds = state.deletedIds.filter((deletedId) => deletedId !== id);

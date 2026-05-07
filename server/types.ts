@@ -1,5 +1,7 @@
 export type Recommendation = 'keep' | 'review' | 'delete';
 export type ActivityStatus = 'active' | 'inactive';
+export type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
+export type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
 
 export type MessageRole = 'user' | 'assistant';
 
@@ -21,6 +23,13 @@ export interface Evaluation {
   score: number;
   reasons: string[];
   actualWorkdirs: string[];
+  directoryIndex: string[];
+  techStack: string[];
+  keywords: string[];
+  searchText: string;
+  updateCadence: UpdateCadence;
+  reviewPriority: ReviewPriority;
+  reviewSignals: string[];
   cwdMatchesWorkdir: boolean | null;
   recommendedWorkdir: string | null;
   remoteMachines: RemoteMachine[];
