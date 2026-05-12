@@ -230,7 +230,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
 
     const indexDocuments = await requestJson<{ documents: JsonRecord[] }>(
       baseUrl,
-      '/api/hermes/search-documents?q=Hermes%20dispatch%20E2E&remote=0',
+      '/api/hermes/search-documents?q=Hermes%20session%20index&remote=0',
     );
     assert.ok(indexDocuments.documents.some((document) => document.kind === 'session_index' && document.sessionId === sessionId));
 

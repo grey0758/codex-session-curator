@@ -595,6 +595,35 @@ function scoreHermesMatch(session: SessionListItem, query: string): number {
   return score;
 }
 
+function queryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/[\s,，。/\\|:：;；()[\]{}"'`]+/)
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 2);
+}
+
+function scoreDocumentMatch(document: {
+  id: string;
+  title: string;
+  text: string;
+  machineId?: string | null;
+  sessionId?: string | null;
+}, query: string): number {
+  const needle = query.toLowerCase().trim();
+  if (!needle) return 1;
+  const haystack = [document.id, document.title, document.text, document.machineId ?? '', document.sessionId ?? '']
+    .join(' ')
+    .toLowerCase();
+  let score = haystack.includes(needle) ? 10 : 0;
+  for (const term of queryTerms(query)) {
+    if (haystack.includes(term)) score += 3;
+    if (document.title.toLowerCase().includes(term)) score += 2;
+    if (document.id.toLowerCase().includes(term)) score += 2;
+  }
+  return score;
+}
+
 function toHermesSession(session: SessionListItem, query = '') {
   const hermesRefreshStatus =
     session.evaluation.hermesRefreshStatus ?? (session.evaluation.hermesNeedsRefresh ? 'pending' : 'never');
@@ -1807,15 +1836,16 @@ app.get('/api/hermes/search-documents', async (request) => {
     .flatMap(buildHermesSearchDocuments)
     .map((document) => ({
       ...document,
-      score: needle
-        ? [document.id, document.title, document.text, document.machineId, document.sessionId]
-            .filter(Boolean)
-            .join(' ')
-            .toLowerCase()
-            .includes(needle)
-          ? 10
-          : 0
-        : 1,
+      score: scoreDocumentMatch(
+        {
+          id: document.id,
+          title: document.title,
+          text: document.text,
+          machineId: document.machineId,
+          sessionId: 'sessionId' in document ? document.sessionId : null,
+        },
+        needle
+      ),
     }))
     .filter((document) => document.score > 0)
     .sort((a, b) => b.score - a.score || Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? ''))
