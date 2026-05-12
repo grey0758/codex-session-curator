@@ -217,6 +217,11 @@ const remoteControlSchema = z.object({
 const includeDeprecatedSchema = z.object({
   includeDeprecated: z.enum(['0', '1', 'true', 'false']).optional(),
 });
+const hermesSessionIndexSchema = z.object({
+  q: z.string().max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  remote: z.enum(['0', '1', 'true', 'false']).optional(),
+});
 const serverIdentityAliasSchema = z.object({ alias: z.string().min(1).max(120) });
 const serverIdentityMachineSchema = z
   .object({
@@ -634,6 +639,36 @@ function toHermesSession(session: SessionListItem, query = '') {
   };
 }
 
+function toHermesSessionIndexEntry(session: SessionListItem, query = '') {
+  const base = toHermesSession(session, query);
+  return {
+    id: base.id,
+    title: base.title,
+    machineId: base.machineId,
+    cwd: base.cwd,
+    recommendedWorkdir: base.recommendedWorkdir,
+    resumeCommand: base.resumeCommand,
+    canResume: base.canResume,
+    updatedAt: base.updatedAt,
+    activityStatus: base.activityStatus,
+    score: base.score,
+    recommendation: base.recommendation,
+    summary: base.summary,
+    directoryIndex: base.directoryIndex,
+    actualWorkdirs: base.actualWorkdirs,
+    keywords: base.keywords,
+    techStack: base.techStack,
+    remoteMachines: base.remoteMachines,
+    messageCount: base.messageCount,
+    userTurns: base.userTurns,
+    assistantTurns: base.assistantTurns,
+    workflow: base.workflow,
+    status: base.status,
+    hermesRefreshStatus: base.hermesRefreshStatus,
+    preferredAction: base.canResume ? 'resume' : 'inspect',
+  };
+}
+
 function isUsableAbsoluteWorkdir(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith('/') && value.trim().length > 1;
 }
@@ -742,6 +777,26 @@ function buildHermesMemoryContext(sessions: ReturnType<typeof toHermesSession>[]
 function buildHermesSearchDocuments(session: SessionListItem) {
   const base = toHermesSession(session);
   const docs = [
+    {
+      id: `${base.id}:session-index`,
+      kind: 'session_index',
+      sessionId: base.id,
+      machineId: base.machineId,
+      title: `Session index: ${base.title}`,
+      text: [
+        base.id,
+        base.title,
+        base.resumeCommand,
+        base.cwd ?? '',
+        base.recommendedWorkdir ?? '',
+        base.summary,
+        ...base.actualWorkdirs,
+        ...base.directoryIndex,
+        ...base.techStack,
+        ...base.keywords,
+      ].filter(Boolean).join('\n'),
+      updatedAt: base.updatedAt,
+    },
     {
       id: `${base.id}:session`,
       kind: 'session',
@@ -1706,6 +1761,33 @@ app.get('/api/hermes/search', async (request) => {
     sessions,
     count: sessions.length,
     memoryContext: buildHermesMemoryContext(sessions),
+  };
+});
+
+app.get('/api/hermes/session-index', async (request) => {
+  const query = hermesSessionIndexSchema.parse(request.query);
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const localSessions = await getStateSessionsForHermes();
+  const remoteSessions = includeRemote ? await getRemoteSessionsCached() : [];
+  const needle = query.q?.trim() ?? '';
+  const scored = [...localSessions, ...remoteSessions]
+    .map((session) => ({ session, score: needle ? scoreHermesMatch(session, needle) : session.evaluation.score }))
+    .filter((item) => !needle || item.score > 0)
+    .sort((a, b) => b.score - a.score || Date.parse(b.session.updatedAt ?? '') - Date.parse(a.session.updatedAt ?? ''));
+  const limit = query.limit ?? 200;
+  const sessions = scored.slice(0, limit).map((item) => toHermesSessionIndexEntry(item.session, needle));
+  return {
+    query: needle,
+    count: sessions.length,
+    total: scored.length,
+    resumePolicy: {
+      defaultAction: 'resume-matched-session',
+      createChildSessionOnlyWhen: [
+        'no indexed session matches the requested project or task context',
+        'the user explicitly asks for a new session',
+      ],
+    },
+    sessions,
   };
 });
 

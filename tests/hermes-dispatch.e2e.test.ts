@@ -219,6 +219,21 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     assert.ok(dispatch.candidates.length >= 1);
     const jobId = String(dispatch.job.id);
 
+    const sessionIndex = await requestJson<{ sessions: JsonRecord[]; resumePolicy: JsonRecord }>(
+      baseUrl,
+      '/api/hermes/session-index?q=Hermes%20dispatch%20E2E&remote=0',
+    );
+    assert.equal(sessionIndex.resumePolicy.defaultAction, 'resume-matched-session');
+    assert.equal(sessionIndex.sessions[0].id, sessionId);
+    assert.equal(sessionIndex.sessions[0].preferredAction, 'resume');
+    assert.match(String(sessionIndex.sessions[0].resumeCommand), new RegExp(sessionId));
+
+    const indexDocuments = await requestJson<{ documents: JsonRecord[] }>(
+      baseUrl,
+      '/api/hermes/search-documents?q=Hermes%20dispatch%20E2E&remote=0',
+    );
+    assert.ok(indexDocuments.documents.some((document) => document.kind === 'session_index' && document.sessionId === sessionId));
+
     const supervise = await requestJson<{ decision: string; job: JsonRecord }>(
       baseUrl,
       `/api/hermes/jobs/${jobId}/supervise`,
