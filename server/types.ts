@@ -3,6 +3,16 @@ export type ActivityStatus = 'active' | 'inactive';
 export type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
 export type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
 export type HermesRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
+export type KnowledgeItemType =
+  | 'project'
+  | 'preference'
+  | 'service'
+  | 'runbook'
+  | 'decision'
+  | 'session'
+  | 'job'
+  | 'commander_action'
+  | 'note';
 
 export type MessageRole = 'user' | 'assistant';
 
@@ -82,6 +92,48 @@ export interface JobOutcome {
   summary: string;
 }
 
+export type CommanderActionKind = 'direct-action' | 'self-repair' | 'manual-note';
+export type CommanderActionStatus = 'started' | 'completed' | 'failed' | 'blocked';
+
+export interface CommanderAction {
+  id: string;
+  kind: CommanderActionKind;
+  status: CommanderActionStatus;
+  goal: string;
+  reason: string;
+  scope: string | null;
+  targetRepo: string | null;
+  cwd: string | null;
+  changedFiles: string[];
+  tests: string[];
+  verification: string[];
+  followUp: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+export interface KnowledgeItem {
+  id: string;
+  type: KnowledgeItemType;
+  scope: string | null;
+  title: string;
+  text: string;
+  project: string | null;
+  repo: string | null;
+  cwd: string | null;
+  machineId: string | null;
+  tags: string[];
+  source: string | null;
+  confidence: number | null;
+  lastVerifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeSearchResult {
+  score: number;
+  item: KnowledgeItem;
+}
 export interface FailureKnowledgeCard {
   id: string;
   at: string;

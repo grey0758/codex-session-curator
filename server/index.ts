@@ -13,6 +13,7 @@ import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep 
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath, isClaudeSessionPath } from './file-ops.js';
+import { getKnowledgeDbPath, KnowledgeStore } from './knowledge-store.js';
 import { readAnalysisRuns } from './analysis-log.js';
 import { parseSessionHistory } from './session-parser.js';
 import {
@@ -27,7 +28,7 @@ import {
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
-import type { CodexSession } from './types.js';
+import type { CodexSession, CommanderAction, KnowledgeItem, KnowledgeItemType } from './types.js';
 import {
   exportServerIdentityInventory,
   getServerIdentityMachine,
@@ -52,6 +53,7 @@ import {
   type CodexJobMode,
 } from './codex-jobs.js';
 import { evaluateJobSemantics } from './job-supervisor-ai.js';
+import { buildContextPack, type ContextKnowledgeItem } from './context-pack.js';
 import {
   getEvaluatorBaseUrl,
   getEvaluatorModel,
@@ -84,6 +86,7 @@ const app = Fastify({
 });
 const codexHome = getCodexHome();
 const store = new CuratorStore(getStatePath(codexHome));
+const knowledgeStore = new KnowledgeStore(getKnowledgeDbPath(codexHome));
 const service = new SessionService(store);
 const remoteAgents = getRemoteAgents();
 
@@ -222,6 +225,46 @@ const hermesSessionIndexSchema = z.object({
   limit: z.coerce.number().int().min(1).max(500).optional(),
   remote: z.enum(['0', '1', 'true', 'false']).optional(),
 });
+const contextPackSchema = z.object({
+  q: z.string().max(1000).optional(),
+  cwd: z.string().min(1).max(1000).optional(),
+  repo: z.string().min(1).max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+  remote: z.enum(['0', '1', 'true', 'false']).optional(),
+});
+const commanderActionKindSchema = z.enum(['direct-action', 'self-repair', 'manual-note']);
+const commanderActionStatusSchema = z.enum(['started', 'completed', 'failed', 'blocked']);
+const commanderActionArraySchema = z.array(z.string().min(1).max(1000)).max(200).optional();
+const commanderActionCreateSchema = z.object({
+  kind: commanderActionKindSchema,
+  status: commanderActionStatusSchema.optional(),
+  goal: z.string().min(1).max(5000),
+  reason: z.string().min(1).max(5000),
+  scope: z.string().min(1).max(5000).nullable().optional(),
+  targetRepo: z.string().min(1).max(1000).nullable().optional(),
+  cwd: z.string().min(1).max(1000).nullable().optional(),
+  changedFiles: commanderActionArraySchema,
+  tests: commanderActionArraySchema,
+  verification: commanderActionArraySchema,
+  followUp: z.string().min(1).max(5000).nullable().optional(),
+  startedAt: z.string().datetime().optional(),
+  completedAt: z.string().datetime().nullable().optional(),
+});
+const commanderActionUpdateSchema = z.object({
+  kind: commanderActionKindSchema.optional(),
+  status: commanderActionStatusSchema.optional(),
+  goal: z.string().min(1).max(5000).optional(),
+  reason: z.string().min(1).max(5000).optional(),
+  scope: z.string().min(1).max(5000).nullable().optional(),
+  targetRepo: z.string().min(1).max(1000).nullable().optional(),
+  cwd: z.string().min(1).max(1000).nullable().optional(),
+  changedFiles: commanderActionArraySchema,
+  tests: commanderActionArraySchema,
+  verification: commanderActionArraySchema,
+  followUp: z.string().min(1).max(5000).nullable().optional(),
+  startedAt: z.string().datetime().optional(),
+  completedAt: z.string().datetime().nullable().optional(),
+});
 const serverIdentityAliasSchema = z.object({ alias: z.string().min(1).max(120) });
 const serverIdentityMachineSchema = z
   .object({
@@ -249,6 +292,45 @@ const serverIdentityMachineSchema = z
   .strict();
 const serverIdentityPatchSchema = serverIdentityMachineSchema.partial().refine((value) => Object.keys(value).length > 0, {
   message: 'patch body must not be empty',
+});
+const knowledgeItemTypeSchema = z.enum([
+  'project',
+  'preference',
+  'service',
+  'runbook',
+  'decision',
+  'session',
+  'job',
+  'commander_action',
+  'note',
+]);
+const knowledgeItemBaseSchema = {
+  type: knowledgeItemTypeSchema,
+  scope: z.string().max(1000).nullable().optional(),
+  title: z.string().min(1).max(1000),
+  text: z.string().min(1).max(100_000),
+  project: z.string().max(1000).nullable().optional(),
+  repo: z.string().max(1000).nullable().optional(),
+  cwd: z.string().max(2000).nullable().optional(),
+  machineId: z.string().max(300).nullable().optional(),
+  tags: z.array(z.string().min(1).max(200)).max(100).optional(),
+  source: z.string().max(5000).nullable().optional(),
+  confidence: z.number().min(0).max(1).nullable().optional(),
+  lastVerifiedAt: z.string().datetime().nullable().optional(),
+  updatedAt: z.string().datetime().optional(),
+};
+const knowledgeItemCreateSchema = z.object({
+  id: z.string().min(1).max(200).optional(),
+  ...knowledgeItemBaseSchema,
+  createdAt: z.string().datetime().optional(),
+});
+const knowledgeItemUpdateSchema = z.object(knowledgeItemBaseSchema).partial();
+const knowledgeSearchSchema = z.object({
+  q: z.string().max(1000).optional(),
+  type: z.union([knowledgeItemTypeSchema, z.array(knowledgeItemTypeSchema)]).optional(),
+  project: z.string().max(1000).optional(),
+  repo: z.string().max(1000).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
 });
 
 type SessionListItem = Awaited<ReturnType<SessionService['listSessions']>>[number];
@@ -724,6 +806,21 @@ function withEffectiveHermesSessionCwd<T extends ReturnType<typeof toHermesSessi
   };
 }
 
+function normalizedPathMatch(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = (left ?? '').trim().toLowerCase().replace(/\/+$/, '');
+  const b = (right ?? '').trim().toLowerCase().replace(/\/+$/, '');
+  if (!a || !b) return false;
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function scoreRequestedSessionPath(session: SessionListItem, input: { cwd?: string | null; repo?: string | null }): number {
+  const paths = [session.cwd, session.evaluation.recommendedWorkdir, ...session.evaluation.actualWorkdirs].filter(Boolean);
+  let score = 0;
+  if (input.cwd && paths.some((path) => normalizedPathMatch(path, input.cwd))) score += 60;
+  if (input.repo && paths.some((path) => normalizedPathMatch(path, input.repo))) score += 50;
+  return score;
+}
+
 function truncateWorkerContext(value: string | null | undefined, max = 900): string {
   const text = (value ?? '').replace(/\s+/g, ' ').trim();
   if (!text || text.length <= max) return text;
@@ -867,6 +964,113 @@ function buildHermesSearchDocuments(session: SessionListItem) {
   return docs;
 }
 
+function buildCommanderActionSearchDocument(action: CommanderAction) {
+  return {
+    id: `commander-action:${action.id}`,
+    kind: 'commander_action',
+    actionId: action.id,
+    actionKind: action.kind,
+    status: action.status,
+    machineId: service.getMeta().machineId,
+    title: `Commander ${action.kind}: ${action.goal.slice(0, 120)}`,
+    text: [
+      action.goal,
+      action.reason,
+      action.scope ?? '',
+      action.targetRepo ?? '',
+      action.cwd ?? '',
+      ...action.changedFiles,
+      ...action.tests,
+      ...action.verification,
+      action.followUp ?? '',
+    ].filter(Boolean).join('\n'),
+    updatedAt: action.completedAt ?? action.startedAt,
+  };
+}
+
+function projectNameFromDocumentText(text: string): string | null {
+  const path = text
+    .split(/\s+/)
+    .find((part) => part.startsWith('/') && part.split('/').filter(Boolean).length > 1);
+  if (!path) return null;
+  const clean = path.replace(/[,;:]+$/, '').replace(/\/+$/, '');
+  return clean.split('/').filter(Boolean).at(-1) ?? null;
+}
+
+function knowledgeTypeForDocument(kind: string): KnowledgeItemType {
+  if (kind === 'commander_action') return 'commander_action';
+  if (kind === 'job_outcome') return 'job';
+  if (kind === 'session' || kind === 'session_index') return 'session';
+  return 'note';
+}
+
+function toKnowledgeItem(document: ReturnType<typeof buildHermesSearchDocuments>[number] | ReturnType<typeof buildCommanderActionSearchDocument>): Omit<KnowledgeItem, 'createdAt' | 'updatedAt'> & { updatedAt: string | null } {
+  const cwd = 'cwd' in document && typeof document.cwd === 'string' ? document.cwd : null;
+  const sessionId = 'sessionId' in document && typeof document.sessionId === 'string' ? document.sessionId : null;
+  return {
+    id: document.id,
+    type: knowledgeTypeForDocument(document.kind),
+    scope: document.kind,
+    title: document.title,
+    text: document.text,
+    project: projectNameFromDocumentText(document.text),
+    repo: null,
+    cwd,
+    machineId: 'machineId' in document ? document.machineId ?? null : service.getMeta().machineId,
+    updatedAt: document.updatedAt ?? null,
+    tags: [document.kind, sessionId ?? '', 'machineId' in document ? document.machineId ?? '' : ''].filter(Boolean),
+    source: 'curator:auto-sync',
+    confidence: 0.75,
+    lastVerifiedAt: document.updatedAt ?? null,
+  };
+}
+
+async function syncKnowledgeItems(items: Array<ReturnType<typeof toKnowledgeItem>>): Promise<void> {
+  if (!items.length) return;
+  for (const item of items) {
+    try {
+      const existing = await knowledgeStore.getItem(item.id);
+      if (existing) {
+        await knowledgeStore.updateItem(item.id, {
+          type: item.type,
+          scope: item.scope,
+          title: item.title,
+          text: item.text,
+          project: item.project,
+          repo: item.repo,
+          cwd: item.cwd,
+          machineId: item.machineId,
+          tags: item.tags,
+          source: item.source,
+          confidence: item.confidence,
+          lastVerifiedAt: item.lastVerifiedAt,
+          updatedAt: item.updatedAt ?? new Date().toISOString(),
+        });
+      } else {
+        await knowledgeStore.createItem({
+          ...item,
+          updatedAt: item.updatedAt ?? undefined,
+        });
+      }
+    } catch (error) {
+      app.log.warn({ itemId: item.id, error }, 'Knowledge item sync failed');
+    }
+  }
+}
+
+function toContextKnowledgeItem(item: ReturnType<typeof toKnowledgeItem> | KnowledgeItem): ContextKnowledgeItem {
+  return {
+    id: item.id,
+    type: item.type,
+    title: item.title,
+    text: item.text,
+    project: item.project,
+    cwd: item.cwd,
+    repo: item.repo,
+    updatedAt: item.updatedAt,
+    tags: item.tags,
+  };
+}
 function buildCodexWorkerPrompt(input: {
   query: string;
   prompt?: string;
@@ -1400,7 +1604,26 @@ function jobOutcomeFromJob(job: CodexResumeJob, goal: string) {
 }
 
 async function recordJobOutcome(job: CodexResumeJob, goal: string): Promise<void> {
-  await service.appendJobOutcome(jobOutcomeFromJob(job, goal));
+  const outcome = jobOutcomeFromJob(job, goal);
+  await service.appendJobOutcome(outcome);
+  await syncKnowledgeItems([
+    {
+      id: `${outcome.sessionId}:job:${outcome.jobId}`,
+      type: 'job',
+      scope: 'job_outcome',
+      title: `Codex worker ${outcome.status}: ${outcome.goal.slice(0, 120)}`,
+      text: outcome.summary,
+      project: outcome.cwd?.split('/').filter(Boolean).at(-1) ?? null,
+      repo: null,
+      cwd: outcome.cwd,
+      machineId: outcome.machineId,
+      updatedAt: outcome.at,
+      tags: ['job_outcome', outcome.status, outcome.machineId].filter(Boolean),
+      source: 'curator:auto-sync',
+      confidence: 0.8,
+      lastVerifiedAt: outcome.at,
+    },
+  ]);
   clearSessionCaches();
 }
 
@@ -1684,6 +1907,93 @@ app.all('/api/codex/*', async (request, reply) => {
 
 app.get('/api/meta', async () => service.getMeta());
 
+app.post('/api/commander-actions', async (request, reply) => {
+  const body = commanderActionCreateSchema.parse(request.body ?? {});
+  const now = new Date().toISOString();
+  const status = body.status ?? 'started';
+  const action: CommanderAction = {
+    id: randomUUID(),
+    kind: body.kind,
+    status,
+    goal: body.goal,
+    reason: body.reason,
+    scope: body.scope ?? null,
+    targetRepo: body.targetRepo ?? null,
+    cwd: body.cwd ?? null,
+    changedFiles: body.changedFiles ?? [],
+    tests: body.tests ?? [],
+    verification: body.verification ?? [],
+    followUp: body.followUp ?? null,
+    startedAt: body.startedAt ?? now,
+    completedAt: body.completedAt ?? (status === 'started' ? null : now),
+  };
+  await store.addCommanderAction(action);
+  await syncKnowledgeItems([toKnowledgeItem(buildCommanderActionSearchDocument(action))]);
+  return reply.code(201).send({ action });
+});
+
+app.patch('/api/commander-actions/:id', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  const body = commanderActionUpdateSchema.parse(request.body ?? {});
+  const patch: Partial<Omit<CommanderAction, 'id'>> = { ...body };
+  if (
+    patch.completedAt === undefined &&
+    patch.status &&
+    patch.status !== 'started'
+  ) {
+    patch.completedAt = new Date().toISOString();
+  }
+  const action = await store.updateCommanderAction(params.id, patch);
+  if (!action) return reply.code(404).send({ error: 'Commander action not found' });
+  await syncKnowledgeItems([toKnowledgeItem(buildCommanderActionSearchDocument(action))]);
+  return { action };
+});
+
+app.get('/api/commander-actions', async () => ({
+  actions: await store.listCommanderActions(),
+}));
+
+app.post('/api/knowledge/items', async (request, reply) => {
+  const body = knowledgeItemCreateSchema.parse(request.body ?? {});
+  const item = await knowledgeStore.createItem(body);
+  return reply.code(201).send({ item });
+});
+
+app.patch('/api/knowledge/items/:id', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  const body = knowledgeItemUpdateSchema.parse(request.body ?? {});
+  const item = await knowledgeStore.updateItem(params.id, body);
+  if (!item) return reply.code(404).send({ error: 'Knowledge item not found' });
+  return { item };
+});
+
+app.get('/api/knowledge/items/:id', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  const item = await knowledgeStore.getItem(params.id);
+  if (!item) return reply.code(404).send({ error: 'Knowledge item not found' });
+  return { item };
+});
+
+async function buildKnowledgeSearchResponse(rawQuery: unknown) {
+  const query = knowledgeSearchSchema.parse(rawQuery);
+  const results = await knowledgeStore.search(query);
+  return {
+    query: query.q ?? '',
+    count: results.length,
+    items: results.map((result) => ({
+      score: result.score,
+      ...result.item,
+    })),
+  };
+}
+
+app.get('/api/knowledge/search', async (request) => {
+  return buildKnowledgeSearchResponse(request.query);
+});
+
+app.get('/api/hermes/knowledge-search', async (request) => {
+  return buildKnowledgeSearchResponse(request.query);
+});
 app.get('/api/analysis-runs', async () => {
   const records = await readAnalysisRuns(160);
   const now = Date.now();
@@ -1805,6 +2115,12 @@ app.get('/api/hermes/session-index', async (request) => {
     .sort((a, b) => b.score - a.score || Date.parse(b.session.updatedAt ?? '') - Date.parse(a.session.updatedAt ?? ''));
   const limit = query.limit ?? 200;
   const sessions = scored.slice(0, limit).map((item) => toHermesSessionIndexEntry(item.session, needle));
+  await syncKnowledgeItems(
+    scored
+      .slice(0, limit)
+      .flatMap((item) => buildHermesSearchDocuments(item.session).filter((document) => document.kind === 'session_index'))
+      .map(toKnowledgeItem)
+  );
   return {
     query: needle,
     count: sessions.length,
@@ -1857,7 +2173,89 @@ app.get('/api/hermes/search-documents', async (request) => {
   };
 });
 
-app.get('/api/codex/sessions/:id/context', async (request, reply) => {
+async function buildContextPackResponse(rawQuery: unknown) {
+  const query = contextPackSchema.parse(rawQuery);
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const limit = query.limit ?? 8;
+  const localSessions = await getStateSessionsForHermes();
+  const remoteSessions = includeRemote ? await getRemoteSessionsCached() : [];
+  const needle = query.q?.trim() ?? '';
+  const projectNeedle = [query.cwd, query.repo].filter(Boolean).join(' ');
+  const searchNeedle = [needle, projectNeedle].filter(Boolean).join(' ');
+  const allSessions = [...localSessions, ...remoteSessions];
+  const scoredSessions = allSessions
+    .map((session) => ({
+      session,
+      score: needle ? scoreHermesMatch(session, needle) : session.evaluation.score,
+      projectScore: scoreRequestedSessionPath(session, query),
+    }))
+    .filter((item) => {
+      if (query.cwd || query.repo) return item.projectScore > 0 && (!needle || item.score > 0 || item.projectScore > 0);
+      return !searchNeedle || item.score > 0;
+    })
+    .sort(
+      (a, b) =>
+        b.projectScore - a.projectScore ||
+        b.score - a.score ||
+        Date.parse(b.session.updatedAt ?? '') - Date.parse(a.session.updatedAt ?? '')
+    );
+  const sessions = scoredSessions.slice(0, limit).map((item) => toHermesSessionIndexEntry(item.session, needle || projectNeedle));
+  const commanderActions = await store.listCommanderActions();
+  const scoredActions = commanderActions
+    .map((action) => {
+      const document = buildCommanderActionSearchDocument(action);
+      return { action, document, score: scoreDocumentMatch(document, searchNeedle) };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || Date.parse(b.action.startedAt) - Date.parse(a.action.startedAt));
+  const syncedKnowledgeItems = [
+    ...scoredSessions.flatMap((item) => buildHermesSearchDocuments(item.session).map(toKnowledgeItem)),
+    ...scoredActions.map((item) => toKnowledgeItem(item.document)),
+  ].slice(0, Math.max(80, limit * 12));
+  await syncKnowledgeItems(syncedKnowledgeItems);
+  const projectFilter = (query.repo ?? query.cwd)?.replace(/\/+$/, '').split('/').filter(Boolean).at(-1);
+  const storedKnowledge = await knowledgeStore.search({
+    q: searchNeedle || needle,
+    project: projectFilter,
+    repo: query.repo,
+    limit: Math.max(20, limit * 4),
+  });
+  const projectKnowledge = projectFilter
+    ? await knowledgeStore.search({
+        project: projectFilter,
+        repo: query.repo,
+        limit: Math.max(20, limit * 4),
+      })
+    : [];
+  const storedKnowledgeItems = new Map<string, KnowledgeItem>();
+  for (const result of [...storedKnowledge, ...projectKnowledge]) {
+    storedKnowledgeItems.set(result.item.id, result.item);
+  }
+  const knowledgeItems = [
+    ...[...storedKnowledgeItems.values()].map(toContextKnowledgeItem),
+    ...syncedKnowledgeItems.map(toContextKnowledgeItem),
+  ];
+
+  return buildContextPack({
+    query: needle,
+    cwd: query.cwd ?? null,
+    repo: query.repo ?? null,
+    limit,
+    sessions,
+    commanderActions: scoredActions.map((item) => item.action),
+    knowledgeItems,
+  });
+}
+
+app.get('/api/context-pack', async (request) => {
+  return buildContextPackResponse(request.query);
+});
+
+app.get('/api/hermes/context-pack', async (request) => {
+  return buildContextPackResponse(request.query);
+});
+
+app.get('/api/hermes/sessions/:id/context', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionContextSchema.parse(request.query);
   const historyLimit = query.historyLimit ?? 20;

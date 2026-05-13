@@ -342,6 +342,94 @@ interface CodexWorkerJob {
   signal?: string | null;
 }
 
+interface CommanderAction {
+  id: string;
+  kind: 'direct-action' | 'self-repair' | 'manual-note' | string;
+  status: string;
+  goal: string;
+  reason: string;
+  scope: string | null;
+  targetRepo: string | null;
+  cwd: string | null;
+  changedFiles: string[];
+  tests: string[];
+  verification: string[];
+  followUp: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+type KnowledgeItemType =
+  | 'project'
+  | 'preference'
+  | 'service'
+  | 'runbook'
+  | 'decision'
+  | 'session'
+  | 'job'
+  | 'commander_action'
+  | 'note';
+
+interface KnowledgeItemResult {
+  id: string;
+  type: KnowledgeItemType | string;
+  scope: string | null;
+  title: string;
+  text: string;
+  project: string | null;
+  repo: string | null;
+  cwd: string | null;
+  machineId: string | null;
+  tags: string[];
+  source: string | null;
+  confidence: number | null;
+  lastVerifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  score: number;
+}
+
+interface ContextPackSession {
+  id: string;
+  title: string;
+  machineId: string;
+  cwd: string | null;
+  recommendedWorkdir: string | null;
+  resumeCommand: string;
+  canResume: boolean;
+  updatedAt: string | null;
+  score: number;
+  summary: string;
+  directoryIndex: string[];
+  actualWorkdirs: string[];
+  keywords: string[];
+  techStack: string[];
+}
+
+interface ContextPackKnowledgeItem {
+  id: string;
+  type: string;
+  title: string;
+  text: string;
+  project: string | null;
+  cwd: string | null;
+  repo: string | null;
+  updatedAt: string | null;
+  tags: string[];
+}
+
+interface ContextPack {
+  query: string;
+  matchedProject: { name: string; cwd: string | null; repo: string | null; reason: string } | null;
+  preferences: ContextPackKnowledgeItem[];
+  projectFacts: ContextPackKnowledgeItem[];
+  runbooks: ContextPackKnowledgeItem[];
+  sessions: ContextPackSession[];
+  commanderActions: CommanderAction[];
+  recommendedResume: { confidence: number; sessionId: string; resumeCommand: string; reason: string } | null;
+  newSessionReason: string | null;
+  workerPromptContext: string;
+}
 interface CodexJobRegistryEntry {
   machineId?: string | null;
   baseUrl?: string | null;
@@ -1485,6 +1573,17 @@ function App() {
   const [workerJobEvents, setWorkerJobEvents] = useState<Record<string, CodexWorkerEvent[]>>({});
   const [workerJobEventSeq, setWorkerJobEventSeq] = useState<Record<string, number>>({});
   const [workerJobEventsUnavailable, setWorkerJobEventsUnavailable] = useState<Record<string, boolean>>({});
+  const [commanderActions, setCommanderActions] = useState<CommanderAction[]>([]);
+  const [commanderActionsLoading, setCommanderActionsLoading] = useState(false);
+  const [commanderActionsError, setCommanderActionsError] = useState<string | null>(null);
+  const [knowledgeQuery, setKnowledgeQuery] = useState('');
+  const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeItemResult[]>([]);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
+  const [contextPack, setContextPack] = useState<ContextPack | null>(null);
+  const [contextPackLoading, setContextPackLoading] = useState(false);
+  const [contextPackError, setContextPackError] = useState<string | null>(null);
+  const [contextPromptCopied, setContextPromptCopied] = useState(false);
 
   const refreshRemoteStatuses = useCallback(async () => {
     try {
@@ -1905,6 +2004,81 @@ function App() {
       '')
     : '';
   const migrationAlreadyInPlace = selected ? normalizePath(selected.cwd) === normalizePath(migrationTarget) : false;
+  const knowledgeSearchText = (knowledgeQuery.trim() || query.trim() || selected?.title || '').trim();
+  const selectedProjectPath = selected?.evaluation.recommendedWorkdir ?? selected?.cwd ?? null;
+  const contextPackSummary = contextPack
+    ? [
+        `${contextPack.preferences.length} preferences`,
+        `${contextPack.projectFacts.length} project facts`,
+        `${contextPack.runbooks.length} runbooks`,
+        `${contextPack.sessions.length} sessions`,
+      ].join(' · ')
+    : '未构建 context pack';
+
+  const loadKnowledgeSearch = useCallback(async () => {
+    const q = knowledgeSearchText;
+    if (!q) {
+      setKnowledgeError('请输入搜索词，或选择一个有标题的会话');
+      return;
+    }
+    setKnowledgeLoading(true);
+    setKnowledgeError(null);
+    try {
+      const params = new URLSearchParams({ q, limit: '12' });
+      const response = await fetch(`/api/knowledge/search?${params.toString()}`);
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      const payload = (await response.json().catch(() => ({}))) as { items?: KnowledgeItemResult[]; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setKnowledgeResults(Array.isArray(payload.items) ? payload.items : []);
+    } catch (err) {
+      setKnowledgeError(err instanceof Error ? err.message : 'knowledge search 加载失败');
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  }, [knowledgeSearchText]);
+
+  const loadContextPack = useCallback(async () => {
+    const q = knowledgeSearchText || selected?.title || selected?.evaluation.summary || '';
+    if (!q && !selectedProjectPath) {
+      setContextPackError('请输入任务或选择一个项目会话');
+      return;
+    }
+    setContextPackLoading(true);
+    setContextPackError(null);
+    try {
+      const params = new URLSearchParams({ limit: '8', remote: '0' });
+      if (q) params.set('q', q);
+      if (selected?.cwd) params.set('cwd', selected.cwd);
+      if (selectedProjectPath) params.set('repo', selectedProjectPath);
+      const response = await fetch(`/api/context-pack?${params.toString()}`);
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      const payload = (await response.json().catch(() => ({}))) as ContextPack & { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setContextPack(payload);
+    } catch (err) {
+      setContextPackError(err instanceof Error ? err.message : 'context pack 构建失败');
+    } finally {
+      setContextPackLoading(false);
+    }
+  }, [knowledgeSearchText, selected?.cwd, selected?.evaluation.summary, selected?.title, selectedProjectPath]);
+
+  const copyContextPrompt = useCallback(async () => {
+    if (!contextPack?.workerPromptContext) return;
+    try {
+      await navigator.clipboard.writeText(contextPack.workerPromptContext);
+      setContextPromptCopied(true);
+      window.setTimeout(() => setContextPromptCopied(false), 1800);
+    } catch {
+      setContextPackError('复制失败：浏览器阻止访问剪贴板');
+    }
+  }, [contextPack?.workerPromptContext]);
+
   const selectedWorkerJobs = useMemo(
     () => (selected ? sortWorkerJobs(workerJobs.filter((job) => job.sessionId === selected.id)) : []),
     [selected, workerJobs]
@@ -2964,6 +3138,185 @@ function App() {
               ) : null}
             </section>
 
+            <section className="primary-panel knowledge-plane">
+              <div className="panel-heading worker-heading">
+                <div>
+                  <h3>Knowledge Context Plane</h3>
+                  <span>{contextPackSummary}</span>
+                </div>
+                <div className="worker-heading-actions">
+                  <button type="button" className="primary-button" disabled={knowledgeLoading} onClick={() => void loadKnowledgeSearch()}>
+                    {knowledgeLoading ? <Loader2 size={16} className="spin" /> : <Search size={16} />}
+                    搜索
+                  </button>
+                  <button type="button" className="primary-button" disabled={contextPackLoading} onClick={() => void loadContextPack()}>
+                    <RefreshCw size={16} className={contextPackLoading ? 'spin' : ''} />
+                    Context Pack
+                  </button>
+                  <button type="button" className="primary-button" disabled={!contextPack?.workerPromptContext} onClick={() => void copyContextPrompt()}>
+                    <Copy size={16} />
+                    {contextPromptCopied ? '已复制' : '复制 Prompt'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="knowledge-query-row">
+                <input
+                  value={knowledgeQuery}
+                  onChange={(event) => setKnowledgeQuery(event.target.value)}
+                  placeholder={selected ? `${selected.title} / ${selected.cwd ?? 'unknown cwd'}` : '搜索个人偏好、项目事实、runbook 或历史会话'}
+                />
+                {selectedProjectPath ? <code>{selectedProjectPath}</code> : null}
+              </div>
+
+              {knowledgeError ? <div className="worker-message danger">knowledge search 失败：{knowledgeError}</div> : null}
+              {contextPackError ? <div className="worker-message danger">context pack 失败：{contextPackError}</div> : null}
+
+              {contextPack?.recommendedResume ? (
+                <div className="resume-recommendation">
+                  <div>
+                    <span>recommended resume</span>
+                    <strong>{Math.round(contextPack.recommendedResume.confidence * 100)}% · {contextPack.recommendedResume.reason}</strong>
+                  </div>
+                  <code>{contextPack.recommendedResume.resumeCommand}</code>
+                </div>
+              ) : contextPack ? (
+                <div className="resume-recommendation muted">
+                  <div>
+                    <span>new session reason</span>
+                    <strong>{contextPack.newSessionReason ?? '未找到可恢复会话'}</strong>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="knowledge-context-grid">
+                <div className="knowledge-column">
+                  <h4>Durable Knowledge</h4>
+                  {knowledgeLoading && !knowledgeResults.length ? <div className="empty compact">正在搜索知识库...</div> : null}
+                  {!knowledgeLoading && !knowledgeResults.length && !knowledgeError ? <div className="empty compact">暂无搜索结果</div> : null}
+                  <div className="knowledge-item-list">
+                    {knowledgeResults.slice(0, 6).map((item) => (
+                      <article className="knowledge-item" key={item.id}>
+                        <div className="knowledge-item-title">
+                          <span className="status-pill">{item.type}</span>
+                          <strong>{item.title}</strong>
+                        </div>
+                        <p>{item.text}</p>
+                        <div className="knowledge-item-meta">
+                          {item.project ? <span>{item.project}</span> : null}
+                          {item.repo ? <code>{item.repo}</code> : null}
+                          <span>{formatDate(item.updatedAt)}</span>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="knowledge-column">
+                  <h4>Context Pack</h4>
+                  {contextPackLoading && !contextPack ? <div className="empty compact">正在构建 context pack...</div> : null}
+                  {!contextPack && !contextPackLoading && !contextPackError ? <div className="empty compact">尚未构建</div> : null}
+                  {contextPack ? (
+                    <div className="context-pack-stack">
+                      {contextPack.matchedProject ? (
+                        <div className="context-pack-card">
+                          <span>matched project</span>
+                          <strong>{contextPack.matchedProject.name}</strong>
+                          <code>{contextPack.matchedProject.repo ?? contextPack.matchedProject.cwd ?? contextPack.matchedProject.reason}</code>
+                        </div>
+                      ) : null}
+                      <div className="context-pack-card">
+                        <span>preferences</span>
+                        <p>{contextPack.preferences.map((item) => item.text || item.title).slice(0, 3).join('\n') || 'none'}</p>
+                      </div>
+                      <div className="context-pack-card">
+                        <span>project facts</span>
+                        <p>{contextPack.projectFacts.map((item) => item.text || item.title).slice(0, 4).join('\n') || 'none'}</p>
+                      </div>
+                      <div className="context-pack-card">
+                        <span>runbooks</span>
+                        <p>{contextPack.runbooks.map((item) => item.title).slice(0, 4).join('\n') || 'none'}</p>
+                      </div>
+                      <div className="context-pack-card">
+                        <span>sessions</span>
+                        <p>{contextPack.sessions.map((session) => `${session.title} · ${session.canResume ? 'resume' : 'no resume'}`).slice(0, 5).join('\n') || 'none'}</p>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </section>
+
+            <section className="primary-panel commander-audit">
+              <div className="panel-heading worker-heading">
+                <div>
+                  <h3>Commander Actions 审计</h3>
+                  <span>{commanderActions.length ? `最近 ${recentCommanderActions.length}/${commanderActions.length} 条控制节点记录` : '控制节点 direct-action / self-repair / manual-note'}</span>
+                </div>
+                <button type="button" className="primary-button" disabled={commanderActionsLoading} onClick={() => void loadCommanderActions()}>
+                  <RefreshCw size={16} className={commanderActionsLoading ? 'spin' : ''} />
+                  刷新
+                </button>
+              </div>
+
+              {commanderActionsError ? <div className="worker-message danger">commander actions 加载失败：{commanderActionsError}</div> : null}
+              {commanderActionsLoading && !recentCommanderActions.length ? (
+                <div className="empty compact">正在加载 commander actions...</div>
+              ) : null}
+              {!commanderActionsLoading && !recentCommanderActions.length && !commanderActionsError ? (
+                <div className="empty compact">暂无 commander action 记录</div>
+              ) : null}
+              {recentCommanderActions.length ? (
+                <div className="commander-action-list">
+                  {recentCommanderActions.map((action) => (
+                    <article className="commander-action" key={action.id}>
+                      <div className="commander-action-title">
+                        <span className="status-pill">{commanderActionKindLabel[action.kind] ?? action.kind}</span>
+                        <span className={`status-pill ${commanderActionStatusTone[action.status] ?? ''}`}>{action.status || 'unknown'}</span>
+                        <time>{formatDate(action.completedAt ?? action.startedAt)}</time>
+                      </div>
+                      <div className="commander-action-body">
+                        <div>
+                          <span>goal</span>
+                          <p>{action.goal || '无'}</p>
+                        </div>
+                        <div>
+                          <span>reason</span>
+                          <p>{action.reason || '无'}</p>
+                        </div>
+                        <div>
+                          <span>scope</span>
+                          <p>{action.scope || '无'}</p>
+                        </div>
+                        <div>
+                          <span>changed files</span>
+                          <p>{(action.changedFiles ?? []).join('\n') || 'none'}</p>
+                        </div>
+                        <div>
+                          <span>tests</span>
+                          <p>{(action.tests ?? []).join('\n') || 'not run'}</p>
+                        </div>
+                        <div>
+                          <span>verification</span>
+                          <p>{(action.verification ?? []).join('\n') || '无'}</p>
+                        </div>
+                        <div>
+                          <span>time</span>
+                          <p>
+                            {formatDate(action.startedAt)}
+                            {action.completedAt ? ` - ${formatDate(action.completedAt)}` : ''}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="commander-action-meta">
+                        <code>{action.targetRepo || action.cwd || 'unknown target'}</code>
+                        {action.followUp ? <span>{action.followUp}</span> : null}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </section>
             <section className="primary-panel worker-console">
               <div className="panel-heading worker-heading">
                 <div>
