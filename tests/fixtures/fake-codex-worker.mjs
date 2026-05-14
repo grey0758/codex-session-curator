@@ -50,6 +50,8 @@ switch (scenario) {
     const prompt = process.argv.at(-1) || '';
     console.log('Fake Hermes worker started');
     console.log(prompt.includes('Hermes dispatch E2E') ? 'PROMPT_OK' : 'PROMPT_MISSING_TASK');
+    console.log(prompt.includes('Context pack:') ? 'CONTEXT_PACK_OK' : 'CONTEXT_PACK_MISSING');
+    console.log(prompt.includes('Recommended resume') ? 'RECOMMENDED_RESUME_OK' : 'RECOMMENDED_RESUME_MISSING');
     await delay(80);
     console.log('Hermes dispatch chain finished');
     console.log('STATUS: completed');
@@ -57,7 +59,13 @@ switch (scenario) {
     console.log('TESTS: npm run test:hermes-dispatch');
     console.log('NEXT_ACTION: none');
     await delay(20);
-    process.exit(prompt.includes('Hermes dispatch E2E') ? 0 : 3);
+    process.exit(
+      prompt.includes('Hermes dispatch E2E') &&
+        prompt.includes('Context pack:') &&
+        prompt.includes('Recommended resume')
+        ? 0
+        : 3
+    );
     break;
   }
   case 'policy-stop': {

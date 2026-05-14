@@ -195,7 +195,13 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     server.stderr.on('data', (chunk) => logs.push(chunk.toString('utf8')));
     await waitForServer(baseUrl, server, logs);
 
-    const dispatch = await requestJson<{ status: string; selectedSession: JsonRecord; candidates: JsonRecord[]; job: JsonRecord }>(
+    const dispatch = await requestJson<{
+      status: string;
+      selectedSession: JsonRecord;
+      contextPack: { recommendedResume: JsonRecord; workerPromptContext: string };
+      candidates: JsonRecord[];
+      job: JsonRecord;
+    }>(
       baseUrl,
       '/api/hermes/dispatch?remote=0',
       {
@@ -204,6 +210,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
           query: 'Hermes dispatch E2E',
           prompt: 'Run the Hermes dispatch E2E fake worker and report the result.',
           sessionId,
+          repo: projectDir,
           mode: 'exec',
           supervisor: { autoStop: true, staleOutputMs: 1000 },
           extraArgs: ['--fake-scenario', 'hermes-dispatch-e2e'],
@@ -214,6 +221,8 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
 
     assert.equal(dispatch.status, 'started');
     assert.equal(dispatch.selectedSession.id, sessionId);
+    assert.equal(dispatch.contextPack.recommendedResume.sessionId, sessionId);
+    assert.match(dispatch.contextPack.workerPromptContext, /Recommended resume/);
     assert.equal(dispatch.job.sessionId, sessionId);
     assert.equal(dispatch.job.status, 'running');
     assert.ok(dispatch.candidates.length >= 1);
@@ -251,6 +260,8 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
       'fake worker prompt acknowledgement',
     );
     assert.ok(runningEvents.events.some((event) => event.type === 'started'));
+    assert.ok(runningEvents.events.some((event) => event.type === 'output' && JSON.stringify(event.data ?? {}).includes('CONTEXT_PACK_OK')));
+    assert.ok(runningEvents.events.some((event) => event.type === 'output' && JSON.stringify(event.data ?? {}).includes('RECOMMENDED_RESUME_OK')));
 
     const completed = await waitFor(
       () => requestJson<{ job: JsonRecord }>(baseUrl, `/api/hermes/jobs/${jobId}`),

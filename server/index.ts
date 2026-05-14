@@ -172,6 +172,8 @@ const hermesDispatchSchema = z.object({
   query: z.string().min(1).max(2000),
   prompt: z.string().min(1).max(20_000).optional(),
   sessionId: z.string().min(1).max(160).optional(),
+  cwd: z.string().min(1).max(1000).optional(),
+  repo: z.string().min(1).max(1000).optional(),
   model: z.string().min(1).max(120).optional(),
   limit: z.number().int().min(1).max(10).optional(),
   requireConfirmationBelowScore: z.number().int().min(0).max(100).optional(),
@@ -1077,6 +1079,7 @@ function buildCodexWorkerPrompt(input: {
   session: ReturnType<typeof toHermesSession>;
   template?: z.infer<typeof taskTemplateSchema>;
   policyProfile?: PolicyProfile;
+  contextPackText?: string | null;
 }): string {
   const task = input.prompt?.trim() || input.query.trim();
   const templateRules: Record<NonNullable<z.infer<typeof taskTemplateSchema>>, string[]> = {
@@ -1127,6 +1130,9 @@ function buildCodexWorkerPrompt(input: {
     input.session.keywords.length ? `- keywords: ${input.session.keywords.slice(0, 16).join(', ')}` : '',
     input.session.lastUserMessage ? `- lastUser: ${truncateWorkerContext(input.session.lastUserMessage.text, 500)}` : '',
     input.session.lastAssistantMessage ? `- lastAgent: ${truncateWorkerContext(input.session.lastAssistantMessage.text, 500)}` : '',
+    input.contextPackText ? '' : '',
+    input.contextPackText ? 'Context pack:' : '',
+    input.contextPackText ? truncateWorkerContext(input.contextPackText, 4000) : '',
     '',
     '执行要求：',
     '- 你是实际执行者，控制面只负责调度和监督。',
@@ -2359,14 +2365,25 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
   const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const limit = body.limit ?? 5;
   const threshold = body.requireConfirmationBelowScore ?? 10;
+  const contextPack = await buildContextPackResponse({
+    q: body.query,
+    cwd: body.cwd,
+    repo: body.repo,
+    limit,
+    remote: allowRemote ? undefined : '0',
+  });
+  const recommendedSessionId = body.sessionId ?? contextPack.recommendedResume?.sessionId ?? null;
   const localSessions = await getStateSessionsForHermes();
   const remoteSessions = allowRemote ? await getRemoteSessionsCached() : [];
   const localIds = new Set(localSessions.map((session) => session.id));
   const allSessions = [...localSessions, ...remoteSessions];
 
   const scored = allSessions
-    .map((session) => ({ session, score: body.sessionId === session.id ? 10_000 : scoreHermesMatch(session, body.query) }))
-    .filter((item) => (body.sessionId ? item.session.id === body.sessionId : item.score > 0))
+    .map((session) => ({
+      session,
+      score: recommendedSessionId === session.id ? 10_000 : scoreHermesMatch(session, body.query),
+    }))
+    .filter((item) => (recommendedSessionId ? item.session.id === recommendedSessionId : item.score > 0))
     .sort((a, b) => b.score - a.score || Date.parse(b.session.updatedAt ?? '') - Date.parse(a.session.updatedAt ?? ''));
   const candidates = scored.slice(0, limit).map((item) => toHermesSession(item.session, body.query));
   const selected = candidates[0] ?? null;
@@ -2374,17 +2391,21 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
   if (!selected) {
     return {
       status: 'needs_selection',
-      reason: body.sessionId ? `Session not found: ${body.sessionId}` : 'No relevant Codex session matched the request.',
+      reason: body.sessionId
+        ? `Session not found: ${body.sessionId}`
+        : (contextPack.newSessionReason ?? 'No relevant Codex session matched the request.'),
       query: body.query,
+      contextPack,
       candidates: [],
     };
   }
 
-  if (!body.sessionId && selected.score < threshold) {
+  if (!body.sessionId && !contextPack.recommendedResume && selected.score < threshold) {
     return {
       status: 'needs_selection',
       reason: `Best match score ${selected.score} is below confirmation threshold ${threshold}.`,
       query: body.query,
+      contextPack,
       selectedSession: selected,
       candidates,
     };
@@ -2397,6 +2418,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     session: selectedForJob,
     template: body.template,
     policyProfile: body.policyProfile,
+    contextPackText: contextPack.workerPromptContext,
   });
 
   if (!localIds.has(selected.id)) {
@@ -2424,6 +2446,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
           routedTo: agent.id,
           query: body.query,
           selectedSession: selected,
+          contextPack,
           candidates,
           nextAction: remotePayload.job && typeof remotePayload.job === 'object' && 'id' in remotePayload.job
             ? `Poll /api/hermes/jobs/${String((remotePayload.job as { id?: unknown }).id)} until status is completed, failed, or stopped.`
@@ -2465,6 +2488,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     status: 'started',
     query: body.query,
     selectedSession: selected,
+    contextPack,
     candidates,
     job,
     nextAction: `Poll /api/hermes/jobs/${job.id} until status is completed, failed, or stopped.`,
