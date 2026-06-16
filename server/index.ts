@@ -23,6 +23,14 @@ import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
 import {
+  exportServerIdentityInventory,
+  getServerIdentityMachine,
+  listServerIdentityMachines,
+  patchServerIdentityMachine,
+  renderServerIdentitySshConfig,
+  upsertServerIdentityMachine,
+} from './server-identity.js';
+import {
   getEvaluatorBaseUrl,
   getEvaluatorModel,
   getEvaluatorProvider,
@@ -56,6 +64,37 @@ const backfillSchema = z.object({
 });
 const bulkDeleteSchema = z.object({ confirm: z.literal(true), ids: z.array(z.string().min(1).max(160)).min(1).max(200) });
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
+const includeDeprecatedSchema = z.object({
+  includeDeprecated: z.enum(['0', '1', 'true', 'false']).optional(),
+});
+const serverIdentityAliasSchema = z.object({ alias: z.string().min(1).max(120) });
+const serverIdentityMachineSchema = z
+  .object({
+    alias: z.string().min(1).max(120),
+    aliases: z.array(z.string().min(1).max(120)).optional(),
+    status: z.enum(['active', 'deprecated']).optional(),
+    region: z.string().max(120).nullable().optional(),
+    public_dns: z.string().max(300).nullable().optional(),
+    public_ip: z.string().max(120).nullable().optional(),
+    ssh_user: z.string().max(120).optional(),
+    ssh_users: z.array(z.string().min(1).max(120)).optional(),
+    ssh_port: z.number().int().min(1).max(65535).optional(),
+    frp_hostname: z.string().max(300).nullable().optional(),
+    frp_port: z.number().int().min(1).max(65535).nullable().optional(),
+    tailscale_hostname: z.string().max(300).nullable().optional(),
+    tailscale_ip: z.string().max(120).nullable().optional(),
+    priority: z.array(z.enum(['public', 'frp', 'tailscale'])).min(1).max(3).optional(),
+    verified_hostname: z.string().max(300).nullable().optional(),
+    verified_at: z.string().max(80).nullable().optional(),
+    notes: z.string().max(5000).nullable().optional(),
+    identity_file: z.string().max(500).nullable().optional(),
+    identity_public_key_ref: z.string().max(500).nullable().optional(),
+    host_key_alias: z.string().max(300).nullable().optional(),
+  })
+  .strict();
+const serverIdentityPatchSchema = serverIdentityMachineSchema.partial().refine((value) => Object.keys(value).length > 0, {
+  message: 'patch body must not be empty',
+});
 
 function toSessionSummary(session: Awaited<ReturnType<SessionService['listSessions']>>[number]) {
   return {
@@ -318,6 +357,76 @@ app.post('/api/auth/logout', async (request, reply) => {
 });
 
 app.get('/api/meta', async () => service.getMeta());
+
+function includeDeprecated(query: z.infer<typeof includeDeprecatedSchema>): boolean {
+  return query.includeDeprecated === '1' || query.includeDeprecated === 'true';
+}
+
+app.get('/api/server-identity/machines', async (request, reply) => {
+  const query = includeDeprecatedSchema.parse(request.query);
+  try {
+    return { machines: await listServerIdentityMachines(includeDeprecated(query)) };
+  } catch (error) {
+    request.log.error({ error }, 'server identity list failed');
+    return reply.code(500).send({ error: error instanceof Error ? error.message : 'Server identity list failed' });
+  }
+});
+
+app.get('/api/server-identity/machines/:alias', async (request, reply) => {
+  const params = serverIdentityAliasSchema.parse(request.params);
+  try {
+    const machine = await getServerIdentityMachine(params.alias);
+    if (!machine) return reply.code(404).send({ error: 'Machine not found' });
+    return { machine };
+  } catch (error) {
+    request.log.error({ error, alias: params.alias }, 'server identity get failed');
+    return reply.code(500).send({ error: error instanceof Error ? error.message : 'Server identity get failed' });
+  }
+});
+
+app.post('/api/server-identity/machines', async (request, reply) => {
+  const body = serverIdentityMachineSchema.parse(request.body ?? {});
+  try {
+    return reply.code(201).send({ machine: await upsertServerIdentityMachine(body) });
+  } catch (error) {
+    request.log.error({ error, alias: body.alias }, 'server identity upsert failed');
+    return reply.code(500).send({ error: error instanceof Error ? error.message : 'Server identity upsert failed' });
+  }
+});
+
+app.patch('/api/server-identity/machines/:alias', async (request, reply) => {
+  const params = serverIdentityAliasSchema.parse(request.params);
+  const body = serverIdentityPatchSchema.parse(request.body ?? {});
+  try {
+    const machine = await patchServerIdentityMachine(params.alias, body);
+    if (!machine) return reply.code(404).send({ error: 'Machine not found' });
+    return { machine };
+  } catch (error) {
+    request.log.error({ error, alias: params.alias }, 'server identity patch failed');
+    const message = error instanceof Error ? error.message : 'Server identity patch failed';
+    return reply.code(message.includes('alias cannot be changed') ? 400 : 500).send({ error: message });
+  }
+});
+
+app.post('/api/server-identity/export', async (request, reply) => {
+  const body = includeDeprecatedSchema.parse(request.body ?? {});
+  try {
+    return await exportServerIdentityInventory(includeDeprecated(body));
+  } catch (error) {
+    request.log.error({ error }, 'server identity export failed');
+    return reply.code(500).send({ error: error instanceof Error ? error.message : 'Server identity export failed' });
+  }
+});
+
+app.get('/api/server-identity/ssh-config', async (request, reply) => {
+  const query = includeDeprecatedSchema.parse(request.query);
+  try {
+    return reply.type('text/plain; charset=utf-8').send(await renderServerIdentitySshConfig(includeDeprecated(query)));
+  } catch (error) {
+    request.log.error({ error }, 'server identity ssh config render failed');
+    return reply.code(500).send({ error: error instanceof Error ? error.message : 'Server identity SSH config render failed' });
+  }
+});
 
 app.get('/api/analysis-runs', async () => {
   const records = await readAnalysisRuns(160);

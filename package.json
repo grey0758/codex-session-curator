@@ -9,7 +9,8 @@
     "server": "tsx server/index.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:server-identity": "node --import tsx --test tests/server-identity-api.test.ts"
   },
   "dependencies": {
     "@fastify/compress": "^8.3.1",
