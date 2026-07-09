@@ -2,6 +2,7 @@ export type Recommendation = 'keep' | 'review' | 'delete';
 export type ActivityStatus = 'active' | 'inactive';
 export type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
 export type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
+export type HermesRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
 
 export type MessageRole = 'user' | 'assistant';
 
@@ -15,10 +16,27 @@ export interface HistoryMessage extends ParsedMessage {
   index: number;
 }
 
+export interface SessionMessagesPage {
+  messages: HistoryMessage[];
+  totalMessages: number;
+  nextBefore: number | null;
+  nextAfter: number | null;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+}
+
 export interface Evaluation {
   title: string;
   summary: string;
   detailedSummary: string;
+  hermesContext?: string;
+  hermesContextUpdatedAt?: string | null;
+  hermesLastUsedAt?: string | null;
+  hermesLastJobId?: string | null;
+  hermesNeedsRefresh?: boolean;
+  hermesRecalculatedAt?: string | null;
+  hermesRefreshStatus?: HermesRefreshStatus;
+  hermesRefreshError?: string | null;
   recommendation: Recommendation;
   score: number;
   reasons: string[];
@@ -26,6 +44,8 @@ export interface Evaluation {
   directoryIndex: string[];
   techStack: string[];
   keywords: string[];
+  failureCards?: FailureKnowledgeCard[];
+  jobOutcomes?: JobOutcome[];
   searchText: string;
   updateCadence: UpdateCadence;
   reviewPriority: ReviewPriority;
@@ -38,6 +58,34 @@ export interface Evaluation {
   model: string;
   status: 'ok' | 'fallback' | 'failed';
   error: string | null;
+}
+
+export interface JobOutcome {
+  id: string;
+  at: string;
+  jobId: string;
+  sessionId: string;
+  machineId: string;
+  status: 'completed' | 'failed' | 'stopped' | 'running' | string;
+  mode: 'exec' | 'pty' | string;
+  goal: string;
+  cwd: string | null;
+  changedFiles: string[];
+  tests: string[];
+  nextAction: string | null;
+  failureReason: string | null;
+  needsReview: boolean;
+  summary: string;
+}
+
+export interface FailureKnowledgeCard {
+  id: string;
+  at: string;
+  jobId: string;
+  category: 'auth' | 'env' | 'dependency' | 'test' | 'remote' | 'policy' | 'timeout' | 'worker' | 'unknown';
+  title: string;
+  summary: string;
+  evidence: string;
 }
 
 export interface RemoteMachine {
@@ -58,6 +106,8 @@ export interface CodexSession {
   messageCount: number;
   userTurns: number;
   assistantTurns: number;
+  lastUserMessage: ParsedMessage | null;
+  lastAssistantMessage: ParsedMessage | null;
   shellSnapshotCount: number;
   title: string;
   customTitle: string | null;
@@ -81,6 +131,8 @@ export interface StoredEvaluation extends Evaluation {
   messageCount?: number;
   userTurns?: number;
   assistantTurns?: number;
+  lastUserMessage?: ParsedMessage | null;
+  lastAssistantMessage?: ParsedMessage | null;
   shellSnapshotCount?: number;
 }
 

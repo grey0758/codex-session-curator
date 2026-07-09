@@ -1,0 +1,28 @@
+[Unit]
+Description=Codex Session Curator slot %i
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/grey/data/apps/codex-session-curator-blue-green/slots/%i/current
+Environment=HOST=127.0.0.1
+Environment=CODEX_HOME=/home/grey/.codex
+Environment=CURATOR_EVALUATION_CONCURRENCY=2
+Environment=CURATOR_AUTO_BACKFILL_INTERVAL_MS=600000
+Environment=CURATOR_AUTO_BACKFILL_INITIAL_DELAY_MS=10000
+Environment=CURATOR_AUTO_BACKFILL_LIMIT=8
+Environment=CURATOR_AUTO_BACKFILL_INCLUDE_FAILED=1
+Environment=CURATOR_REMOTE_AGENTS=cnal002=http://127.0.0.1:54179
+Environment=CURATOR_TERMINAL_TRANSPORT=auto
+Environment=CURATOR_TERMINAL_TMUX_SOCKET=codex-curator
+Environment=CURATOR_TERMINAL_SSH_TARGET_GPL001=curator-localhost
+Environment=CURATOR_TERMINAL_SSH_TARGET_CNAL002=cnal002-ts
+EnvironmentFile=-/home/grey/.config/codex-session-curator/auth.env
+EnvironmentFile=-/home/grey/.config/codex-session-curator/llm.env
+EnvironmentFile=/home/grey/.config/codex-session-curator/slots/%i.env
+ExecStart=/usr/bin/npm run server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

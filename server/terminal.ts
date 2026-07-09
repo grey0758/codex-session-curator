@@ -16,6 +16,11 @@ export interface TerminalInput {
   rows?: number;
 }
 
+export interface TerminalStartOptions {
+  cols?: number;
+  rows?: number;
+}
+
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 40;
 const MIN_COLS = 40;
@@ -26,12 +31,30 @@ const SHELL_ENV_CACHE_MS = 60_000;
 
 let cachedUserShellEnv: { loadedAt: number; env: NodeJS.ProcessEnv } | null = null;
 
+type TerminalTransport = 'auto' | 'ssh' | 'local';
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function shellCommandWord(value: string): string {
   return /^[a-zA-Z0-9_./-]+$/.test(value) ? value : shellQuote(value);
+}
+
+function envNameForMachine(machineId: string | null | undefined): string | null {
+  const normalized = machineId?.trim().replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
+  return normalized ? `CURATOR_TERMINAL_SSH_TARGET_${normalized}` : null;
+}
+
+function terminalTransport(): TerminalTransport {
+  const configured = process.env.CURATOR_TERMINAL_TRANSPORT?.trim().toLowerCase();
+  return configured === 'ssh' || configured === 'local' || configured === 'auto' ? configured : 'auto';
+}
+
+function sshTargetForSession(session: CodexSession): string | null {
+  const machineEnvName = envNameForMachine(session.machineId);
+  const configured = (machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_TARGET;
+  return configured?.trim() || null;
 }
 
 function canRunCommand(command: string, env: NodeJS.ProcessEnv): boolean {
@@ -50,7 +73,7 @@ function findCodexBin(env: NodeJS.ProcessEnv): string | null {
   return found || null;
 }
 
-function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
+export function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
   const configured = process.env.CODEX_BIN || env.CODEX_BIN;
   if (configured && canRunCommand(configured, env)) return configured;
   return findCodexBin(env) ?? configured ?? 'codex';
@@ -82,7 +105,7 @@ function loadUserShellEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function createTerminalEnv(): NodeJS.ProcessEnv {
+export function createTerminalEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...loadUserShellEnv(),
@@ -110,28 +133,49 @@ function tmuxSessionName(sessionId: string): string {
   return `codex-curator-${safeId}`;
 }
 
+function tmuxSocketName(): string {
+  const configured = process.env.CURATOR_TERMINAL_TMUX_SOCKET?.trim() || 'codex-curator';
+  return configured.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'codex-curator';
+}
+
+function tmuxArgs(args: string[]): string[] {
+  return ['-L', tmuxSocketName(), ...args];
+}
+
 function hasTmux(): boolean {
   return spawnSync('tmux', ['-V'], { env: createTerminalEnv(), stdio: 'ignore' }).status === 0;
 }
 
 function tmuxHasSession(name: string, env: NodeJS.ProcessEnv): boolean {
-  return spawnSync('tmux', ['has-session', '-t', name], { env, stdio: 'ignore' }).status === 0;
+  return spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), { env, stdio: 'ignore' }).status === 0;
 }
 
 function configureTmuxSession(name: string, env: NodeJS.ProcessEnv): void {
-  spawnSync('tmux', ['set-option', '-t', name, 'status', 'off'], { env, stdio: 'ignore' });
-  spawnSync('tmux', ['set-option', '-t', name, 'mouse', 'off'], { env, stdio: 'ignore' });
-  spawnSync('tmux', ['set-option', '-t', name, 'history-limit', '50000'], { env, stdio: 'ignore' });
-  spawnSync('tmux', ['set-window-option', '-t', name, 'alternate-screen', 'off'], { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-option', '-t', name, 'status', 'off']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-option', '-t', name, 'prefix', 'None']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-option', '-t', name, 'prefix2', 'None']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-option', '-t', name, 'mouse', 'on']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-option', '-t', name, 'history-limit', '50000']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['set-window-option', '-t', name, 'alternate-screen', 'off']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['unbind-key', '-T', 'root', 'MouseDown3Pane']), { env, stdio: 'ignore' });
+  spawnSync('tmux', tmuxArgs(['unbind-key', '-T', 'root', 'M-MouseDown3Pane']), { env, stdio: 'ignore' });
+}
+
+function resizeTmuxSession(name: string, cols: number, rows: number, env: NodeJS.ProcessEnv): void {
+  spawnSync('tmux', tmuxArgs(['resize-window', '-t', name, '-x', String(cols), '-y', String(rows)]), {
+    env,
+    stdio: 'ignore',
+  });
 }
 
 function ensureTmuxSession(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv): string | null {
   if (!hasTmux()) return null;
 
   const name = tmuxSessionName(session.id);
-  const exists = spawnSync('tmux', ['has-session', '-t', name], { env, stdio: 'ignore' });
+  const exists = spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), { env, stdio: 'ignore' });
   if (exists.status === 0) {
     configureTmuxSession(name, env);
+    resizeTmuxSession(name, cols, rows, env);
     return name;
   }
 
@@ -139,7 +183,7 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
   const command = createCodexResumeCommand(session, env);
   const created = spawnSync(
     'tmux',
-    ['new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), command],
+    tmuxArgs(['new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), command]),
     {
       env,
       encoding: 'utf8',
@@ -152,6 +196,7 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
   }
 
   configureTmuxSession(name, env);
+  resizeTmuxSession(name, cols, rows, env);
   return name;
 }
 
@@ -165,13 +210,61 @@ function createDirectCodexPty(session: CodexSession, cols: number, rows: number,
   });
 }
 
-export function startCodexTerminal(
-  session: CodexSession,
-  send: (message: TerminalMessage) => void
-): { write: (input: TerminalInput) => void; close: () => void } {
-  const cols = DEFAULT_COLS;
-  const rows = DEFAULT_ROWS;
-  const env = createTerminalEnv();
+function remoteCodexCommand(session: CodexSession, cols: number, rows: number): string {
+  const cwdArg = session.cwd ? shellQuote(session.cwd) : '"$HOME"';
+  const tmuxName = tmuxSessionName(session.id);
+  const socketName = shellQuote(tmuxSocketName());
+  const codexCommand = `codex resume --include-non-interactive --no-alt-screen -C ${cwdArg} ${shellQuote(session.id)}`;
+  const script = [
+    'set -e',
+    'export TERM=xterm-256color',
+    'export COLORTERM="${COLORTERM:-truecolor}"',
+    `cd ${cwdArg}`,
+    'if command -v tmux >/dev/null 2>&1; then',
+    `  TMUX_SOCKET=${socketName}`,
+    '  tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }',
+    `  if ! tmux_cmd has-session -t ${shellQuote(tmuxName)} 2>/dev/null; then`,
+    `    tmux_cmd new-session -d -s ${shellQuote(tmuxName)} -c ${cwdArg} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} ${shellQuote(codexCommand)}`,
+    '  fi',
+    `  tmux_cmd set-option -t ${shellQuote(tmuxName)} status off >/dev/null 2>&1 || true`,
+    `  tmux_cmd set-option -t ${shellQuote(tmuxName)} prefix None >/dev/null 2>&1 || true`,
+    `  tmux_cmd set-option -t ${shellQuote(tmuxName)} prefix2 None >/dev/null 2>&1 || true`,
+    `  tmux_cmd set-option -t ${shellQuote(tmuxName)} mouse on >/dev/null 2>&1 || true`,
+    `  tmux_cmd set-option -t ${shellQuote(tmuxName)} history-limit 50000 >/dev/null 2>&1 || true`,
+    `  tmux_cmd set-window-option -t ${shellQuote(tmuxName)} alternate-screen off >/dev/null 2>&1 || true`,
+    `  tmux_cmd unbind-key -T root MouseDown3Pane >/dev/null 2>&1 || true`,
+    `  tmux_cmd unbind-key -T root M-MouseDown3Pane >/dev/null 2>&1 || true`,
+    `  tmux_cmd resize-window -t ${shellQuote(tmuxName)} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} >/dev/null 2>&1 || true`,
+    `  exec tmux -L "$TMUX_SOCKET" attach-session -t ${shellQuote(tmuxName)}`,
+    'fi',
+    `exec ${codexCommand}`,
+  ].join('\n');
+
+  return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
+}
+
+function createSshCodexPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, target: string) {
+  const args = [
+    '-tt',
+    '-o',
+    'RequestTTY=force',
+    '-o',
+    'ServerAliveInterval=30',
+    '-o',
+    'ServerAliveCountMax=3',
+    target,
+    remoteCodexCommand(session, cols, rows),
+  ];
+  return spawnPty('ssh', args, {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd: env.HOME || process.cwd(),
+    env,
+  });
+}
+
+function createLocalCodexPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, send: (message: TerminalMessage) => void) {
   const command = createCodexResumeCommand(session, env);
   let tmuxName: string | null = null;
   try {
@@ -189,7 +282,7 @@ export function startCodexTerminal(
   }
 
   const ptyProcess = tmuxName
-    ? spawnPty('tmux', ['attach-session', '-t', tmuxName], {
+    ? spawnPty('tmux', tmuxArgs(['attach-session', '-t', tmuxName]), {
         name: 'xterm-256color',
         cols,
         rows,
@@ -198,7 +291,32 @@ export function startCodexTerminal(
       })
     : createDirectCodexPty(session, cols, rows, env);
 
-  send({ type: 'ready', data: tmuxName ? `tmux attach-session -t ${tmuxName}` : command });
+  send({ type: 'ready', data: tmuxName ? `local tmux -L ${tmuxSocketName()} attach-session -t ${tmuxName}` : command });
+  return ptyProcess;
+}
+
+export function startCodexTerminal(
+  session: CodexSession,
+  send: (message: TerminalMessage) => void,
+  options: TerminalStartOptions = {}
+): { write: (input: TerminalInput) => void; close: () => void } {
+  const cols = clampDimension(options.cols, DEFAULT_COLS, MIN_COLS, MAX_COLS);
+  const rows = clampDimension(options.rows, DEFAULT_ROWS, MIN_ROWS, MAX_ROWS);
+  const env = createTerminalEnv();
+  const transport = terminalTransport();
+  const sshTarget = sshTargetForSession(session);
+  const shouldUseSsh = transport === 'ssh' || (transport === 'auto' && sshTarget);
+  const ptyProcess =
+    shouldUseSsh && sshTarget
+      ? createSshCodexPty(session, cols, rows, env, sshTarget)
+      : createLocalCodexPty(session, cols, rows, env, send);
+
+  if (shouldUseSsh && sshTarget) {
+    send({ type: 'ready', data: `ssh ${sshTarget} -> login shell -> codex resume ${session.id}` });
+  } else if (transport === 'ssh' && !sshTarget) {
+    send({ type: 'error', data: 'CURATOR_TERMINAL_TRANSPORT=ssh but no CURATOR_TERMINAL_SSH_TARGET is configured' });
+  }
+
   ptyProcess.onData((data) => send({ type: 'output', data }));
   ptyProcess.onExit(({ exitCode, signal }) => send({ type: 'exit', code: exitCode, signal: signal === 0 ? null : String(signal) }));
 

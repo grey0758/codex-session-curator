@@ -52,6 +52,49 @@ npm run dev
 npm run dev:server
 ```
 
+## Agent CLI Harness
+
+This repository includes a CLI-Anything harness under `agent-harness/` so agents can read curated session context without opening the web UI.
+
+```bash
+cd agent-harness
+uv venv .venv
+uv pip install --python .venv/bin/python -e .
+.venv/bin/cli-anything-codex-session-curator sessions --limit 10 --json
+.venv/bin/cli-anything-codex-session-curator context <session-id>
+.venv/bin/cli-anything-codex-session-curator messages <session-id> --full --preserve
+.venv/bin/cli-anything-codex-session-curator hermes-search "project or task" --json
+.venv/bin/cli-anything-codex-session-curator hermes-context <session-id> --history-limit 20
+```
+
+The harness wraps the real Curator API first and falls back to the local cached state file for read-only session summaries when the web service is unavailable or unauthenticated.
+
+## Hermes Integration
+
+Hermes should keep only a stable pointer in memory and read real Codex session memory from Curator.
+
+Recommended local setup:
+
+- Hermes memory entry: `~/.hermes/memories/MEMORY.md`
+- Hermes skill: `~/.hermes/skills/codex-session-curator/SKILL.md`
+- Hermes memory provider: `~/.hermes/plugins/codex_session_curator/`
+
+Enable the provider in `~/.hermes/config.yaml`:
+
+```yaml
+memory:
+  provider: codex_session_curator
+```
+
+The provider exposes these Hermes tools:
+
+- `codex_curator_search` searches prior Codex sessions.
+- `codex_curator_context` loads a compact context pack for one session.
+- `codex_curator_start_resume_job` starts a supervised `codex exec resume` job on the machine that owns the session.
+- `codex_curator_job` reads job status, output tail, exit code, and changed files.
+
+The job API is intentionally separate from the browser terminal. It runs non-interactive Codex resume jobs for Hermes supervision while the existing xterm.js terminal remains available for manual intervention.
+
 ## Authentication
 
 The app supports a built-in login page and token login links.
@@ -100,6 +143,13 @@ CURATOR_LLM_RPM=10
 CURATOR_EVALUATION_CONCURRENCY=4
 CURATOR_LLM_MAX_TOKENS=1536
 CURATOR_LLM_STREAM=1
+CURATOR_LLM_FALLBACK_BASE_URL=https://api.example.com/v1
+CURATOR_LLM_FALLBACK_MODEL=gpt-5.4
+CURATOR_LLM_FALLBACK_API_KEYS=fallback-key
+CURATOR_LLM_FALLBACK_RPM=20
+CURATOR_AUTO_BACKFILL_INTERVAL_MS=600000
+CURATOR_AUTO_BACKFILL_LIMIT=8
+CURATOR_AUTO_BACKFILL_INCLUDE_FAILED=1
 ```
 
 You can also use:

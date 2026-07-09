@@ -2,7 +2,7 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import type { HistoryMessage, ParsedMessage } from './types.js';
+import type { HistoryMessage, ParsedMessage, SessionMessagesPage } from './types.js';
 
 export interface ParsedSessionFile {
   id: string;
@@ -15,6 +15,8 @@ export interface ParsedSessionFile {
   messageCount: number;
   userTurns: number;
   assistantTurns: number;
+  lastUserMessage: ParsedMessage | null;
+  lastAssistantMessage: ParsedMessage | null;
   messages: ParsedMessage[];
 }
 
@@ -45,18 +47,20 @@ function normalizeText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-export async function parseSessionHistory(input: {
+function normalizeMessageText(text: string, preserveWhitespace: boolean): string {
+  return preserveWhitespace ? text.trim() : normalizeText(text);
+}
+
+async function collectSessionMessages(input: {
   filePath: string;
-  limit: number;
-  beforeIndex?: number | null;
-}): Promise<{ messages: HistoryMessage[]; nextBefore: number | null; hasMore: boolean }> {
+  preserveWhitespace?: boolean;
+  accept?: (message: HistoryMessage) => boolean;
+  onMessage: (message: HistoryMessage) => void;
+}): Promise<number> {
   const stream = createReadStream(input.filePath, { encoding: 'utf8' });
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
-  const limit = Math.max(1, Math.min(200, input.limit));
-  const beforeIndex = typeof input.beforeIndex === 'number' ? input.beforeIndex : Number.POSITIVE_INFINITY;
-  const window: HistoryMessage[] = [];
   let messageIndex = 0;
-  let hasMore = false;
+  const preserveWhitespace = input.preserveWhitespace ?? false;
 
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -76,23 +80,91 @@ export async function parseSessionHistory(input: {
     const current: HistoryMessage = {
       index: messageIndex,
       role,
-      text: normalizeText(text),
+      text: normalizeMessageText(text, preserveWhitespace),
       timestamp: typeof record.timestamp === 'string' ? record.timestamp : null,
     };
     messageIndex += 1;
 
-    if (current.index >= beforeIndex) continue;
-    window.push(current);
-    if (window.length > limit) {
-      window.shift();
-      hasMore = true;
-    }
+    if (!input.accept || input.accept(current)) input.onMessage(current);
   }
+
+  return messageIndex;
+}
+
+export async function parseSessionHistory(input: {
+  filePath: string;
+  limit: number;
+  beforeIndex?: number | null;
+}): Promise<{ messages: HistoryMessage[]; nextBefore: number | null; hasMore: boolean }> {
+  const limit = Math.max(1, Math.min(200, input.limit));
+  const beforeIndex = typeof input.beforeIndex === 'number' ? input.beforeIndex : Number.POSITIVE_INFINITY;
+  const window: HistoryMessage[] = [];
+  let hasMore = false;
+
+  await collectSessionMessages({
+    filePath: input.filePath,
+    accept: (message) => message.index < beforeIndex,
+    onMessage: (message) => {
+      window.push(message);
+      if (window.length > limit) {
+        window.shift();
+        hasMore = true;
+      }
+    },
+  });
 
   return {
     messages: window,
     nextBefore: window.length && hasMore ? window[0].index : null,
     hasMore,
+  };
+}
+
+export async function parseSessionMessages(input: {
+  filePath: string;
+  limit?: number | null;
+  beforeIndex?: number | null;
+  afterIndex?: number | null;
+  full?: boolean;
+  preserveWhitespace?: boolean;
+}): Promise<SessionMessagesPage> {
+  const full = input.full === true;
+  const limit = full ? Number.POSITIVE_INFINITY : Math.max(1, Math.min(5000, input.limit ?? 200));
+  const beforeIndex = typeof input.beforeIndex === 'number' ? input.beforeIndex : Number.POSITIVE_INFINITY;
+  const afterIndex = typeof input.afterIndex === 'number' ? input.afterIndex : -1;
+  const messages: HistoryMessage[] = [];
+  let skippedBeforeWindow = false;
+  let stoppedAfterLimit = false;
+
+  const totalMessages = await collectSessionMessages({
+    filePath: input.filePath,
+    preserveWhitespace: input.preserveWhitespace,
+    accept: (message) => message.index < beforeIndex && message.index > afterIndex,
+    onMessage: (message) => {
+      if (messages.length < limit) {
+        messages.push(message);
+        return;
+      }
+      if (Number.isFinite(limit) && typeof input.beforeIndex === 'number') {
+        messages.shift();
+        messages.push(message);
+        skippedBeforeWindow = true;
+        return;
+      }
+      stoppedAfterLimit = true;
+    },
+  });
+
+  const firstIndex = messages[0]?.index ?? null;
+  const lastIndex = messages.at(-1)?.index ?? null;
+
+  return {
+    messages,
+    totalMessages,
+    nextBefore: firstIndex !== null && (skippedBeforeWindow || firstIndex > afterIndex + 1) ? firstIndex : null,
+    nextAfter: lastIndex !== null && (stoppedAfterLimit || lastIndex < Math.min(beforeIndex, totalMessages) - 1) ? lastIndex : null,
+    hasMoreBefore: firstIndex !== null && (skippedBeforeWindow || firstIndex > afterIndex + 1),
+    hasMoreAfter: lastIndex !== null && (stoppedAfterLimit || lastIndex < Math.min(beforeIndex, totalMessages) - 1),
   };
 }
 
@@ -108,6 +180,8 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
   let messageCount = 0;
   let userTurns = 0;
   let assistantTurns = 0;
+  let lastUserMessage: ParsedMessage | null = null;
+  let lastAssistantMessage: ParsedMessage | null = null;
   const messages: ParsedMessage[] = [];
 
   for await (const line of rl) {
@@ -141,7 +215,10 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
     messageCount += 1;
     if (role === 'user') userTurns += 1;
     if (role === 'assistant') assistantTurns += 1;
-    messages.push({ role, text: normalizeText(text), timestamp });
+    const message: ParsedMessage = { role, text: normalizeText(text), timestamp };
+    if (role === 'user') lastUserMessage = message;
+    if (role === 'assistant') lastAssistantMessage = message;
+    messages.push(message);
   }
 
   return {
@@ -155,6 +232,8 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
     messageCount,
     userTurns,
     assistantTurns,
+    lastUserMessage,
+    lastAssistantMessage,
     messages,
   };
 }

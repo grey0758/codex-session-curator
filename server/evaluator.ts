@@ -49,9 +49,40 @@ interface LlmEvaluation {
   keywords?: string[];
   recommendedWorkdir: string | null;
   remoteMachines: RemoteMachine[];
+  model?: string;
 }
 
-export const EVALUATOR_WORKFLOW = 'langgraph:measure->decide->nvidia-minimax-cn-summary:index-v8';
+interface LlmEndpoint {
+  provider: string;
+  model: string;
+  baseUrl: string;
+  apiKeys: string[];
+  rpmLimit: number;
+  stream: boolean;
+  maxTokens: number;
+  temperature: number;
+  topP: number;
+  thinking: boolean;
+  responseFormat: boolean;
+}
+
+export const EVALUATOR_WORKFLOW = 'langgraph:measure->decide->cn-summary:index-v11-codex';
+
+export function isEvaluationWorkflowCompatible(workflow?: string | null): boolean {
+  if (!workflow) return false;
+  const base = workflow.replace(/:needs-refresh:[^:]+$/, '').replace(/:fast-list$/, '');
+  if (base === EVALUATOR_WORKFLOW) return true;
+  if (/^langgraph:measure->decide->.+-cn-summary:index-v9$/.test(base)) return true;
+  if (process.env.CURATOR_COMPATIBLE_LEGACY_WORKFLOWS !== '0' && /^langgraph:measure->decide->.+-cn-summary:index-v8$/.test(base)) {
+    return true;
+  }
+  return false;
+}
+
+export function isEvaluationWorkflowComplete(workflow?: string | null): boolean {
+  const value = workflow ?? '';
+  return isEvaluationWorkflowCompatible(value) && !/:needs-refresh:[^:]+$/.test(value) && !/:fast-list$/.test(value);
+}
 
 const WorkflowAnnotation = Annotation.Root({
   messages: Annotation<ParsedMessage[]>(),
@@ -82,22 +113,25 @@ const WorkflowAnnotation = Annotation.Root({
 });
 
 export function getEvaluatorModel(): string {
-  return process.env.CURATOR_LLM_MODEL || process.env.MODEL || 'minimaxai/minimax-m2.7';
+  return getEvaluatorEndpoints()[0]?.model || 'minimaxai/minimax-m2.7';
 }
 
 export function getEvaluatorBaseUrl(): string {
-  return (process.env.CURATOR_LLM_BASE_URL || process.env.BASE_URL || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
+  return getEvaluatorEndpoints()[0]?.baseUrl || 'https://integrate.api.nvidia.com/v1';
 }
 
-export function getEvaluatorProvider(): string {
-  const baseUrl = getEvaluatorBaseUrl();
+function providerForBaseUrl(baseUrl: string): string {
   if (baseUrl.includes('nvidia.com')) return 'nvidia';
   if (baseUrl.includes('opencodex')) return 'opencodex';
   return 'openai-compatible';
 }
 
+export function getEvaluatorProvider(): string {
+  return getEvaluatorEndpoints()[0]?.provider || providerForBaseUrl(getEvaluatorBaseUrl());
+}
+
 export function getEvaluatorRpmLimit(): number {
-  const raw = Number(process.env.CURATOR_LLM_RPM || 40);
+  const raw = getEvaluatorEndpoints()[0]?.rpmLimit ?? Number(process.env.CURATOR_LLM_RPM || 40);
   if (!Number.isFinite(raw)) return 40;
   return Math.max(1, Math.min(120, Math.floor(raw)));
 }
@@ -110,16 +144,9 @@ export function getRecommendedEvaluationConcurrency(): number {
 
 let nextLlmRequestAt = 0;
 const nextLlmRequestAtByKey = new Map<string, number>();
-let nextApiKeyIndex = 0;
+const nextApiKeyIndexByEndpoint = new Map<string, number>();
 
-function getEvaluatorApiKeys(): string[] {
-  const raw =
-    process.env.CURATOR_LLM_API_KEYS ||
-    process.env.NVIDIA_API_KEYS ||
-    process.env.CURATOR_LLM_API_KEY ||
-    process.env.NVIDIA_API_KEY ||
-    process.env.API_KEY ||
-    '';
+function parseApiKeys(raw: string): string[] {
   const keys = raw
     .split(',')
     .map((key) => key.trim().replace(/^['"]|['"]$/g, ''))
@@ -127,16 +154,83 @@ function getEvaluatorApiKeys(): string[] {
   return [...new Set(keys)];
 }
 
-function nextEvaluatorApiKey(): string | null {
-  const keys = getEvaluatorApiKeys();
-  if (!keys.length) return null;
-  const key = keys[nextApiKeyIndex % keys.length];
-  nextApiKeyIndex += 1;
-  return key;
+function readRpm(value: string | undefined, fallback: number): number {
+  const raw = Number(value ?? fallback);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(1, Math.min(120, Math.floor(raw)));
 }
 
-async function waitForLlmRateSlot(apiKey?: string): Promise<void> {
-  const intervalMs = Math.ceil(60_000 / getEvaluatorRpmLimit());
+function endpointFromEnv(prefix: string, defaults: Partial<LlmEndpoint> = {}): LlmEndpoint | null {
+  const baseUrl = (process.env[`${prefix}_BASE_URL`] || (prefix === 'CURATOR_LLM' ? process.env.BASE_URL : '') || defaults.baseUrl || '')
+    .replace(/\/$/, '');
+  const model = process.env[`${prefix}_MODEL`] || (prefix === 'CURATOR_LLM' ? process.env.MODEL : '') || defaults.model || '';
+  const rawKeys =
+    process.env[`${prefix}_API_KEYS`] ||
+    process.env[`${prefix}_API_KEY`] ||
+    (prefix === 'CURATOR_LLM'
+      ? process.env.NVIDIA_API_KEYS || process.env.NVIDIA_API_KEY || process.env.API_KEY || ''
+      : '');
+  const apiKeys = parseApiKeys(rawKeys);
+  if (!baseUrl || !model || apiKeys.length === 0) return null;
+  const provider = providerForBaseUrl(baseUrl);
+  return {
+    provider,
+    model,
+    baseUrl,
+    apiKeys,
+    rpmLimit: readRpm(process.env[`${prefix}_RPM`], defaults.rpmLimit ?? 40),
+    stream: provider === 'nvidia' && process.env[`${prefix}_STREAM`] !== '0',
+    maxTokens: Number(process.env[`${prefix}_MAX_TOKENS`] || defaults.maxTokens || (provider === 'nvidia' ? 1536 : 500)),
+    temperature: Number(process.env[`${prefix}_TEMPERATURE`] || defaults.temperature || (provider === 'nvidia' ? 1 : 0.2)),
+    topP: Number(process.env[`${prefix}_TOP_P`] || defaults.topP || 1),
+    thinking: process.env[`${prefix}_THINKING`] === '1',
+    responseFormat: process.env[`${prefix}_RESPONSE_FORMAT`] !== '0',
+  };
+}
+
+function endpointKey(endpoint: LlmEndpoint): string {
+  return `${endpoint.provider}:${endpoint.baseUrl}:${endpoint.model}`;
+}
+
+export function getEvaluatorEndpoints(): LlmEndpoint[] {
+  const primary =
+    endpointFromEnv('CURATOR_LLM') ??
+    endpointFromEnv('CURATOR_LLM', {
+      baseUrl: 'https://integrate.api.nvidia.com/v1',
+      model: 'minimaxai/minimax-m2.7',
+      rpmLimit: 40,
+    });
+  const fallback = endpointFromEnv('CURATOR_LLM_FALLBACK', {
+    rpmLimit: 20,
+    maxTokens: 1536,
+    temperature: 0.2,
+  });
+  const endpoints = [primary, fallback].filter((endpoint): endpoint is LlmEndpoint => Boolean(endpoint));
+  const seen = new Set<string>();
+  return endpoints.filter((endpoint) => {
+    const key = endpointKey(endpoint);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getLlmTimeoutMs(): number {
+  const raw = Number(process.env.CURATOR_LLM_TIMEOUT_MS || 60_000);
+  if (!Number.isFinite(raw)) return 60_000;
+  return Math.max(10_000, Math.min(300_000, Math.floor(raw)));
+}
+
+function nextEvaluatorApiKey(endpoint: LlmEndpoint): string | null {
+  if (!endpoint.apiKeys.length) return null;
+  const key = endpointKey(endpoint);
+  const index = nextApiKeyIndexByEndpoint.get(key) ?? 0;
+  nextApiKeyIndexByEndpoint.set(key, index + 1);
+  return endpoint.apiKeys[index % endpoint.apiKeys.length];
+}
+
+async function waitForLlmRateSlot(rpmLimit: number, apiKey?: string): Promise<void> {
+  const intervalMs = Math.ceil(60_000 / Math.max(1, rpmLimit));
   const now = Date.now();
   const currentNext = apiKey ? (nextLlmRequestAtByKey.get(apiKey) ?? 0) : nextLlmRequestAt;
   const scheduledAt = Math.max(now, currentNext);
@@ -603,105 +697,146 @@ async function readStreamingContent(response: Response): Promise<string | null> 
 }
 
 async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
-  const model = getEvaluatorModel();
-  const baseUrl = getEvaluatorBaseUrl();
-  const provider = getEvaluatorProvider();
-  if (!getEvaluatorApiKeys().length) return null;
+  const endpoints = getEvaluatorEndpoints();
+  if (!endpoints.length) return null;
 
   const transcript = transcriptForLlm(state.messages);
   if (!transcript.trim()) return null;
 
-  const stream = provider === 'nvidia' && process.env.CURATOR_LLM_STREAM !== '0';
-  const body: Record<string, unknown> = {
-    model,
-    messages: [
-      {
-        role: 'system',
-        content:
-          '你是一个代码会话整理器。请用简体中文总结 Codex 对话，重点说明这次大概做了什么、涉及哪个项目或机器、是否值得保留。不要输出原始密钥、token 或长段原文。',
-      },
-      {
-        role: 'user',
-        content: [
-          `工作目录：${state.cwd ?? '未知'}`,
-          `用户回合：${state.userTurns}`,
-          `助手回合：${state.assistantTurns}`,
-          `推荐结果：${state.recommendation ?? 'review'}`,
-          `规则依据：${(state.reasons ?? []).join('；')}`,
-          `规则提取工作目录：${(state.actualWorkdirs ?? []).join('；') || '无'}`,
-          `规则提取远程机器：${(state.remoteMachines ?? [])
-            .map((machine) => machine.label ?? machine.host ?? machine.ip)
-            .filter(Boolean)
-            .join('；') || '无'}`,
-          '',
-          '请只返回 JSON：',
-          '{"title":"短标题，12到28字，适合作为保留面板标题","summary":"一小段中文，概括整段会话主要做了什么，不要只总结最后一次消息，120字以内","detailedSummary":"更细致说明整段会话做了什么、修改/部署/验证了什么、遗留了什么，180到350字，不泄露密钥","reasons":["中文依据1","中文依据2"],"actualWorkdirs":["/实际工作目录"],"directoryIndex":["目录路径或项目名"],"techStack":["Codex","React","WebSocket"],"keywords":["可搜索关键词"],"recommendedWorkdir":"/建议迁移或继续工作的目录，没有则为null","remoteMachines":[{"label":"机器名","host":"主机名或域名","ip":"IP或null","user":"SSH用户或null","evidence":"简短依据"}]}',
-          '',
-          '下面是从整段会话开头、中间和结尾抽取的摘录，请综合判断：',
-          transcript,
-        ].join('\n'),
-      },
-    ],
-    max_tokens: Number(process.env.CURATOR_LLM_MAX_TOKENS || (provider === 'nvidia' ? 1536 : 500)),
-    temperature: Number(process.env.CURATOR_LLM_TEMPERATURE || (provider === 'nvidia' ? 1 : 0.2)),
-    top_p: Number(process.env.CURATOR_LLM_TOP_P || 1),
-    stream,
-  };
-  if (provider === 'nvidia') {
-    if (process.env.CURATOR_LLM_THINKING === '1') body.chat_template_kwargs = { thinking: true };
-  } else if (process.env.CURATOR_LLM_RESPONSE_FORMAT !== '0') {
-    body.response_format = { type: 'json_object' };
-  }
+  const messages = [
+    {
+      role: 'system',
+      content:
+        '你是一个代码会话整理器。请用简体中文总结 Codex 对话，重点说明这次大概做了什么、涉及哪个项目或机器、是否值得保留。不要输出原始密钥、token 或长段原文。',
+    },
+    {
+      role: 'user',
+      content: [
+        `工作目录：${state.cwd ?? '未知'}`,
+        `用户回合：${state.userTurns}`,
+        `助手回合：${state.assistantTurns}`,
+        `推荐结果：${state.recommendation ?? 'review'}`,
+        `规则依据：${(state.reasons ?? []).join('；')}`,
+        `规则提取工作目录：${(state.actualWorkdirs ?? []).join('；') || '无'}`,
+        `规则提取远程机器：${(state.remoteMachines ?? [])
+          .map((machine) => machine.label ?? machine.host ?? machine.ip)
+          .filter(Boolean)
+          .join('；') || '无'}`,
+        '',
+        '请只返回 JSON：',
+        '{"title":"短标题，12到28字，适合作为保留面板标题","summary":"一小段中文，概括整段会话主要做了什么，不要只总结最后一次消息，120字以内","detailedSummary":"更细致说明整段会话做了什么、修改/部署/验证了什么、遗留了什么，180到350字，不泄露密钥","reasons":["中文依据1","中文依据2"],"actualWorkdirs":["/实际工作目录"],"directoryIndex":["目录路径或项目名"],"techStack":["Codex","React","WebSocket"],"keywords":["可搜索关键词"],"recommendedWorkdir":"/建议迁移或继续工作的目录，没有则为null","remoteMachines":[{"label":"机器名","host":"主机名或域名","ip":"IP或null","user":"SSH用户或null","evidence":"简短依据"}]}',
+        '',
+        '下面是从整段会话开头、中间和结尾抽取的摘录，请综合判断：',
+        transcript,
+      ].join('\n'),
+    },
+  ];
 
-  let response: Response | null = null;
-  const startedAt = Date.now();
-  let httpStatus: number | null = null;
-  let apiKey = nextEvaluatorApiKey();
-  if (!apiKey) return null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    await waitForLlmRateSlot(apiKey);
-    response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        Accept: stream ? 'text/event-stream' : 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    httpStatus = response.status;
-    if (response.ok) break;
-    if (attempt < 3 && (response.status >= 500 || response.status === 429)) {
-      apiKey = nextEvaluatorApiKey() ?? apiKey;
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+  let lastError: Error | null = null;
+  for (const endpoint of endpoints) {
+    const body: Record<string, unknown> = {
+      model: endpoint.model,
+      messages,
+      max_tokens: endpoint.maxTokens,
+      temperature: endpoint.temperature,
+      top_p: endpoint.topP,
+      stream: endpoint.stream,
+    };
+    if (endpoint.provider === 'nvidia') {
+      if (endpoint.thinking) body.chat_template_kwargs = { thinking: true };
+    } else if (endpoint.responseFormat) {
+      body.response_format = { type: 'json_object' };
+    }
+
+    let response: Response | null = null;
+    const startedAt = Date.now();
+    let httpStatus: number | null = null;
+    let apiKey = nextEvaluatorApiKey(endpoint);
+    if (!apiKey) continue;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await waitForLlmRateSlot(endpoint.rpmLimit, `${endpoint.baseUrl}:${apiKey}`);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), getLlmTimeoutMs());
+      try {
+        response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: endpoint.stream ? 'text/event-stream' : 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        lastError = error instanceof Error ? error : new Error('LLM request failed');
+        if (attempt < 3) {
+          apiKey = nextEvaluatorApiKey(endpoint) ?? apiKey;
+          await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+          continue;
+        }
+        break;
+      } finally {
+        clearTimeout(timer);
+      }
+      httpStatus = response.status;
+      if (response.ok) break;
+      if (attempt < 3 && (response.status >= 500 || response.status === 429)) {
+        apiKey = nextEvaluatorApiKey(endpoint) ?? apiKey;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+        continue;
+      }
+      break;
+    }
+
+    if (!response?.ok) {
+      lastError = new Error(`LLM request failed: ${httpStatus ?? 'no response'}`);
+      await recordAnalysisRun({
+        timestamp: new Date().toISOString(),
+        provider: endpoint.provider,
+        model: endpoint.model,
+        baseUrl: endpoint.baseUrl,
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        httpStatus,
+        error: lastError.message,
+      }).catch(() => undefined);
       continue;
     }
+
+    const content = endpoint.stream ? await readStreamingContent(response) : extractChatContent(await response.json());
     await recordAnalysisRun({
       timestamp: new Date().toISOString(),
-      provider,
-      model,
-      baseUrl,
+      provider: endpoint.provider,
+      model: endpoint.model,
+      baseUrl: endpoint.baseUrl,
+      status: content ? 'ok' : 'failed',
+      durationMs: Date.now() - startedAt,
+      httpStatus,
+      error: content ? null : 'LLM response had no content',
+    }).catch(() => undefined);
+    if (!content) {
+      lastError = new Error('LLM response had no content');
+      continue;
+    }
+    const parsed = parseJsonObject(content);
+    if (parsed) return { ...parsed, model: endpoint.model };
+    lastError = new Error('LLM response was not valid curator JSON');
+    await recordAnalysisRun({
+      timestamp: new Date().toISOString(),
+      provider: endpoint.provider,
+      model: endpoint.model,
+      baseUrl: endpoint.baseUrl,
       status: 'failed',
       durationMs: Date.now() - startedAt,
       httpStatus,
-      error: `LLM request failed: ${response.status}`,
+      error: lastError.message,
     }).catch(() => undefined);
-    throw new Error(`LLM request failed: ${response.status}`);
   }
 
-  if (!response?.ok) throw new Error('LLM request failed without response');
-  const content = stream ? await readStreamingContent(response) : extractChatContent(await response.json());
-  await recordAnalysisRun({
-    timestamp: new Date().toISOString(),
-    provider,
-    model,
-    baseUrl,
-    status: content ? 'ok' : 'failed',
-    durationMs: Date.now() - startedAt,
-    httpStatus,
-    error: content ? null : 'LLM response had no content',
-  }).catch(() => undefined);
-  return content ? parseJsonObject(content) : null;
+  if (lastError) throw lastError;
+  return null;
 }
 
 function measureNode(state: WorkflowState): Partial<WorkflowState> {
@@ -810,7 +945,6 @@ function decisionNode(state: WorkflowState): Partial<WorkflowState> {
 }
 
 async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowState>> {
-  const model = getEvaluatorModel();
   try {
     const llm = await callLlm(state);
     if (llm) {
@@ -851,7 +985,7 @@ async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowSta
         cwdMatchesWorkdir,
         recommendedWorkdir: llm.recommendedWorkdir ?? (cwdMatchesWorkdir === false ? actualWorkdirs[0] ?? null : null),
         remoteMachines,
-        model,
+        model: llm.model ?? getEvaluatorModel(),
         status: 'ok',
         error: null,
       };
@@ -876,7 +1010,7 @@ async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowSta
         keywords: state.keywords ?? [],
         remoteMachines: state.remoteMachines ?? [],
       }),
-      model,
+      model: getEvaluatorModel(),
       status: 'failed',
       error: error instanceof Error ? error.message.slice(0, 240) : 'GPT summary failed',
     };
@@ -900,7 +1034,7 @@ async function llmSummaryNode(state: WorkflowState): Promise<Partial<WorkflowSta
       keywords: state.keywords ?? [],
       remoteMachines: state.remoteMachines ?? [],
     }),
-    model,
+    model: getEvaluatorModel(),
     status: 'fallback',
     error: null,
   };
@@ -931,10 +1065,16 @@ export async function evaluateSession(input: {
   const remoteMachines = result.remoteMachines ?? extractRemoteMachines(input.messages);
   const title = result.title ?? fallbackTitle(summary, input.cwd);
   const detailedSummary = result.detailedSummary ?? fallbackDetailedSummary(input.messages, input.cwd);
+  const recommendedWorkdir = result.recommendedWorkdir ?? null;
+  const now = new Date().toISOString();
   return {
     title,
     summary,
     detailedSummary,
+    hermesNeedsRefresh: false,
+    hermesRecalculatedAt: now,
+    hermesRefreshStatus: 'ok',
+    hermesRefreshError: null,
     recommendation: result.recommendation ?? 'review',
     score: result.score ?? 0,
     reasons: result.reasons ?? ['工作流未返回评估依据'],
@@ -942,6 +1082,8 @@ export async function evaluateSession(input: {
     directoryIndex,
     techStack,
     keywords,
+    failureCards: [],
+    jobOutcomes: [],
     searchText:
       result.searchText ??
       buildSearchText({
@@ -959,9 +1101,9 @@ export async function evaluateSession(input: {
     reviewPriority: result.reviewPriority ?? 'normal',
     reviewSignals: result.reviewSignals ?? ['首次或完整评估，已生成基础索引'],
     cwdMatchesWorkdir: result.cwdMatchesWorkdir ?? null,
-    recommendedWorkdir: result.recommendedWorkdir ?? null,
+    recommendedWorkdir,
     remoteMachines,
-    evaluatedAt: new Date().toISOString(),
+    evaluatedAt: now,
     workflow: EVALUATOR_WORKFLOW,
     model: result.model ?? getEvaluatorModel(),
     status: result.status ?? 'fallback',

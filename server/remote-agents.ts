@@ -118,6 +118,20 @@ export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promi
   return (await response.json()) as T;
 }
 
+export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: unknown): Promise<T> {
+  const response = await fetchWithTimeout(
+    remoteUrl(agent, path),
+    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
+  return (await response.json()) as T;
+}
+
 export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
   const response = await fetchWithTimeout(
     remoteUrl(agent, `/api/sessions/${encodeURIComponent(sessionId)}`),

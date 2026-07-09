@@ -8,7 +8,10 @@ import {
   CheckCircle2,
   Clock3,
   Copy,
+  Download,
   FileJson,
+  FileText,
+  Folder,
   FolderOpen,
   KeyRound,
   Loader2,
@@ -21,6 +24,7 @@ import {
   Sparkles,
   Terminal as TerminalIcon,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import { FitAddon } from '@xterm/addon-fit';
@@ -34,6 +38,11 @@ type TabId = 'all' | 'kept' | 'recycle' | Recommendation;
 type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
 type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
 type SessionListViewMode = 'folder' | 'activityDate';
+type AiRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
+type MessageRole = 'user' | 'assistant';
+type CodexWorkerJobStatus = 'running' | 'completed' | 'failed' | 'stopped' | string;
+type CodexWorkerMode = 'exec' | 'pty' | string;
+type WorkerProtocolKind = 'guide' | 'pause' | 'continue' | 'summarize' | 'handoff' | 'verify';
 
 interface RemoteMachine {
   label: string | null;
@@ -47,6 +56,12 @@ interface Evaluation {
   title: string;
   summary: string;
   detailedSummary: string;
+  hermesLastUsedAt?: string | null;
+  hermesLastJobId?: string | null;
+  hermesNeedsRefresh?: boolean;
+  hermesRecalculatedAt?: string | null;
+  hermesRefreshStatus?: AiRefreshStatus;
+  hermesRefreshError?: string | null;
   recommendation: Recommendation;
   score: number;
   reasons: string[];
@@ -68,6 +83,12 @@ interface Evaluation {
   error: string | null;
 }
 
+interface SessionMessagePreview {
+  role: MessageRole;
+  text: string;
+  timestamp: string | null;
+}
+
 interface CodexSession {
   id: string;
   filePath: string;
@@ -78,6 +99,8 @@ interface CodexSession {
   messageCount: number;
   userTurns: number;
   assistantTurns: number;
+  lastUserMessage: SessionMessagePreview | null;
+  lastAssistantMessage: SessionMessagePreview | null;
   shellSnapshotCount: number;
   title: string;
   customTitle: string | null;
@@ -124,6 +147,94 @@ interface RecyclePayload {
   archives: RecycleArchive[];
 }
 
+function asArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeEvaluation(session: Partial<CodexSession>): Evaluation {
+  const flat = session as Partial<CodexSession> & Partial<Evaluation>;
+  const evaluation = (session.evaluation ?? {}) as Partial<Evaluation>;
+  const fallbackTitle = session.title || session.id || '未知会话';
+  const fallbackSummary = '远端会话尚未生成摘要';
+  const rawRecommendation = evaluation.recommendation ?? flat.recommendation;
+  const recommendation: Recommendation =
+    rawRecommendation === 'keep' || rawRecommendation === 'review' || rawRecommendation === 'delete'
+      ? rawRecommendation
+      : 'review';
+  const remoteMachines = asArray(evaluation.remoteMachines ?? flat.remoteMachines).map((machine) => ({
+    label: machine.label ?? null,
+    host: machine.host ?? null,
+    ip: machine.ip ?? null,
+    user: machine.user ?? null,
+    evidence: machine.evidence ?? '',
+  }));
+  return {
+    title: evaluation.title ?? flat.title ?? fallbackTitle,
+    summary: evaluation.summary ?? flat.summary ?? fallbackSummary,
+    detailedSummary: evaluation.detailedSummary ?? flat.detailedSummary ?? evaluation.summary ?? flat.summary ?? fallbackSummary,
+    hermesLastUsedAt: evaluation.hermesLastUsedAt ?? null,
+    hermesLastJobId: evaluation.hermesLastJobId ?? null,
+    hermesNeedsRefresh: evaluation.hermesNeedsRefresh ?? false,
+    hermesRecalculatedAt: evaluation.hermesRecalculatedAt ?? null,
+    hermesRefreshStatus: evaluation.hermesRefreshStatus ?? (evaluation.hermesNeedsRefresh ? 'pending' : 'never'),
+    hermesRefreshError: evaluation.hermesRefreshError ?? null,
+    recommendation,
+    score: typeof evaluation.score === 'number' ? evaluation.score : typeof flat.score === 'number' ? flat.score : 0,
+    reasons: asArray(evaluation.reasons ?? flat.reasons),
+    actualWorkdirs: asArray(evaluation.actualWorkdirs ?? flat.actualWorkdirs),
+    directoryIndex: asArray(evaluation.directoryIndex ?? flat.directoryIndex),
+    techStack: asArray(evaluation.techStack ?? flat.techStack),
+    keywords: asArray(evaluation.keywords ?? flat.keywords),
+    searchText: evaluation.searchText ?? flat.searchText ?? '',
+    updateCadence: evaluation.updateCadence ?? flat.updateCadence ?? 'quiet',
+    reviewPriority: evaluation.reviewPriority ?? flat.reviewPriority ?? 'normal',
+    reviewSignals: asArray(evaluation.reviewSignals ?? flat.reviewSignals),
+    cwdMatchesWorkdir: evaluation.cwdMatchesWorkdir ?? flat.cwdMatchesWorkdir ?? null,
+    recommendedWorkdir: evaluation.recommendedWorkdir ?? flat.recommendedWorkdir ?? null,
+    remoteMachines,
+    evaluatedAt: evaluation.evaluatedAt ?? flat.evaluatedAt ?? session.updatedAt ?? session.startedAt ?? new Date(0).toISOString(),
+    workflow: evaluation.workflow ?? flat.workflow ?? 'frontend-compat',
+    model: evaluation.model ?? flat.model ?? 'none',
+    status: evaluation.status ?? flat.status ?? 'fallback',
+    error: evaluation.error ?? flat.error ?? null,
+  };
+}
+
+function normalizeSession(raw: unknown): CodexSession {
+  const session = (raw ?? {}) as Partial<CodexSession>;
+  const id = String(session.id ?? session.filePath ?? 'unknown-session');
+  const title = session.title || session.customTitle || id;
+  return {
+    ...session,
+    id,
+    filePath: session.filePath ?? '',
+    cwd: session.cwd ?? null,
+    startedAt: session.startedAt ?? null,
+    updatedAt: session.updatedAt ?? session.startedAt ?? null,
+    bytes: typeof session.bytes === 'number' ? session.bytes : 0,
+    messageCount: typeof session.messageCount === 'number' ? session.messageCount : 0,
+    userTurns: typeof session.userTurns === 'number' ? session.userTurns : 0,
+    assistantTurns: typeof session.assistantTurns === 'number' ? session.assistantTurns : 0,
+    lastUserMessage: session.lastUserMessage ?? null,
+    lastAssistantMessage: session.lastAssistantMessage ?? null,
+    shellSnapshotCount: typeof session.shellSnapshotCount === 'number' ? session.shellSnapshotCount : 0,
+    title,
+    customTitle: session.customTitle ?? null,
+    resumeCommand: session.resumeCommand ?? '',
+    machineId: session.machineId ?? 'unknown',
+    activityStatus: session.activityStatus === 'inactive' ? 'inactive' : 'active',
+    lastActiveAt: session.lastActiveAt ?? session.updatedAt ?? session.startedAt ?? null,
+    inactiveDays: typeof session.inactiveDays === 'number' ? session.inactiveDays : null,
+    kept: Boolean(session.kept),
+    deleted: Boolean(session.deleted),
+    evaluation: normalizeEvaluation({ ...session, id, title }),
+  };
+}
+
+function normalizeSessions(sessions: unknown): CodexSession[] {
+  return Array.isArray(sessions) ? sessions.map(normalizeSession) : [];
+}
+
 interface HistoryMessage {
   index: number;
   role: 'user' | 'assistant';
@@ -135,6 +246,141 @@ interface HistoryPayload {
   messages: HistoryMessage[];
   nextBefore: number | null;
   hasMore: boolean;
+  totalMessages?: number;
+}
+
+type EvaluationRefreshJobStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+interface EvaluationRefreshJob {
+  id: string;
+  sessionId: string;
+  reason: string;
+  status: EvaluationRefreshJobStatus;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  result: { title?: string; status?: string; error?: string } | null;
+  error: string | null;
+}
+
+interface CodexWorkerGuidance {
+  at?: string | null;
+  text?: string | null;
+  source?: string | null;
+}
+
+interface CodexWorkerSupervisor {
+  enabled?: boolean;
+  lastCheckedAt?: string | null;
+  lastDecision?: string | null;
+  lastReason?: string | null;
+  checks?: number;
+  retries?: number;
+  autoStop?: boolean;
+  autoRetry?: boolean;
+  idleTimeoutMs?: number | null;
+  maxRetries?: number | null;
+  lastOutputAt?: string | null;
+  lastOutputBytes?: number | null;
+}
+
+interface CodexWorkerPolicy {
+  maxRuntimeMs?: number | null;
+  maxOutputBytes?: number | null;
+  allowDeploy?: boolean;
+  allowDeletes?: boolean;
+  allowedCwds?: string[];
+  blockedCommands?: string[];
+  autoStop?: boolean;
+}
+
+interface CodexWorkerPolicyViolation {
+  at?: string | null;
+  reason?: string | null;
+  severity?: 'warn' | 'stop' | string | null;
+  pattern?: string | null;
+}
+
+interface CodexWorkerPolicyState {
+  lastCheckedAt?: string | null;
+  violations?: CodexWorkerPolicyViolation[];
+  stoppedAt?: string | null;
+}
+
+interface CodexWorkerStructuredReport {
+  status?: string | null;
+  changedFiles?: string[];
+  tests?: string[];
+  nextAction?: string | null;
+  rawFooter?: string | null;
+  parsedAt?: string | null;
+}
+
+interface CodexWorkerJob {
+  id: string;
+  sessionId?: string | null;
+  status?: CodexWorkerJobStatus | null;
+  mode?: CodexWorkerMode | null;
+  machineId?: string | null;
+  machine?: string | null;
+  cwd?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  completedAt?: string | null;
+  outputTail?: string | null;
+  changedFiles?: string[];
+  guidance?: CodexWorkerGuidance[];
+  supervisor?: CodexWorkerSupervisor | null;
+  policy?: CodexWorkerPolicy | null;
+  policyState?: CodexWorkerPolicyState | null;
+  structuredReport?: CodexWorkerStructuredReport | null;
+  error?: string | null;
+  command?: string | null;
+  prompt?: string | null;
+  outputBytes?: number | null;
+  exitCode?: number | null;
+  signal?: string | null;
+}
+
+interface CodexJobRegistryEntry {
+  machineId?: string | null;
+  baseUrl?: string | null;
+  job?: CodexWorkerJob;
+}
+
+interface CodexJobRegistryHealth {
+  machineId: string;
+  baseUrl: string | null;
+  healthy: boolean;
+  updatedAt: string | null;
+  cached: boolean;
+  error: string | null;
+}
+
+interface CodexJobRegistryError {
+  machineId: string;
+  baseUrl: string | null;
+  error: string;
+}
+
+interface CodexJobRegistryPayload {
+  machineId?: string | null;
+  baseUrl?: string | null;
+  jobs?: CodexJobRegistryEntry[];
+  count?: number;
+  health?: CodexJobRegistryHealth[];
+  errors?: CodexJobRegistryError[];
+  error?: string;
+}
+
+interface CodexWorkerEvent {
+  seq?: number;
+  at?: string | null;
+  type?: string | null;
+  kind?: string | null;
+  message?: string | null;
+  data?: unknown;
+  [key: string]: unknown;
 }
 
 interface TerminalEvent {
@@ -155,6 +401,47 @@ interface RemoteAgentStatus {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
 
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+interface TerminalSessionTarget {
+  id: string;
+  machineId: string;
+  cwd: string | null;
+  title?: string;
+  resumeCommand?: string;
+}
+
+interface TerminalCopyOptions {
+  clearSelection?: boolean;
+  preferLegacy?: boolean;
+  silentEmpty?: boolean;
+  notice?: string;
+  text?: string;
+}
+
+interface TerminalCellPoint {
+  col: number;
+  row: number;
+}
+
+interface SessionFileEntry {
+  name: string;
+  path: string;
+  type: 'directory' | 'file' | 'symlink' | 'other';
+  size: number | null;
+  mtime: string | null;
+}
+
+interface SessionFilesPayload {
+  sessionId: string;
+  machineId: string;
+  cwd: string;
+  root: string;
+  path: string;
+  parent: string | null;
+  entries: SessionFileEntry[];
+}
+
 interface LoginPanelProps {
   busy: boolean;
   message: string | null;
@@ -167,6 +454,116 @@ const terminalStatusLabel: Record<TerminalStatus, string> = {
   connected: '已连接',
   'codex-running': 'Codex 运行中',
 };
+
+const MACHINE_FILTER_STORAGE_KEY = 'codex-session-curator:last-machine-filter';
+
+function readStoredMachineFilter(): string {
+  try {
+    return window.localStorage.getItem(MACHINE_FILTER_STORAGE_KEY) || 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+function readTerminalSessionId(): string | null {
+  try {
+    return new URL(window.location.href).searchParams.get('terminal');
+  } catch {
+    return null;
+  }
+}
+
+function readFilesSessionId(): string | null {
+  try {
+    return new URL(window.location.href).searchParams.get('files');
+  } catch {
+    return null;
+  }
+}
+
+function terminalPageUrl(sessionId: string): string {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('terminal', sessionId);
+  return url.toString();
+}
+
+function filesPageUrl(sessionId: string): string {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('files', sessionId);
+  return url.toString();
+}
+
+function terminalPlaceholderSession(sessionId: string): TerminalSessionTarget {
+  return {
+    id: sessionId,
+    machineId: 'unknown',
+    cwd: null,
+    title: `SSH 终端 ${sessionId}`,
+  };
+}
+
+function terminalCellFromMouseEvent(terminal: XTerm, container: HTMLDivElement, event: MouseEvent): TerminalCellPoint | null {
+  const screen = container.querySelector<HTMLElement>('.xterm-screen') ?? container;
+  const rect = screen.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const col = Math.max(0, Math.min(terminal.cols - 1, Math.floor(((event.clientX - rect.left) / rect.width) * terminal.cols)));
+  const row = Math.max(0, Math.min(terminal.rows - 1, Math.floor(((event.clientY - rect.top) / rect.height) * terminal.rows)));
+  return { col, row };
+}
+
+function extractTerminalBufferRange(terminal: XTerm, start: TerminalCellPoint, end: TerminalCellPoint): string {
+  const first = start.row < end.row || (start.row === end.row && start.col <= end.col) ? start : end;
+  const last = first === start ? end : start;
+  const buffer = terminal.buffer.active;
+  const topRow = buffer.viewportY;
+  const lines: string[] = [];
+
+  for (let row = first.row; row <= last.row; row += 1) {
+    const line = buffer.getLine(topRow + row);
+    if (!line) {
+      lines.push('');
+      continue;
+    }
+    const startCol = row === first.row ? first.col : 0;
+    const endCol = row === last.row ? last.col + 1 : terminal.cols;
+    lines.push(line.translateToString(true, startCol, endCol));
+  }
+
+  return lines.join('\n').replace(/\n+$/, '');
+}
+
+function copyViaHiddenTextarea(text: string): boolean {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand('copy');
+  textarea.remove();
+  return copied;
+}
+
+async function writeClipboardText(text: string, preferLegacy = false): Promise<void> {
+  if (preferLegacy && copyViaHiddenTextarea(text)) return;
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back to execCommand below; HTTP tunnels often reject Clipboard API writes.
+    }
+  }
+  if (copyViaHiddenTextarea(text)) return;
+  throw new Error('copy command failed');
+}
 
 const tabs: Array<{ id: TabId; label: string }> = [
   { id: 'all', label: '全部' },
@@ -187,6 +584,63 @@ const recommendationTone: Record<Recommendation, string> = {
   keep: 'tone-keep',
   review: 'tone-review',
   delete: 'tone-delete',
+};
+
+const aiRefreshLabel: Record<AiRefreshStatus, string> = {
+  never: '未重算',
+  pending: '待 AI 重算',
+  running: 'AI 重算中',
+  ok: '已 AI 重算',
+  failed: '重算失败',
+};
+
+const aiRefreshTone: Record<AiRefreshStatus, string> = {
+  never: 'tone-review',
+  pending: 'tone-review',
+  running: 'tone-review',
+  ok: 'tone-keep',
+  failed: 'tone-delete',
+};
+
+const workerStatusLabel: Record<string, string> = {
+  running: '运行中',
+  completed: '已完成',
+  failed: '失败',
+  stopped: '已停止',
+};
+
+const workerStatusTone: Record<string, string> = {
+  running: 'tone-review',
+  completed: 'tone-keep',
+  failed: 'tone-delete',
+  stopped: 'tone-delete',
+};
+
+const workerProtocolKinds: Array<{ id: WorkerProtocolKind; label: string }> = [
+  { id: 'guide', label: '指导' },
+  { id: 'pause', label: '暂停' },
+  { id: 'continue', label: '继续' },
+  { id: 'summarize', label: '总结' },
+  { id: 'handoff', label: '交接' },
+  { id: 'verify', label: '验证' },
+];
+
+const supervisorDecisionLabel: Record<string, string> = {
+  continue: '继续',
+  needs_guidance: '需要指导',
+  stop: '停止',
+  retry: '重试',
+  completed: '已完成',
+  failed: '失败',
+};
+
+const supervisorDecisionTone: Record<string, string> = {
+  continue: 'tone-review',
+  needs_guidance: 'tone-review',
+  stop: 'tone-delete',
+  retry: 'tone-review',
+  completed: 'tone-keep',
+  failed: 'tone-delete',
 };
 
 const cadenceLabel: Record<UpdateCadence, string> = {
@@ -216,14 +670,81 @@ function formatDate(value: string | null): string {
   }).format(date);
 }
 
+function previewText(message: SessionMessagePreview | null, fallback = '暂无记录'): string {
+  const text = message?.text.replace(/\s+/g, ' ').trim();
+  if (!text) return fallback;
+  return text.length > 220 ? `${text.slice(0, 220)}...` : text;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function fileSizeLabel(bytes: number | null): string {
+  return typeof bytes === 'number' && Number.isFinite(bytes) ? formatBytes(bytes) : '-';
+}
+
+function formatOptionalBytes(bytes: number | null | undefined): string {
+  return typeof bytes === 'number' && Number.isFinite(bytes) ? formatBytes(bytes) : '未限制';
+}
+
+function formatDurationMs(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '未限制';
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function booleanPolicyLabel(value: boolean | null | undefined, enabledText = '允许', disabledText = '禁止'): string {
+  if (value === true) return enabledText;
+  if (value === false) return disabledText;
+  return '未配置';
+}
+
 function normalizePath(value: string | null | undefined): string {
   return (value ?? '').replace(/\/+$/, '');
+}
+
+function formatUnknownValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '无';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function workerJobTime(job: CodexWorkerJob): number {
+  return Date.parse(job.updatedAt ?? job.startedAt ?? '') || 0;
+}
+
+function isWorkerJobRunning(job: CodexWorkerJob): boolean {
+  return job.status === 'running';
+}
+
+function sortWorkerJobs(jobs: CodexWorkerJob[]): CodexWorkerJob[] {
+  return [...jobs].sort((a, b) => {
+    const runningDelta = Number(isWorkerJobRunning(b)) - Number(isWorkerJobRunning(a));
+    return runningDelta || workerJobTime(b) - workerJobTime(a);
+  });
+}
+
+function statusLabel(status: string | null | undefined): string {
+  return status ? (workerStatusLabel[status] ?? status) : '未知';
+}
+
+function machineKey(machineId: string | null | undefined, baseUrl: string | null | undefined): string {
+  return `${machineId || 'unknown'}|||${baseUrl || 'local'}`;
 }
 
 function LoginPanel({ busy, message, onLogin }: LoginPanelProps) {
@@ -309,6 +830,8 @@ function matchesSearch(session: CodexSession, query: string): boolean {
     session.resumeCommand,
     session.cwd ?? '',
     session.machineId,
+    session.lastUserMessage?.text ?? '',
+    session.lastAssistantMessage?.text ?? '',
     session.evaluation.summary,
     session.evaluation.detailedSummary,
     session.evaluation.searchText ?? '',
@@ -342,7 +865,7 @@ function metricLabel(value: number, label: string) {
   );
 }
 
-function TerminalConsole({ session, active, onClose }: { session: CodexSession; active: boolean; onClose: () => void }) {
+function TerminalConsole({ session, active, onClose }: { session: TerminalSessionTarget; active: boolean; onClose: () => void }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -352,6 +875,14 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
   const reconnectTimerRef = useRef<number | null>(null);
   const terminalCleanupRef = useRef<(() => void) | null>(null);
   const connectRef = useRef<() => void>(() => {});
+  const pendingOutputRef = useRef('');
+  const outputFlushTimerRef = useRef<number | null>(null);
+  const initialOutputRefreshesRef = useRef(0);
+  const lastFitGeometryRef = useRef('');
+  const lastSelectionCopyRef = useRef('');
+  const dragCopyStartRef = useRef<TerminalCellPoint | null>(null);
+  const latestSelectionRef = useRef('');
+  const selectionStartedRef = useRef(false);
   const activeRef = useRef(active);
   const manualCloseRef = useRef(false);
   const [terminalStatus, setTerminalStatus] = useState<TerminalStatus>('disconnected');
@@ -385,9 +916,19 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
       window.clearTimeout(resizeTimerRef.current);
       resizeTimerRef.current = null;
     }
+    if (outputFlushTimerRef.current !== null) {
+      window.clearTimeout(outputFlushTimerRef.current);
+      outputFlushTimerRef.current = null;
+    }
+    pendingOutputRef.current = '';
     terminalRef.current?.dispose();
     terminalRef.current = null;
     fitRef.current = null;
+    lastFitGeometryRef.current = '';
+    latestSelectionRef.current = '';
+    lastSelectionCopyRef.current = '';
+    dragCopyStartRef.current = null;
+    selectionStartedRef.current = false;
     setTerminalStatus('disconnected');
   }, []);
 
@@ -423,19 +964,22 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     }
   }, []);
 
-  const copyTerminalSelection = useCallback(async () => {
+  const copyTerminalSelection = useCallback(async (options: TerminalCopyOptions = {}) => {
     const terminal = terminalRef.current;
-    if (!terminal?.hasSelection()) {
-      setTerminalNotice('没有选中的终端文本');
-      return;
+    const text = options.text || terminal?.getSelection() || latestSelectionRef.current;
+    if (!terminal || !text) {
+      if (!options.silentEmpty) setTerminalNotice('没有选中的终端文本');
+      return false;
     }
     try {
-      await navigator.clipboard.writeText(terminal.getSelection());
-      terminal.clearSelection();
+      await writeClipboardText(text, options.preferLegacy);
+      if (options.clearSelection !== false && terminal.hasSelection()) terminal.clearSelection();
       terminal.focus();
-      setTerminalNotice('已复制终端选中文本');
+      setTerminalNotice(options.notice ?? '已复制终端选中文本');
+      return true;
     } catch {
       setTerminalNotice('浏览器阻止写入剪贴板');
+      return false;
     }
   }, []);
 
@@ -446,7 +990,7 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     setTerminalNotice(null);
     const terminal = new XTerm({
       cursorBlink: true,
-      convertEol: true,
+      convertEol: false,
       scrollback: 5000,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       fontSize: 14,
@@ -455,15 +999,44 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
+    terminal.attachCustomWheelEventHandler((event) => {
+      if (event.deltaY === 0) return false;
+      if (terminal.buffer.active.type === 'normal' && terminal.buffer.active.baseY > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
+        terminal.scrollLines(event.deltaY > 0 ? lines : -lines);
+        return false;
+      }
+      return true;
+    });
     fitRef.current = fit;
     terminal.open(containerRef.current);
+    const runFit = () => {
+      try {
+        const before = `${terminal.cols}x${terminal.rows}`;
+        fit.fit();
+        const after = `${terminal.cols}x${terminal.rows}`;
+        if (after !== before && after !== lastFitGeometryRef.current && terminal.rows > 0) {
+          lastFitGeometryRef.current = after;
+          terminal.refresh(0, terminal.rows - 1);
+        }
+      } catch {
+        // The fit addon can throw while the terminal is being disposed.
+      }
+    };
+    runFit();
+    initialOutputRefreshesRef.current = 2;
     terminal.focus();
-    terminal.writeln(`连接 ${session.id}`);
-    terminal.writeln(`machine: ${session.machineId}`);
-    terminal.writeln(`cwd: ${session.cwd ?? 'unknown'}`);
 
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const socket = new WebSocket(`${protocol}://${window.location.host}/api/sessions/${encodeURIComponent(session.id)}/terminal`);
+    const terminalParams = new URLSearchParams({
+      cols: String(terminal.cols || 120),
+      rows: String(terminal.rows || 40),
+    });
+    const socket = new WebSocket(
+      `${protocol}://${window.location.host}/api/sessions/${encodeURIComponent(session.id)}/terminal?${terminalParams.toString()}`
+    );
     socketRef.current = socket;
     terminalRef.current = terminal;
 
@@ -471,9 +1044,30 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     const writeInput = (data: string) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }));
     };
+    const flushOutput = () => {
+      outputFlushTimerRef.current = null;
+      const data = pendingOutputRef.current;
+      pendingOutputRef.current = '';
+      if (!data || terminalRef.current !== terminal) return;
+      terminal.write(data, () => {
+        if (initialOutputRefreshesRef.current > 0 && terminal.rows > 0) {
+          initialOutputRefreshesRef.current -= 1;
+          terminal.refresh(0, terminal.rows - 1);
+        }
+      });
+    };
+    const queueOutput = (data: string) => {
+      pendingOutputRef.current += data;
+      if (outputFlushTimerRef.current !== null) return;
+      outputFlushTimerRef.current = window.setTimeout(flushOutput, 16);
+    };
 
     terminal.onData((data) => {
       writeInput(data);
+    });
+    const selectionDisposable = terminal.onSelectionChange(() => {
+      latestSelectionRef.current = terminal.getSelection();
+      if (!latestSelectionRef.current) lastSelectionCopyRef.current = '';
     });
 
     const handlePaste = (event: ClipboardEvent) => {
@@ -491,30 +1085,66 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
         setContextMenu({ x: event.clientX, y: event.clientY });
         return;
       }
-      if (terminal.hasSelection()) {
-        void copyTerminalSelection();
-        return;
-      }
       void pasteIntoTerminal();
     };
-    const handleWheel = (event: WheelEvent) => {
+    const stopRightMouseForTmux = (event: MouseEvent | PointerEvent) => {
+      if (event.button !== 2) return false;
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
-      terminal.scrollLines(event.deltaY > 0 ? lines : -lines);
+      terminal.focus();
+      return true;
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      stopRightMouseForTmux(event);
+    };
+    const handlePointerUp = (event: PointerEvent) => {
+      stopRightMouseForTmux(event);
+    };
+    const handleMouseDown = (event: MouseEvent) => {
+      if (stopRightMouseForTmux(event)) return;
+      if (event.button !== 0) return;
+      selectionStartedRef.current = true;
+      dragCopyStartRef.current = terminalCellFromMouseEvent(terminal, container, event);
+    };
+    const handleMouseUp = (event: MouseEvent) => {
+      if (stopRightMouseForTmux(event)) return;
+      if (event.button !== 0 || !selectionStartedRef.current) return;
+      selectionStartedRef.current = false;
+      const dragStart = dragCopyStartRef.current;
+      const dragEnd = terminalCellFromMouseEvent(terminal, container, event);
+      dragCopyStartRef.current = null;
+      const draggedText = dragStart && dragEnd && (dragStart.row !== dragEnd.row || dragStart.col !== dragEnd.col)
+        ? extractTerminalBufferRange(terminal, dragStart, dragEnd)
+        : '';
+      const selectedText = terminal.getSelection() || latestSelectionRef.current || draggedText;
+      if (!selectedText || selectedText === lastSelectionCopyRef.current) return;
+      void copyTerminalSelection({
+        clearSelection: false,
+        preferLegacy: true,
+        silentEmpty: true,
+        notice: '已复制选中的终端内容',
+        text: selectedText,
+      }).then((copied) => {
+        if (copied) lastSelectionCopyRef.current = selectedText;
+      });
     };
     container.addEventListener('paste', handlePaste);
     container.addEventListener('contextmenu', handleContextMenu);
-    const wheelTarget = (container.querySelector('.xterm-viewport') as HTMLElement | null) ?? container;
-    const wheelListener = handleWheel as EventListener;
-    container.addEventListener('wheel', wheelListener, { capture: true, passive: false });
-    wheelTarget.addEventListener('wheel', wheelListener, { capture: true, passive: false });
+    container.addEventListener('pointerdown', handlePointerDown, true);
+    container.addEventListener('pointerup', handlePointerUp, true);
+    container.addEventListener('mousedown', handleMouseDown, true);
+    container.addEventListener('mouseup', handleMouseUp, true);
+    window.addEventListener('mouseup', handleMouseUp, true);
     terminalCleanupRef.current = () => {
+      selectionDisposable.dispose();
       container.removeEventListener('paste', handlePaste);
       container.removeEventListener('contextmenu', handleContextMenu);
-      container.removeEventListener('wheel', wheelListener, true);
-      wheelTarget.removeEventListener('wheel', wheelListener, true);
+      container.removeEventListener('pointerdown', handlePointerDown, true);
+      container.removeEventListener('pointerup', handlePointerUp, true);
+      container.removeEventListener('mousedown', handleMouseDown, true);
+      container.removeEventListener('mouseup', handleMouseUp, true);
+      window.removeEventListener('mouseup', handleMouseUp, true);
     };
 
     let lastResize = '';
@@ -534,27 +1164,33 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
     terminal.onResize(({ cols, rows }) => queueResize(cols, rows));
 
     const fitAndQueueResize = () => {
-      fit.fit();
-      queueResize(terminal.cols || 120, terminal.rows || 40);
+      runFit();
+      sendResize(terminal.cols || 120, terminal.rows || 40);
     };
     window.setTimeout(fitAndQueueResize, 0);
+    window.setTimeout(fitAndQueueResize, 50);
     window.setTimeout(fitAndQueueResize, 120);
+    window.setTimeout(fitAndQueueResize, 240);
+    window.setTimeout(fitAndQueueResize, 360);
+    window.setTimeout(fitAndQueueResize, 700);
+    window.setTimeout(fitAndQueueResize, 1200);
+    window.setTimeout(fitAndQueueResize, 2400);
+    window.setTimeout(fitAndQueueResize, 5000);
+    void document.fonts?.ready.then(fitAndQueueResize).catch(() => {});
     const resizeObserver = new ResizeObserver(() => window.requestAnimationFrame(fitAndQueueResize));
     resizeObserver.observe(containerRef.current);
     resizeObserverRef.current = resizeObserver;
 
     socket.onopen = () => {
       setTerminalStatus('connected');
-      terminal.writeln('WebSocket 已连接，启动 codex resume...');
-      fit.fit();
+      runFit();
       sendResize(terminal.cols || 120, terminal.rows || 40);
     };
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data as string) as TerminalEvent;
-      if (message.type === 'output' && message.data) terminal.write(message.data);
+      if (message.type === 'output' && message.data) queueOutput(message.data);
       if (message.type === 'ready' && message.data) {
         setTerminalStatus('codex-running');
-        terminal.writeln(`\r\n$ ${message.data}`);
       }
       if (message.type === 'error') terminal.writeln(`\r\n[error] ${message.data ?? 'unknown error'}`);
       if (message.type === 'exit') {
@@ -608,7 +1244,7 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
   return (
     <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}${active ? '' : ' inactive'}`}>
       <div className="terminal-toolbar">
-        <span>客户端终端代理 · {terminalStatusLabel[terminalStatus]}</span>
+        <span>SSH 终端代理 · {terminalStatusLabel[terminalStatus]}</span>
         <button
           type="button"
           className="icon-button terminal-icon-button"
@@ -634,7 +1270,7 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
           <X size={16} />
         </button>
       </div>
-      {terminalNotice ? <div className="terminal-notice">{terminalNotice}</div> : null}
+      <div className={`terminal-notice${terminalNotice ? '' : ' terminal-notice-empty'}`}>{terminalNotice ?? '\u00a0'}</div>
       {contextMenu ? (
         <div className="terminal-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
           <button type="button" onClick={() => { setContextMenu(null); void copyTerminalSelection(); }}>复制</button>
@@ -649,14 +1285,167 @@ function TerminalConsole({ session, active, onClose }: { session: CodexSession; 
   );
 }
 
+function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; onUnauthorized: () => void }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [currentPath, setCurrentPath] = useState('');
+  const [payload, setPayload] = useState<SessionFilesPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadFiles = useCallback(async (path: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (path) params.set('path', path);
+      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files?${params.toString()}`);
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      const nextPayload = (await response.json()) as SessionFilesPayload & { error?: string };
+      if (!response.ok) throw new Error(nextPayload.error || `HTTP ${response.status}`);
+      setPayload(nextPayload);
+      setCurrentPath(nextPayload.path || '');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '目录加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [onUnauthorized, sessionId]);
+
+  useEffect(() => {
+    void loadFiles('');
+  }, [loadFiles, sessionId]);
+
+  const uploadFile = useCallback(async (file: File) => {
+    setUploading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const params = new URLSearchParams({
+        path: currentPath,
+        name: file.name,
+        overwrite: '1',
+      });
+      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/upload?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      });
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      setNotice(`已上传 ${file.name}`);
+      await loadFiles(currentPath);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '上传失败');
+    } finally {
+      setUploading(false);
+      if (inputRef.current) inputRef.current.value = '';
+    }
+  }, [currentPath, loadFiles, onUnauthorized, sessionId]);
+
+  const downloadUrl = (entry: SessionFileEntry) => {
+    const params = new URLSearchParams({ path: entry.path });
+    return `/api/sessions/${encodeURIComponent(sessionId)}/files/download?${params.toString()}`;
+  };
+
+  return (
+    <section className="primary-panel file-browser-panel">
+      <div className="panel-heading">
+        <div>
+          <h3>会话工作目录</h3>
+          <span>{payload?.cwd ?? sessionId}</span>
+        </div>
+        <div className="file-browser-actions">
+          <button type="button" className="primary-button" disabled={loading} onClick={() => void loadFiles(currentPath)}>
+            <RefreshCw size={16} />
+            刷新
+          </button>
+          <button type="button" className="primary-button" disabled={uploading} onClick={() => inputRef.current?.click()}>
+            <Upload size={16} />
+            上传文件
+          </button>
+          <input
+            ref={inputRef}
+            type="file"
+            hidden
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void uploadFile(file);
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="file-browser-path">
+        <FolderOpen size={16} />
+        <code>{payload ? `${payload.root}${payload.path ? `/${payload.path}` : ''}` : 'loading'}</code>
+      </div>
+
+      {notice ? <div className="terminal-notice">{notice}</div> : null}
+      {error ? <div className="notice danger">目录操作失败：{error}</div> : null}
+
+      <div className="file-browser-list" aria-busy={loading || uploading}>
+        {payload?.parent !== null && payload ? (
+          <button type="button" className="file-row" onClick={() => void loadFiles(payload.parent ?? '')}>
+            <Folder size={17} />
+            <strong>..</strong>
+            <span>上级目录</span>
+            <em />
+          </button>
+        ) : null}
+        {loading ? <div className="empty">正在读取目录...</div> : null}
+        {!loading && payload?.entries.length === 0 ? <div className="empty">目录为空</div> : null}
+        {payload?.entries.map((entry) => (
+          <div className="file-row" key={entry.path}>
+            <button
+              type="button"
+              className="file-name-button"
+              disabled={entry.type !== 'directory'}
+              onClick={() => entry.type === 'directory' && void loadFiles(entry.path)}
+            >
+              {entry.type === 'directory' ? <Folder size={17} /> : <FileText size={17} />}
+              <strong>{entry.name}</strong>
+            </button>
+            <span>{entry.type}</span>
+            <span>{entry.mtime ? formatDate(entry.mtime) : '-'}</span>
+            <em>{fileSizeLabel(entry.size)}</em>
+            {entry.type === 'file' ? (
+              <a className="icon-button file-download-button" title="下载文件" href={downloadUrl(entry)}>
+                <Download size={16} />
+              </a>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function App() {
+  const [terminalOnlySessionId] = useState(readTerminalSessionId);
+  const [filesOnlySessionId] = useState(readFilesSessionId);
+  const isTerminalOnlyPage = Boolean(terminalOnlySessionId);
+  const isFilesOnlyPage = Boolean(filesOnlySessionId);
+  const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(() =>
+    terminalOnlySessionId ? terminalPlaceholderSession(terminalOnlySessionId) : null
+  );
+  const [terminalOnlyLoading, setTerminalOnlyLoading] = useState(Boolean(terminalOnlySessionId));
+  const [terminalOnlyError, setTerminalOnlyError] = useState<string | null>(null);
   const [allSessions, setAllSessions] = useState<CodexSession[]>([]);
   const [sessionDetails, setSessionDetails] = useState<Record<string, CodexSession>>({});
   const [recycleArchives, setRecycleArchives] = useState<RecycleArchive[]>([]);
   const [remoteStatuses, setRemoteStatuses] = useState<RemoteAgentStatus[]>([]);
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
-  const [machineFilter, setMachineFilter] = useState('all');
+  const [machineFilter, setMachineFilter] = useState(readStoredMachineFilter);
   const [listViewMode, setListViewMode] = useState<SessionListViewMode>('folder');
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -679,6 +1468,23 @@ function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [workerJobs, setWorkerJobs] = useState<CodexWorkerJob[]>([]);
+  const [jobRegistryMachineId, setJobRegistryMachineId] = useState<string | null>(null);
+  const [jobRegistryBaseUrl, setJobRegistryBaseUrl] = useState<string | null>(null);
+  const [jobRegistryHealth, setJobRegistryHealth] = useState<CodexJobRegistryHealth[]>([]);
+  const [jobRegistryErrors, setJobRegistryErrors] = useState<CodexJobRegistryError[]>([]);
+  const [workerJobsLoading, setWorkerJobsLoading] = useState(false);
+  const [workerJobsError, setWorkerJobsError] = useState<string | null>(null);
+  const [workerJobBusyId, setWorkerJobBusyId] = useState<string | null>(null);
+  const [selectedWorkerJobId, setSelectedWorkerJobId] = useState<string | null>(null);
+  const [workerGuidanceDrafts, setWorkerGuidanceDrafts] = useState<Record<string, string>>({});
+  const [workerProtocolKindsByJob, setWorkerProtocolKindsByJob] = useState<Record<string, WorkerProtocolKind>>({});
+  const [workerSupervisorDrafts, setWorkerSupervisorDrafts] = useState<Record<string, string>>({});
+  const [workerSupervisorAutoStop, setWorkerSupervisorAutoStop] = useState<Record<string, boolean>>({});
+  const [workerActionMessage, setWorkerActionMessage] = useState<string | null>(null);
+  const [workerJobEvents, setWorkerJobEvents] = useState<Record<string, CodexWorkerEvent[]>>({});
+  const [workerJobEventSeq, setWorkerJobEventSeq] = useState<Record<string, number>>({});
+  const [workerJobEventsUnavailable, setWorkerJobEventsUnavailable] = useState<Record<string, boolean>>({});
 
   const refreshRemoteStatuses = useCallback(async () => {
     try {
@@ -716,7 +1522,7 @@ function App() {
       const recyclePayload = (await recycleResponse.json()) as RecyclePayload;
       setAuthRequired(false);
       setAuthMessage(null);
-      setAllSessions(payload.sessions);
+      setAllSessions(normalizeSessions(payload.sessions));
       setRecycleArchives(recyclePayload.archives);
       setMeta(payload.meta);
       setLoading(false);
@@ -726,7 +1532,7 @@ function App() {
         const remoteResponse = await fetch('/api/sessions?detail=0');
         if (remoteResponse.ok) {
           const remotePayload = (await remoteResponse.json()) as ApiPayload;
-          setAllSessions(remotePayload.sessions);
+          setAllSessions(normalizeSessions(remotePayload.sessions));
           setMeta(remotePayload.meta);
         }
       }
@@ -735,6 +1541,219 @@ function App() {
       setLoading(false);
     }
   }, [refreshRemoteStatuses]);
+
+  const loadTerminalOnlySession = useCallback(async () => {
+    if (!terminalOnlySessionId) return;
+    setTerminalOnlyLoading(true);
+    setTerminalOnlyError(null);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(terminalOnlySessionId)}`, { signal: controller.signal });
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const session = normalizeSession(await response.json());
+      setTerminalOnlySession(session);
+      setAuthRequired(false);
+      setAuthMessage(null);
+    } catch (err) {
+      setTerminalOnlyError(err instanceof DOMException && err.name === 'AbortError'
+        ? null
+        : err instanceof Error ? err.message : '终端会话加载失败');
+    } finally {
+      window.clearTimeout(timeout);
+      setTerminalOnlyLoading(false);
+    }
+  }, [terminalOnlySessionId]);
+
+  const upsertWorkerJob = useCallback((job: CodexWorkerJob) => {
+    setWorkerJobs((current) => sortWorkerJobs([job, ...current.filter((item) => item.id !== job.id)]));
+  }, []);
+
+  const loadWorkerJobs = useCallback(async () => {
+    setWorkerJobsLoading(true);
+    setWorkerJobsError(null);
+    try {
+      const response = await fetch('/api/codex/job-registry');
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      const payload = (await response.json()) as CodexJobRegistryPayload;
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setJobRegistryMachineId(payload.machineId ?? null);
+      setJobRegistryBaseUrl(payload.baseUrl ?? null);
+      setJobRegistryHealth(Array.isArray(payload.health) ? payload.health : []);
+      setJobRegistryErrors(Array.isArray(payload.errors) ? payload.errors : []);
+      setWorkerJobs(sortWorkerJobs(
+        (Array.isArray(payload.jobs) ? payload.jobs : [])
+          .filter((entry) => entry.job)
+          .map((entry) => ({
+            ...entry.job,
+            machineId: entry.job?.machineId ?? entry.machineId ?? null,
+            machine: entry.job?.machine ?? entry.machineId ?? undefined,
+          } as CodexWorkerJob))
+      ));
+    } catch (err) {
+      setWorkerJobsError(err instanceof Error ? err.message : 'worker job 加载失败');
+    } finally {
+      setWorkerJobsLoading(false);
+    }
+  }, []);
+
+  const refreshWorkerJob = useCallback(async (jobId: string) => {
+    const response = await fetch(`/api/codex/jobs/${encodeURIComponent(jobId)}`);
+    const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
+    if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
+    upsertWorkerJob(payload.job);
+    return payload.job;
+  }, [upsertWorkerJob]);
+
+  const loadWorkerJobEvents = useCallback(async (jobId: string) => {
+    if (workerJobEventsUnavailable[jobId]) return;
+    const afterSeq = workerJobEventSeq[jobId] ?? 0;
+    try {
+      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(jobId)}/events?afterSeq=${encodeURIComponent(String(afterSeq))}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json()) as { events?: CodexWorkerEvent[]; nextSeq?: number };
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      setWorkerJobEventsUnavailable((current) => ({ ...current, [jobId]: false }));
+      if (!events.length) return;
+
+      setWorkerJobEvents((current) => {
+        const existing = current[jobId] ?? [];
+        const seen = new Set(
+          existing.map((event) => (typeof event.seq === 'number' ? `seq:${event.seq}` : `raw:${formatUnknownValue(event)}`))
+        );
+        const merged = [
+          ...existing,
+          ...events.filter((event) => {
+            const key = typeof event.seq === 'number' ? `seq:${event.seq}` : `raw:${formatUnknownValue(event)}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          }),
+        ].slice(-160);
+        return { ...current, [jobId]: merged };
+      });
+
+      const maxEventSeq = events.reduce((max, event) => (
+        typeof event.seq === 'number' ? Math.max(max, event.seq) : max
+      ), afterSeq);
+      const nextSeq = typeof payload.nextSeq === 'number' ? payload.nextSeq : maxEventSeq;
+      setWorkerJobEventSeq((current) => ({ ...current, [jobId]: Math.max(current[jobId] ?? 0, nextSeq) }));
+    } catch {
+      setWorkerJobEventsUnavailable((current) => ({ ...current, [jobId]: true }));
+    }
+  }, [workerJobEventSeq, workerJobEventsUnavailable]);
+
+  async function stopWorkerJob(job: CodexWorkerJob) {
+    setWorkerJobBusyId(`${job.id}:stop`);
+    setWorkerActionMessage(null);
+    try {
+      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/stop`, { method: 'POST' });
+      const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
+      if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
+      upsertWorkerJob(payload.job);
+      setWorkerActionMessage(`已停止 job：${job.id}`);
+    } catch (err) {
+      setWorkerActionMessage(`停止失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setWorkerJobBusyId(null);
+    }
+  }
+
+  async function sendWorkerGuidance(job: CodexWorkerJob) {
+    const text = (workerGuidanceDrafts[job.id] ?? '').trim();
+    if (!text) return;
+    setWorkerJobBusyId(`${job.id}:guidance`);
+    setWorkerActionMessage(null);
+    try {
+      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/guidance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, source: 'api' }),
+      });
+      const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
+      if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
+      upsertWorkerJob(payload.job);
+      setWorkerGuidanceDrafts((current) => ({ ...current, [job.id]: '' }));
+      setWorkerActionMessage('已发送指导');
+    } catch (err) {
+      setWorkerActionMessage(`指导发送失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setWorkerJobBusyId(null);
+    }
+  }
+
+  async function sendWorkerProtocolKind(job: CodexWorkerJob) {
+    const kind = workerProtocolKindsByJob[job.id] ?? 'guide';
+    const label = workerProtocolKinds.find((item) => item.id === kind)?.label ?? kind;
+    setWorkerJobBusyId(`${job.id}:protocol`);
+    setWorkerActionMessage(null);
+    try {
+      const protocolResponse = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/protocol`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      if (protocolResponse.ok) {
+        const payload = (await protocolResponse.json()) as { job?: CodexWorkerJob };
+        if (payload.job) upsertWorkerJob(payload.job);
+        else await refreshWorkerJob(job.id);
+        setWorkerActionMessage(`已发送 protocol：${label}`);
+        return;
+      }
+
+      const fallbackResponse = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/guidance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: `[protocol:${kind}] ${label}`, source: 'api' }),
+      });
+      const fallbackPayload = (await fallbackResponse.json()) as { job?: CodexWorkerJob; error?: string };
+      if (!fallbackResponse.ok || !fallbackPayload.job) throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
+      upsertWorkerJob(fallbackPayload.job);
+      setWorkerActionMessage(`后端未提供 protocol endpoint，已按 guidance 记录：${label}`);
+    } catch (err) {
+      setWorkerActionMessage(`protocol 发送失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setWorkerJobBusyId(null);
+    }
+  }
+
+  async function superviseWorkerJob(job: CodexWorkerJob) {
+    const instruction = (workerSupervisorDrafts[job.id] ?? '').trim();
+    setWorkerJobBusyId(`${job.id}:supervise`);
+    setWorkerActionMessage(null);
+    try {
+      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/supervise`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...(instruction ? { instruction } : {}),
+          autoStop: workerSupervisorAutoStop[job.id] ?? false,
+        }),
+      });
+      const payload = (await response.json()) as {
+        job?: CodexWorkerJob;
+        decision?: string;
+        reason?: string;
+        followupJob?: CodexWorkerJob;
+        error?: string;
+      };
+      if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
+      upsertWorkerJob(payload.job);
+      if (payload.followupJob) upsertWorkerJob(payload.followupJob);
+      setWorkerActionMessage(`监督结果：${payload.decision ?? '未知'} · ${payload.reason ?? '无原因'}`);
+    } catch (err) {
+      setWorkerActionMessage(`supervise 失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setWorkerJobBusyId(null);
+    }
+  }
 
   async function login(username: string, password: string) {
     setAuthBusy(true);
@@ -750,6 +1769,10 @@ function App() {
         return;
       }
       setAuthRequired(false);
+      if (terminalOnlySessionId || filesOnlySessionId) {
+        await loadTerminalOnlySession();
+        return;
+      }
       await loadSessions();
     } catch (err) {
       setAuthMessage(err instanceof Error ? err.message : '登录失败');
@@ -768,13 +1791,33 @@ function App() {
   }
 
   useEffect(() => {
+    if (isTerminalOnlyPage || isFilesOnlyPage) return;
     const handle = window.setTimeout(() => {
       void loadSessions();
     }, 150);
     return () => window.clearTimeout(handle);
-  }, [loadSessions]);
+  }, [isFilesOnlyPage, isTerminalOnlyPage, loadSessions]);
+
+  useEffect(() => {
+    if (!terminalOnlySessionId || authRequired) return;
+    void loadTerminalOnlySession();
+  }, [authRequired, loadTerminalOnlySession, terminalOnlySessionId]);
 
   const machineOptions = useMemo(() => ['all', ...Array.from(new Set(allSessions.map((session) => session.machineId))).sort()], [allSessions]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MACHINE_FILTER_STORAGE_KEY, machineFilter);
+    } catch {
+      // Browser storage may be unavailable in private contexts.
+    }
+  }, [machineFilter]);
+
+  useEffect(() => {
+    if (!allSessions.length) return;
+    if (machineOptions.includes(machineFilter)) return;
+    setMachineFilter('all');
+  }, [allSessions.length, machineFilter, machineOptions]);
 
   const visibleSessions = useMemo(
     () =>
@@ -825,6 +1868,8 @@ function App() {
     [selectedId, visibleSessions]
   );
   const selected = selectedSummary ? (sessionDetails[selectedSummary.id] ?? selectedSummary) : null;
+  const selectedAiRefreshStatus: AiRefreshStatus = selected?.evaluation.hermesRefreshStatus
+    ?? (selected?.evaluation.hermesNeedsRefresh ? 'pending' : 'never');
   const visibleSessionIds = useMemo(() => visibleSessions.map((session) => session.id), [visibleSessions]);
   const selectedIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedVisibleCount = useMemo(
@@ -860,6 +1905,105 @@ function App() {
       '')
     : '';
   const migrationAlreadyInPlace = selected ? normalizePath(selected.cwd) === normalizePath(migrationTarget) : false;
+  const selectedWorkerJobs = useMemo(
+    () => (selected ? sortWorkerJobs(workerJobs.filter((job) => job.sessionId === selected.id)) : []),
+    [selected, workerJobs]
+  );
+  const currentWorkerJob = useMemo(() => {
+    if (!selectedWorkerJobs.length) return null;
+    return selectedWorkerJobs.find((job) => job.id === selectedWorkerJobId)
+      ?? selectedWorkerJobs.find(isWorkerJobRunning)
+      ?? selectedWorkerJobs[0];
+  }, [selectedWorkerJobId, selectedWorkerJobs]);
+  const currentWorkerEvents = currentWorkerJob ? (workerJobEvents[currentWorkerJob.id] ?? []) : [];
+  const currentWorkerProtocolKind = currentWorkerJob ? (workerProtocolKindsByJob[currentWorkerJob.id] ?? 'guide') : 'guide';
+  const currentWorkerGuidanceDraft = currentWorkerJob ? (workerGuidanceDrafts[currentWorkerJob.id] ?? '') : '';
+  const currentWorkerSupervisorDraft = currentWorkerJob ? (workerSupervisorDrafts[currentWorkerJob.id] ?? '') : '';
+  const currentWorkerSupervisorAutoStop = currentWorkerJob ? (workerSupervisorAutoStop[currentWorkerJob.id] ?? false) : false;
+  const jobRegistryMachines = useMemo(() => {
+    const machines = new Map<string, CodexJobRegistryHealth & { runningJobs: number; totalJobs: number }>();
+    const localMachineId = jobRegistryMachineId ?? 'local';
+
+    machines.set(machineKey(localMachineId, jobRegistryBaseUrl), {
+      machineId: localMachineId,
+      baseUrl: jobRegistryBaseUrl,
+      healthy: true,
+      updatedAt: null,
+      cached: false,
+      error: null,
+      runningJobs: 0,
+      totalJobs: 0,
+    });
+
+    jobRegistryHealth.forEach((item) => {
+      machines.set(machineKey(item.machineId, item.baseUrl), {
+        ...item,
+        runningJobs: 0,
+        totalJobs: 0,
+      });
+    });
+
+    workerJobs.forEach((job) => {
+      const id = job.machineId ?? job.machine ?? localMachineId;
+      const key = [...machines.keys()].find((item) => item.startsWith(`${id}|||`)) ?? machineKey(id, null);
+      const existing = machines.get(key) ?? {
+        machineId: id,
+        baseUrl: null,
+        healthy: true,
+        updatedAt: null,
+        cached: false,
+        error: null,
+        runningJobs: 0,
+        totalJobs: 0,
+      };
+      machines.set(key, {
+        ...existing,
+        totalJobs: existing.totalJobs + 1,
+        runningJobs: existing.runningJobs + (isWorkerJobRunning(job) ? 1 : 0),
+      });
+    });
+
+    return [...machines.values()].sort((a, b) => {
+      const healthDelta = Number(b.healthy) - Number(a.healthy);
+      return healthDelta || b.runningJobs - a.runningJobs || a.machineId.localeCompare(b.machineId);
+    });
+  }, [jobRegistryBaseUrl, jobRegistryHealth, jobRegistryMachineId, workerJobs]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setWorkerActionMessage(null);
+      setSelectedWorkerJobId(null);
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [selected?.id]);
+
+  useEffect(() => {
+    if (isTerminalOnlyPage || activeTab === 'recycle' || !selected?.id) return;
+    const firstLoad = window.setTimeout(() => {
+      void loadWorkerJobs();
+    }, 0);
+    const interval = window.setInterval(() => {
+      void loadWorkerJobs();
+    }, 8000);
+    return () => {
+      window.clearTimeout(firstLoad);
+      window.clearInterval(interval);
+    };
+  }, [activeTab, isTerminalOnlyPage, loadWorkerJobs, selected?.id]);
+
+  useEffect(() => {
+    if (isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob?.id) return;
+    const firstLoad = window.setTimeout(() => {
+      void loadWorkerJobEvents(currentWorkerJob.id);
+    }, 0);
+    const interval = window.setInterval(() => {
+      void loadWorkerJobEvents(currentWorkerJob.id);
+    }, 4000);
+    return () => {
+      window.clearTimeout(firstLoad);
+      window.clearInterval(interval);
+    };
+  }, [activeTab, currentWorkerJob?.id, isTerminalOnlyPage, loadWorkerJobEvents]);
 
   const toggleSessionSelection = useCallback((id: string) => {
     setSelectedSessionIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
@@ -890,7 +2034,21 @@ function App() {
   }, []);
 
   const openTerminal = useCallback((session: CodexSession) => {
-    setOpenedTerminalIds((current) => (current.includes(session.id) ? current : [...current, session.id]));
+    setMachineFilter(session.machineId);
+    setSelectedId(session.id);
+    const opened = window.open(terminalPageUrl(session.id), '_blank');
+    if (opened) opened.opener = null;
+    opened?.focus();
+    if (!opened) setActionMessage('浏览器阻止了新终端页面，请允许弹出窗口后重试');
+  }, []);
+
+  const openSessionFiles = useCallback((session: CodexSession) => {
+    setMachineFilter(session.machineId);
+    setSelectedId(session.id);
+    const opened = window.open(filesPageUrl(session.id), '_blank');
+    if (opened) opened.opener = null;
+    opened?.focus();
+    if (!opened) setActionMessage('浏览器阻止了新目录页面，请允许弹出窗口后重试');
   }, []);
 
   const closeTerminal = useCallback((id: string) => {
@@ -927,6 +2085,23 @@ function App() {
     }
   }, []);
 
+  const loadAllMessages = useCallback(async (session: CodexSession) => {
+    setHistoryLoading(true);
+    try {
+      const params = new URLSearchParams({ full: '1', preserve: '1' });
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/messages?${params.toString()}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json()) as HistoryPayload;
+      setHistoryLoadedSessionId(session.id);
+      setHistoryMessages(payload.messages);
+      setHistoryBefore(null);
+      setHistoryHasMore(false);
+      setActionMessage(`已加载 ${payload.messages.length}/${payload.totalMessages ?? payload.messages.length} 条会话消息`);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const handle = window.setTimeout(() => {
       setHistoryMessages([]);
@@ -943,10 +2118,11 @@ function App() {
     void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}`)
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<CodexSession>;
+        return response.json();
       })
       .then((session) => {
-        if (!cancelled) setSessionDetails((current) => ({ ...current, [session.id]: session }));
+        const normalized = normalizeSession(session);
+        if (!cancelled) setSessionDetails((current) => ({ ...current, [normalized.id]: normalized }));
       })
       .catch(() => {
         // Detail loading is opportunistic; the summary row remains usable.
@@ -1097,6 +2273,49 @@ function App() {
     }
   }
 
+  async function refreshSessionEvaluation(session: CodexSession) {
+    setBusyId(`${session.id}:refresh-evaluation`);
+    setActionMessage(null);
+    try {
+      const response = await fetch(`/api/evaluations/${session.id}/refresh`, { method: 'POST' });
+      const payload = (await response.json()) as { job?: EvaluationRefreshJob; title?: string; status?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      await loadSessions();
+
+      if (!payload.job) {
+        setActionMessage(`已重算当前会话：${payload.title ?? session.title}`);
+        return;
+      }
+
+      let job = payload.job;
+      setActionMessage(`已加入 AI 重算队列：${session.title}`);
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (job.status === 'completed' || job.status === 'failed') break;
+        await sleep(job.status === 'queued' ? 1200 : 2000);
+        const jobResponse = await fetch(`/api/evaluations/refresh-jobs/${job.id}`);
+        const jobPayload = (await jobResponse.json()) as { job?: EvaluationRefreshJob; error?: string };
+        if (!jobResponse.ok || !jobPayload.job) throw new Error(jobPayload.error || `HTTP ${jobResponse.status}`);
+        job = jobPayload.job;
+        if (attempt % 3 === 0) {
+          setActionMessage(job.status === 'queued' ? 'AI 重算排队中...' : 'AI 重算正在后台运行...');
+          await loadSessions();
+        }
+      }
+      await loadSessions(true);
+      if (job.status === 'completed') {
+        setActionMessage(`已重算当前会话：${job.result?.title ?? session.title}`);
+      } else if (job.status === 'failed') {
+        throw new Error(job.error || job.result?.error || 'AI 重算失败');
+      } else {
+        setActionMessage('AI 重算仍在后台运行，稍后刷新面板查看结果。');
+      }
+    } catch (err) {
+      setActionMessage(`当前会话重算失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function saveTitle(session: CodexSession) {
     setBusyId(`${session.id}:title`);
     try {
@@ -1207,6 +2426,69 @@ function App() {
     return <LoginPanel busy={authBusy} message={authMessage} onLogin={login} />;
   }
 
+  if (isFilesOnlyPage && filesOnlySessionId) {
+    return (
+      <main className="terminal-page-shell">
+        <section className="terminal-page-workspace">
+          <header className="terminal-page-heading">
+            <div>
+              <p className="eyebrow">Session Files</p>
+              <h1>会话工作目录</h1>
+              <span>{filesOnlySessionId}</span>
+            </div>
+            <div className="terminal-page-actions">
+              <button type="button" className="primary-button" onClick={() => window.location.assign('/')}>
+                返回面板
+              </button>
+            </div>
+          </header>
+          <SessionFileBrowser sessionId={filesOnlySessionId} onUnauthorized={() => setAuthRequired(true)} />
+        </section>
+      </main>
+    );
+  }
+
+  if (isTerminalOnlyPage) {
+    const terminalTitle = terminalOnlySession?.title || terminalOnlySessionId || 'SSH 终端';
+    const terminalMeta = terminalOnlySession
+      ? `${terminalOnlySession.machineId} · ${terminalOnlySession.cwd ?? 'unknown cwd'}`
+      : terminalOnlySessionId;
+    return (
+      <main className="terminal-page-shell">
+        <section className="terminal-page-workspace">
+          <header className="terminal-page-heading">
+            <div>
+              <p className="eyebrow">SSH Terminal</p>
+              <h1>{terminalTitle}</h1>
+              {terminalMeta ? <span>{terminalMeta}{terminalOnlyLoading ? ' · 正在补充会话详情' : ''}</span> : null}
+            </div>
+            <div className="terminal-page-actions">
+              <button type="button" className="primary-button" onClick={() => window.location.assign('/')}>
+                返回面板
+              </button>
+            </div>
+          </header>
+
+          <div className={`terminal-page-inline-notice${terminalOnlyError ? '' : ' terminal-page-inline-notice-empty'}`}>
+            {terminalOnlyError ?? '\u00a0'}
+          </div>
+          {terminalOnlySession ? (
+            <TerminalConsole
+              session={terminalOnlySession}
+              active
+              onClose={() => {
+                window.close();
+                window.setTimeout(() => window.location.assign('/'), 120);
+              }}
+            />
+          ) : (
+            <div className="terminal-page-message">{terminalOnlyLoading ? '正在加载终端会话...' : '未找到终端会话'}</div>
+          )}
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="shell">
       <aside className="rail">
@@ -1258,7 +2540,15 @@ function App() {
         {remoteStatuses.length ? (
           <div className="remote-status-list">
             {remoteStatuses.map((agent) => (
-              <button type="button" key={agent.id} onClick={() => void refreshRemoteStatuses()} title="刷新远端机器状态">
+              <button
+                type="button"
+                key={agent.id}
+                onClick={() => {
+                  if (agent.machineId) setMachineFilter(agent.machineId);
+                  void refreshRemoteStatuses();
+                }}
+                title={agent.machineId ? `查看 ${agent.machineId} 的会话` : '刷新远端机器状态'}
+              >
                 <span className={`remote-dot ${agent.online ? 'online' : 'offline'}`} />
                 <strong>{agent.machineId ?? agent.id}</strong>
                 <em>{agent.online ? `${agent.latencyMs ?? '?'}ms` : `${agent.id} 暂不可用`}</em>
@@ -1397,6 +2687,14 @@ function App() {
                             <span className="session-main">
                               <span className="session-key">{session.title}</span>
                               <span className="session-summary">{session.evaluation.summary}</span>
+                              <span className="session-preview-line">
+                                <strong>用户</strong>
+                                <span>{previewText(session.lastUserMessage)}</span>
+                              </span>
+                              <span className="session-preview-line agent">
+                                <strong>Agent</strong>
+                                <span>{previewText(session.lastAssistantMessage)}</span>
+                              </span>
                             </span>
                             <span className="session-time">
                               {session.kept ? '已保留 · ' : ''}
@@ -1417,6 +2715,18 @@ function App() {
             <h2>{selected ? selected.title : '未选择会话'}</h2>
           </div>
           <div className="topbar-actions">
+            {selected ? (
+              <>
+                <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
+                  <TerminalIcon size={17} />
+                  打开 SSH 终端
+                </button>
+                <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
+                  <FolderOpen size={17} />
+                  打开工作目录
+                </button>
+              </>
+            ) : null}
             <button type="button" className="icon-button" title="刷新" onClick={() => void loadSessions()}>
               <RefreshCw size={18} />
             </button>
@@ -1591,9 +2901,13 @@ function App() {
                   <Trash2 size={17} />
                   移入回收站
                 </button>
-                <button type="button" className="primary-button" onClick={() => openTerminal(selected)}>
+                <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
                   <TerminalIcon size={17} />
-                  打开/查看终端
+                  打开 SSH 终端
+                </button>
+                <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
+                  <FolderOpen size={17} />
+                  打开工作目录
                 </button>
               </div>
             </section>
@@ -1601,6 +2915,400 @@ function App() {
             <section className="primary-panel">
               <h3>整段会话做了什么</h3>
               <p className="long-summary">{selected.evaluation.detailedSummary || selected.evaluation.summary}</p>
+            </section>
+
+            <section className="primary-panel">
+              <div className="panel-heading">
+                <h3>最近对话</h3>
+                <span className={`status-pill ${aiRefreshTone[selectedAiRefreshStatus]}`}>
+                  {selectedAiRefreshStatus === 'running' ? <Loader2 size={14} className="spin" /> : null}
+                  {aiRefreshLabel[selectedAiRefreshStatus]}
+                </span>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={
+                    busyId === `${selected.id}:refresh-evaluation` ||
+                    selectedAiRefreshStatus === 'running'
+                  }
+                  onClick={() => void refreshSessionEvaluation(selected)}
+                >
+                  <Sparkles size={16} />
+                  重算当前
+                </button>
+              </div>
+              <div className="recent-dialogue">
+                <article>
+                  <span>用户最后发送</span>
+                  <p>{previewText(selected.lastUserMessage)}</p>
+                  {selected.lastUserMessage?.timestamp ? <em>{formatDate(selected.lastUserMessage.timestamp)}</em> : null}
+                </article>
+                <article>
+                  <span>Agent 最后回复</span>
+                  <p>{previewText(selected.lastAssistantMessage)}</p>
+                  {selected.lastAssistantMessage?.timestamp ? <em>{formatDate(selected.lastAssistantMessage.timestamp)}</em> : null}
+                </article>
+              </div>
+              <div className="workflow">
+                <Sparkles size={16} />
+                摘要更新时间：{formatDate(selected.evaluation.evaluatedAt)}
+                {selected.evaluation.hermesLastUsedAt ? ` · 最近调度：${formatDate(selected.evaluation.hermesLastUsedAt)}` : ''}
+                {selected.evaluation.hermesRecalculatedAt ? ` · 重算完成：${formatDate(selected.evaluation.hermesRecalculatedAt)}` : ''}
+                {selected.evaluation.hermesLastJobId ? ` · job：${selected.evaluation.hermesLastJobId}` : ''}
+              </div>
+              {selected.evaluation.hermesRefreshError ? (
+                <div className="warning-line">
+                  <AlertTriangle size={15} />
+                  {selected.evaluation.hermesRefreshError}
+                </div>
+              ) : null}
+            </section>
+
+            <section className="primary-panel worker-console">
+              <div className="panel-heading worker-heading">
+                <div>
+                  <h3>Codex Worker 控制台</h3>
+                  <span>{selectedWorkerJobs.length ? `当前会话 ${selectedWorkerJobs.length} 个 job` : '当前会话暂无 job'}</span>
+                </div>
+                <div className="worker-heading-actions">
+                  {selectedWorkerJobs.length > 1 ? (
+                    <select
+                      className="worker-job-select"
+                      value={currentWorkerJob?.id ?? ''}
+                      onChange={(event) => setSelectedWorkerJobId(event.target.value || null)}
+                      aria-label="选择 worker job"
+                    >
+                      {selectedWorkerJobs.map((job) => (
+                        <option key={job.id} value={job.id}>
+                          {statusLabel(job.status)} · {formatDate(job.updatedAt ?? job.startedAt ?? null)} · {job.id.slice(0, 8)}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <button type="button" className="primary-button" disabled={workerJobsLoading} onClick={() => void loadWorkerJobs()}>
+                    <RefreshCw size={16} className={workerJobsLoading ? 'spin' : ''} />
+                    刷新
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={!currentWorkerJob || !isWorkerJobRunning(currentWorkerJob) || workerJobBusyId === `${currentWorkerJob.id}:stop`}
+                    onClick={() => currentWorkerJob ? void stopWorkerJob(currentWorkerJob) : undefined}
+                  >
+                    <X size={16} />
+                    停止 job
+                  </button>
+                </div>
+              </div>
+
+              {workerJobsError ? <div className="worker-message danger">job 列表加载失败：{workerJobsError}</div> : null}
+              {workerActionMessage ? <div className="worker-message">{workerActionMessage}</div> : null}
+
+              <div className="job-registry-panel">
+                <div className="job-registry-heading">
+                  <div>
+                    <h4>多机器 Job Registry</h4>
+                    <span>
+                      {jobRegistryMachines.length} 台机器 · {workerJobs.filter(isWorkerJobRunning).length} 个 running job
+                      {workerJobs.length ? ` / ${workerJobs.length} total` : ''}
+                    </span>
+                  </div>
+                  <span className="status-pill">{workerJobsLoading ? '刷新中' : 'registry'}</span>
+                </div>
+                <div className="job-registry-grid">
+                  {jobRegistryMachines.map((machine) => (
+                    <div
+                      className={`job-registry-machine ${machine.healthy ? 'healthy' : 'unhealthy'}`}
+                      key={machineKey(machine.machineId, machine.baseUrl)}
+                    >
+                      <div className="job-registry-machine-title">
+                        <span className={`remote-dot ${machine.healthy ? 'online' : 'offline'}`} />
+                        <strong>{machine.machineId}</strong>
+                        <em>{machine.cached ? 'cached' : 'live'}</em>
+                      </div>
+                      <div className="job-registry-fields">
+                        <div>
+                          <span>baseUrl</span>
+                          <strong>{machine.baseUrl || 'local'}</strong>
+                        </div>
+                        <div>
+                          <span>updatedAt</span>
+                          <strong>{formatDate(machine.updatedAt)}</strong>
+                        </div>
+                        <div>
+                          <span>running jobs</span>
+                          <strong>{machine.runningJobs}</strong>
+                        </div>
+                        <div>
+                          <span>errors</span>
+                          <strong>{machine.error || '无'}</strong>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {jobRegistryErrors.length ? (
+                  <div className="job-registry-errors">
+                    {jobRegistryErrors.map((item) => (
+                      <div className="worker-event danger" key={`${item.machineId}-${item.baseUrl ?? 'local'}-${item.error}`}>
+                        <span>{item.machineId} · {item.baseUrl || 'local'}</span>
+                        <p>{item.error}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+
+              {currentWorkerJob ? (
+                <div className="worker-console-grid">
+                  <div className="worker-facts">
+                    <div>
+                      <span>status</span>
+                      <strong className={`status-pill ${workerStatusTone[currentWorkerJob.status ?? ''] ?? ''}`}>
+                        {statusLabel(currentWorkerJob.status)}
+                      </strong>
+                    </div>
+                    <div>
+                      <span>mode</span>
+                      <strong>{currentWorkerJob.mode ?? '未知'}</strong>
+                    </div>
+                    <div>
+                      <span>machine</span>
+                      <strong>{currentWorkerJob.machineId ?? currentWorkerJob.machine ?? '未知'}</strong>
+                    </div>
+                    <div>
+                      <span>cwd</span>
+                      <strong>{currentWorkerJob.cwd ?? '未知'}</strong>
+                    </div>
+                    <div>
+                      <span>startedAt</span>
+                      <strong>{formatDate(currentWorkerJob.startedAt ?? null)}</strong>
+                    </div>
+                    <div>
+                      <span>updatedAt</span>
+                      <strong>{formatDate(currentWorkerJob.updatedAt ?? null)}</strong>
+                    </div>
+                  </div>
+
+                  <div className="worker-controls">
+                    <label>
+                      <span>发送指导</span>
+                      <textarea
+                        value={currentWorkerGuidanceDraft}
+                        onChange={(event) =>
+                          setWorkerGuidanceDrafts((current) => ({ ...current, [currentWorkerJob.id]: event.target.value }))
+                        }
+                        placeholder="给运行中的 Codex worker 发送中文指导"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={!currentWorkerGuidanceDraft.trim() || workerJobBusyId === `${currentWorkerJob.id}:guidance`}
+                      onClick={() => void sendWorkerGuidance(currentWorkerJob)}
+                    >
+                      <TerminalIcon size={16} />
+                      发送指导
+                    </button>
+
+                    <div className="worker-protocol-row">
+                      <select
+                        value={currentWorkerProtocolKind}
+                        onChange={(event) =>
+                          setWorkerProtocolKindsByJob((current) => ({
+                            ...current,
+                            [currentWorkerJob.id]: event.target.value as WorkerProtocolKind,
+                          }))
+                        }
+                        aria-label="protocol kind"
+                      >
+                        {workerProtocolKinds.map((kind) => (
+                          <option key={kind.id} value={kind.id}>
+                            {kind.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={workerJobBusyId === `${currentWorkerJob.id}:protocol`}
+                        onClick={() => void sendWorkerProtocolKind(currentWorkerJob)}
+                      >
+                        <Sparkles size={16} />
+                        发送 protocol
+                      </button>
+                    </div>
+
+                    <label>
+                      <span>supervise instruction</span>
+                      <textarea
+                        value={currentWorkerSupervisorDraft}
+                        onChange={(event) =>
+                          setWorkerSupervisorDrafts((current) => ({ ...current, [currentWorkerJob.id]: event.target.value }))
+                        }
+                        placeholder="可选：监督指令"
+                      />
+                    </label>
+                    <div className="worker-supervise-row">
+                      <label className="worker-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={currentWorkerSupervisorAutoStop}
+                          onChange={(event) =>
+                            setWorkerSupervisorAutoStop((current) => ({ ...current, [currentWorkerJob.id]: event.target.checked }))
+                          }
+                        />
+                        autoStop
+                      </label>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={workerJobBusyId === `${currentWorkerJob.id}:supervise`}
+                        onClick={() => void superviseWorkerJob(currentWorkerJob)}
+                      >
+                        <ShieldCheck size={16} />
+                        supervise
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>outputTail</h4>
+                    <pre className="worker-code">{currentWorkerJob.outputTail || '暂无输出'}</pre>
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>changedFiles</h4>
+                    <div className="worker-file-list">
+                      {(currentWorkerJob.changedFiles ?? []).length ? (
+                        (currentWorkerJob.changedFiles ?? []).map((file) => <code key={file}>{file}</code>)
+                      ) : (
+                        <span>暂无 changed files</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>guidance</h4>
+                    <div className="worker-event-list">
+                      {(currentWorkerJob.guidance ?? []).length ? (
+                        (currentWorkerJob.guidance ?? []).slice(-8).map((item, index) => (
+                          <div className="worker-event" key={`${item.at ?? 'guidance'}-${index}`}>
+                            <span>{formatDate(item.at ?? null)} · {item.source ?? 'unknown'}</span>
+                            <p>{item.text ?? '无内容'}</p>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="empty compact">暂无 guidance</div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>supervisor</h4>
+                    <div className="worker-metric-grid">
+                      <div>
+                        <span>启用</span>
+                        <strong>{booleanPolicyLabel(currentWorkerJob.supervisor?.enabled, '启用', '关闭')}</strong>
+                      </div>
+                      <div>
+                        <span>决策</span>
+                        <strong className={`status-pill ${supervisorDecisionTone[currentWorkerJob.supervisor?.lastDecision ?? ''] ?? ''}`}>
+                          {supervisorDecisionLabel[currentWorkerJob.supervisor?.lastDecision ?? ''] ?? currentWorkerJob.supervisor?.lastDecision ?? '暂无'}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>检查次数</span>
+                        <strong>{currentWorkerJob.supervisor?.checks ?? 0}</strong>
+                      </div>
+                      <div>
+                        <span>重试次数</span>
+                        <strong>{currentWorkerJob.supervisor?.retries ?? 0}</strong>
+                      </div>
+                      <div>
+                        <span>空闲阈值</span>
+                        <strong>{formatDurationMs(currentWorkerJob.supervisor?.idleTimeoutMs)}</strong>
+                      </div>
+                      <div>
+                        <span>最后输出</span>
+                        <strong>{formatOptionalBytes(currentWorkerJob.supervisor?.lastOutputBytes)}</strong>
+                      </div>
+                    </div>
+                    {currentWorkerJob.supervisor?.lastReason ? <p className="worker-note">{currentWorkerJob.supervisor.lastReason}</p> : null}
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>structuredReport</h4>
+                    {currentWorkerJob.structuredReport ? (
+                      <div className="worker-report">
+                        <div><span>STATUS</span><strong>{currentWorkerJob.structuredReport.status ?? '未填写'}</strong></div>
+                        <div><span>NEXT_ACTION</span><strong>{currentWorkerJob.structuredReport.nextAction ?? 'none'}</strong></div>
+                        <div>
+                          <span>CHANGED_FILES</span>
+                          <p>{(currentWorkerJob.structuredReport.changedFiles ?? []).join('\n') || 'none'}</p>
+                        </div>
+                        <div>
+                          <span>TESTS</span>
+                          <p>{(currentWorkerJob.structuredReport.tests ?? []).join('\n') || 'not run'}</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="warning-line"><AlertTriangle size={15} /> 完成报告缺失，控制面不应直接宣称任务成功。</div>
+                    )}
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>安全策略</h4>
+                    <div className="worker-metric-grid">
+                      <div><span>deploy</span><strong>{booleanPolicyLabel(currentWorkerJob.policy?.allowDeploy)}</strong></div>
+                      <div><span>delete</span><strong>{booleanPolicyLabel(currentWorkerJob.policy?.allowDeletes)}</strong></div>
+                      <div><span>autoStop</span><strong>{booleanPolicyLabel(currentWorkerJob.policy?.autoStop, '启用', '关闭')}</strong></div>
+                      <div><span>最长运行</span><strong>{formatDurationMs(currentWorkerJob.policy?.maxRuntimeMs)}</strong></div>
+                      <div><span>最大输出</span><strong>{formatOptionalBytes(currentWorkerJob.policy?.maxOutputBytes)}</strong></div>
+                      <div><span>最后检查</span><strong>{formatDate(currentWorkerJob.policyState?.lastCheckedAt ?? null)}</strong></div>
+                    </div>
+                    {(currentWorkerJob.policy?.allowedCwds ?? []).length ? (
+                      <div className="worker-chip-list">
+                        {(currentWorkerJob.policy?.allowedCwds ?? []).map((path) => <code key={path}>{path}</code>)}
+                      </div>
+                    ) : null}
+                    {(currentWorkerJob.policyState?.violations ?? []).length ? (
+                      <div className="worker-event-list compact-list">
+                        {(currentWorkerJob.policyState?.violations ?? []).slice(-6).map((item, index) => (
+                          <div className="worker-event danger" key={`${item.at ?? 'policy'}-${index}`}>
+                            <span>{formatDate(item.at ?? null)} · {item.severity ?? 'warn'} · {item.pattern ?? 'policy'}</span>
+                            <p>{item.reason ?? '触发策略'}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty compact">暂无策略违规</div>
+                    )}
+                  </div>
+
+                  <div className="worker-section">
+                    <h4>事件流</h4>
+                    <div className="worker-event-list">
+                      {currentWorkerEvents.length ? (
+                        currentWorkerEvents.map((event, index) => (
+                          <div className="worker-event" key={typeof event.seq === 'number' ? event.seq : index}>
+                            <span>
+                              #{event.seq ?? index + 1} · {formatDate(event.at ?? null)} · {event.kind ?? event.type ?? 'event'}
+                            </span>
+                            <p>{event.message ?? formatUnknownValue(event.data ?? event)}</p>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="empty compact">
+                          {workerJobEventsUnavailable[currentWorkerJob.id] ? '事件接口未启用或暂不可用' : '暂无事件流'}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="empty compact">{workerJobsLoading ? '正在加载 worker jobs...' : '当前会话没有匹配的 worker job'}</div>
+              )}
             </section>
 
             <section className="primary-panel">
@@ -1655,6 +3363,14 @@ function App() {
                   onClick={() => void loadHistory(selected, historyBefore)}
                 >
                   更早记录
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={historyLoading}
+                  onClick={() => void loadAllMessages(selected)}
+                >
+                  加载全部消息
                 </button>
               </div>
               <div className="history-list" aria-busy={historyLoading}>

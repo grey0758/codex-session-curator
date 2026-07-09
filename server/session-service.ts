@@ -16,13 +16,22 @@ import {
   restoreArchive,
   sameResolvedPath,
 } from './file-ops.js';
-import { EVALUATOR_WORKFLOW, evaluateSession, getRecommendedEvaluationConcurrency } from './evaluator.js';
-import { extractSessionId, parseSessionFile, parseSessionHistory } from './session-parser.js';
+import {
+  EVALUATOR_WORKFLOW,
+  evaluateSession,
+  getRecommendedEvaluationConcurrency,
+  isEvaluationWorkflowCompatible,
+  isEvaluationWorkflowComplete,
+} from './evaluator.js';
+import { extractSessionId, parseSessionFile, parseSessionHistory, parseSessionMessages } from './session-parser.js';
 import { CuratorStore } from './store.js';
 import type {
   ActivityStatus,
   CodexSession,
   Evaluation,
+  FailureKnowledgeCard,
+  JobOutcome,
+  ParsedMessage,
   Recommendation,
   RemoteMachine,
   ReviewPriority,
@@ -66,6 +75,38 @@ function hasCachedMetadata(cached: unknown): cached is {
     typeof item.userTurns === 'number' &&
     typeof item.assistantTurns === 'number' &&
     typeof item.shellSnapshotCount === 'number'
+  );
+}
+
+function isCachedMessage(value: unknown): value is ParsedMessage | null {
+  if (value === null) return true;
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Record<string, unknown>;
+  return (
+    (item.role === 'user' || item.role === 'assistant') &&
+    typeof item.text === 'string' &&
+    (typeof item.timestamp === 'string' || item.timestamp === null)
+  );
+}
+
+function hasCachedConversationPreview(cached: unknown): cached is {
+  lastUserMessage: ParsedMessage | null;
+  lastAssistantMessage: ParsedMessage | null;
+} {
+  const item = cached as Record<string, unknown>;
+  return (
+    Object.prototype.hasOwnProperty.call(item, 'lastUserMessage') &&
+    Object.prototype.hasOwnProperty.call(item, 'lastAssistantMessage') &&
+    isCachedMessage(item.lastUserMessage) &&
+    isCachedMessage(item.lastAssistantMessage)
+  );
+}
+
+function sameCachedMessage(a: ParsedMessage | null | undefined, b: ParsedMessage | null): boolean {
+  return (
+    (a?.role ?? null) === (b?.role ?? null) &&
+    (a?.text ?? null) === (b?.text ?? null) &&
+    (a?.timestamp ?? null) === (b?.timestamp ?? null)
   );
 }
 
@@ -137,6 +178,8 @@ function buildEvaluationSearchText(input: {
   resumeCommand?: string;
   cwd?: string | null;
   machineId?: string;
+  lastUserMessage?: ParsedMessage | null;
+  lastAssistantMessage?: ParsedMessage | null;
   evaluation: Partial<Evaluation>;
 }): string {
   const evaluation = input.evaluation;
@@ -146,6 +189,8 @@ function buildEvaluationSearchText(input: {
     input.resumeCommand ?? '',
     input.cwd ?? '',
     input.machineId ?? '',
+    input.lastUserMessage?.text ?? '',
+    input.lastAssistantMessage?.text ?? '',
     evaluation.title ?? '',
     evaluation.summary ?? '',
     evaluation.detailedSummary ?? '',
@@ -153,6 +198,17 @@ function buildEvaluationSearchText(input: {
     ...(evaluation.directoryIndex ?? []),
     ...(evaluation.techStack ?? []),
     ...(evaluation.keywords ?? []),
+    ...(evaluation.failureCards ?? []).flatMap((card) => [card.category, card.title, card.summary, card.evidence]),
+    ...(evaluation.jobOutcomes ?? []).flatMap((outcome) => [
+      outcome.status,
+      outcome.goal,
+      outcome.cwd ?? '',
+      outcome.summary,
+      outcome.failureReason ?? '',
+      outcome.nextAction ?? '',
+      ...outcome.changedFiles,
+      ...outcome.tests,
+    ]),
     evaluation.recommendedWorkdir ?? '',
     ...(evaluation.remoteMachines ?? []).map((machine) =>
       [machine.label, machine.host, machine.ip, machine.user].filter(Boolean).join(' ')
@@ -185,7 +241,7 @@ function classifyUpdate(input: {
   const minutesSinceEvaluation = Math.max(0, (Date.now() - Date.parse(input.cached.evaluatedAt ?? '')) / 60_000);
   const recentlyEvaluated = Number.isFinite(minutesSinceEvaluation) && minutesSinceEvaluation <= 120;
 
-  if (!changed && input.cached.workflow !== EVALUATOR_WORKFLOW) {
+  if (!changed && !isEvaluationWorkflowCompatible(input.cached.workflow)) {
     return {
       updateCadence: input.cached.updateCadence ?? 'new',
       reviewPriority: input.cached.reviewPriority ?? 'normal',
@@ -245,6 +301,7 @@ function applyUpdateMeta(evaluation: Evaluation, updateMeta: ReturnType<typeof c
 
 function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation {
   const summary = evaluation.summary || 'No summary available.';
+  const hermesRefreshStatus = evaluation.hermesRefreshStatus ?? (evaluation.hermesNeedsRefresh ? 'pending' : 'never');
   const recommendation =
     evaluation.score <= 2 && evaluation.recommendation !== 'keep' ? 'delete' : evaluation.recommendation;
   const reasons =
@@ -255,6 +312,14 @@ function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation
     title: evaluation.title ?? summary.slice(0, 42) ?? '未命名会话',
     summary,
     detailedSummary: evaluation.detailedSummary ?? summary,
+    hermesContext: evaluation.hermesContext ?? '',
+    hermesContextUpdatedAt: evaluation.hermesContextUpdatedAt ?? null,
+    hermesLastUsedAt: evaluation.hermesLastUsedAt ?? null,
+    hermesLastJobId: evaluation.hermesLastJobId ?? null,
+    hermesNeedsRefresh: hermesRefreshStatus === 'failed' ? true : evaluation.hermesNeedsRefresh ?? false,
+    hermesRecalculatedAt: evaluation.hermesRecalculatedAt ?? null,
+    hermesRefreshStatus,
+    hermesRefreshError: evaluation.hermesRefreshError ?? null,
     recommendation,
     score: evaluation.score,
     reasons,
@@ -262,6 +327,8 @@ function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation
     directoryIndex: evaluation.directoryIndex ?? evaluation.actualWorkdirs ?? [],
     techStack: evaluation.techStack ?? [],
     keywords: evaluation.keywords ?? [],
+    failureCards: evaluation.failureCards ?? [],
+    jobOutcomes: evaluation.jobOutcomes ?? [],
     searchText: evaluation.searchText ?? buildEvaluationSearchText({ evaluation }),
     updateCadence: evaluation.updateCadence ?? 'quiet',
     reviewPriority: evaluation.reviewPriority ?? 'normal',
@@ -326,7 +393,13 @@ function fastEvaluation(input: {
     directoryIndex,
     techStack: [],
     keywords: directoryIndex,
+    failureCards: [],
+    jobOutcomes: [],
     searchText: '',
+    hermesNeedsRefresh: true,
+    hermesRecalculatedAt: null,
+    hermesRefreshStatus: 'pending',
+    hermesRefreshError: null,
     updateCadence: updateMeta.updateCadence,
     reviewPriority: updateMeta.reviewPriority,
     reviewSignals: updateMeta.reviewSignals,
@@ -428,8 +501,9 @@ export class SessionService {
           cached &&
           cached.filePath === filePath &&
           hasCachedMetadata(cached) &&
+          hasCachedConversationPreview(cached) &&
           !options.refreshWorkflow &&
-          cached.workflow === EVALUATOR_WORKFLOW &&
+          isEvaluationWorkflowComplete(cached.workflow) &&
           cached.bytes === fileStat.size &&
           cached.mtimeMs === fileStat.mtimeMs;
 
@@ -444,6 +518,8 @@ export class SessionService {
             messageCount: cached.messageCount,
             userTurns: cached.userTurns,
             assistantTurns: cached.assistantTurns,
+            lastUserMessage: cached.lastUserMessage,
+            lastAssistantMessage: cached.lastAssistantMessage,
             shellSnapshotCount,
             title: state.titles[id] || cached.title || cached.summary.slice(0, 42) || id,
             customTitle: state.titles[id] ?? null,
@@ -480,7 +556,7 @@ export class SessionService {
         cached.filePath === parsed.filePath &&
         cached.mtimeMs === parsed.mtimeMs &&
         cached.bytes === parsed.bytes &&
-        cached.workflow === EVALUATOR_WORKFLOW &&
+        isEvaluationWorkflowComplete(cached.workflow) &&
         hasCachedMetadata(cached);
       const evaluation =
         canReuseParsedCache && !options.refreshWorkflow
@@ -495,7 +571,15 @@ export class SessionService {
               directoryIndex: cached.directoryIndex ?? cached.actualWorkdirs ?? [],
               techStack: cached.techStack ?? [],
               keywords: cached.keywords ?? [],
-              searchText: cached.searchText ?? buildEvaluationSearchText({ id: parsed.id, cwd: parsed.cwd, evaluation: cached }),
+              failureCards: cached.failureCards ?? [],
+              jobOutcomes: cached.jobOutcomes ?? [],
+              searchText: cached.searchText ?? buildEvaluationSearchText({
+                id: parsed.id,
+                cwd: parsed.cwd,
+                lastUserMessage: cached.lastUserMessage,
+                lastAssistantMessage: cached.lastAssistantMessage,
+                evaluation: cached,
+              }),
               updateCadence: cached.updateCadence ?? 'quiet',
               reviewPriority: cached.reviewPriority ?? 'normal',
               reviewSignals: cached.reviewSignals ?? [],
@@ -534,7 +618,10 @@ export class SessionService {
         cached.mtimeMs !== parsed.mtimeMs ||
         cached.bytes !== parsed.bytes ||
         cached.workflow !== evaluation.workflow ||
-        !hasCachedMetadata(cached)
+        !hasCachedMetadata(cached) ||
+        !hasCachedConversationPreview(cached) ||
+        !sameCachedMessage(cached.lastUserMessage, parsed.lastUserMessage) ||
+        !sameCachedMessage(cached.lastAssistantMessage, parsed.lastAssistantMessage)
       ) {
         const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
         state.evaluations[parsed.id] = {
@@ -548,7 +635,16 @@ export class SessionService {
           messageCount: parsed.messageCount,
           userTurns: parsed.userTurns,
           assistantTurns: parsed.assistantTurns,
+          lastUserMessage: parsed.lastUserMessage,
+          lastAssistantMessage: parsed.lastAssistantMessage,
           shellSnapshotCount,
+          searchText: buildEvaluationSearchText({
+            id: parsed.id,
+            cwd: parsed.cwd,
+            lastUserMessage: parsed.lastUserMessage,
+            lastAssistantMessage: parsed.lastAssistantMessage,
+            evaluation,
+          }),
         };
         stateChanged = true;
       }
@@ -570,6 +666,8 @@ export class SessionService {
         messageCount: parsed.messageCount,
         userTurns: parsed.userTurns,
         assistantTurns: parsed.assistantTurns,
+        lastUserMessage: parsed.lastUserMessage,
+        lastAssistantMessage: parsed.lastAssistantMessage,
         shellSnapshotCount,
         title: state.titles[parsed.id] || evaluation.title || evaluation.summary.slice(0, 42) || parsed.id,
         customTitle: state.titles[parsed.id] ?? null,
@@ -600,6 +698,262 @@ export class SessionService {
       limit: options.limit ?? 80,
       beforeIndex: options.beforeIndex ?? null,
     });
+  }
+
+  async getSessionMessages(
+    id: string,
+    options: {
+      limit?: number | null;
+      beforeIndex?: number | null;
+      afterIndex?: number | null;
+      full?: boolean;
+      preserveWhitespace?: boolean;
+    } = {}
+  ) {
+    const { found, missingIds } = await this.findSessionFilesByIds([id]);
+    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
+    return parseSessionMessages({
+      filePath: found[0].filePath,
+      limit: options.limit ?? null,
+      beforeIndex: options.beforeIndex ?? null,
+      afterIndex: options.afterIndex ?? null,
+      full: options.full,
+      preserveWhitespace: options.preserveWhitespace,
+    });
+  }
+
+  async markHermesSessionUsed(id: string, jobId: string | null): Promise<void> {
+    const state = await this.store.load();
+    const cached = state.evaluations[id];
+    if (!cached) return;
+    state.evaluations[id] = {
+      ...cached,
+      hermesLastUsedAt: new Date().toISOString(),
+      hermesLastJobId: jobId,
+      hermesNeedsRefresh: true,
+      hermesRefreshStatus: 'pending',
+      hermesRefreshError: null,
+    };
+    await this.store.save(state);
+  }
+
+  async markSessionEvaluationRefreshQueued(id: string, reason = 'manual'): Promise<void> {
+    const state = await this.store.load();
+    const cached = state.evaluations[id];
+    if (!cached) return;
+    state.evaluations[id] = {
+      ...cached,
+      hermesNeedsRefresh: true,
+      hermesRefreshStatus: 'pending',
+      hermesRefreshError: null,
+      reviewSignals: [`已加入 AI 重算队列：${reason}`, ...(cached.reviewSignals ?? [])].slice(0, 6),
+    };
+    await this.store.save(state);
+  }
+
+  async refreshSessionEvaluation(id: string, reason = 'manual') {
+    const { found, missingIds } = await this.findSessionFilesByIds([id]);
+    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
+    const parsed = await parseSessionFile(found[0].filePath);
+    const state = await this.store.load();
+    const cached = state.evaluations[id];
+    const updateMeta = classifyUpdate({
+      cached,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      userTurns: parsed.userTurns,
+      messageCount: parsed.messageCount,
+    });
+    if (cached) {
+      state.evaluations[id] = {
+        ...cached,
+        hermesNeedsRefresh: true,
+        hermesRefreshStatus: 'running',
+        hermesRefreshError: null,
+      };
+      await this.store.save(state);
+    }
+    try {
+    const evaluation = applyUpdateMeta(
+      await evaluateSession({
+        messages: parsed.messages,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        cwd: parsed.cwd,
+      }),
+      {
+        ...updateMeta,
+        reviewSignals: [`AI 重算：${reason}`, ...updateMeta.reviewSignals].slice(0, 6),
+      }
+    );
+    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const refreshedAt = new Date().toISOString();
+    state.evaluations[id] = {
+      ...evaluation,
+      hermesLastUsedAt: cached?.hermesLastUsedAt ?? null,
+      hermesLastJobId: cached?.hermesLastJobId ?? null,
+      hermesNeedsRefresh: evaluation.status === 'failed',
+      hermesRecalculatedAt: evaluation.status === 'failed' ? cached?.hermesRecalculatedAt ?? null : refreshedAt,
+      hermesRefreshStatus: evaluation.status === 'failed' ? 'failed' : 'ok',
+      hermesRefreshError: evaluation.error ?? null,
+      filePath: parsed.filePath,
+      mtimeMs: parsed.mtimeMs,
+      bytes: parsed.bytes,
+      cwd: parsed.cwd,
+      startedAt: parsed.startedAt,
+      updatedAt: parsed.updatedAt,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      lastUserMessage: parsed.lastUserMessage,
+      lastAssistantMessage: parsed.lastAssistantMessage,
+      shellSnapshotCount: shellSnapshotCounts.get(parsed.id) ?? 0,
+      searchText: buildEvaluationSearchText({
+        id: parsed.id,
+        cwd: parsed.cwd,
+        lastUserMessage: parsed.lastUserMessage,
+        lastAssistantMessage: parsed.lastAssistantMessage,
+        evaluation,
+      }),
+    };
+    await this.store.save(state);
+    return { id, status: evaluation.status, title: evaluation.title, model: evaluation.model, error: evaluation.error };
+    } catch (error) {
+      const failedState = await this.store.load();
+      const latest = failedState.evaluations[id] ?? cached;
+      if (latest) {
+        failedState.evaluations[id] = {
+          ...latest,
+          hermesNeedsRefresh: true,
+          hermesRefreshStatus: 'failed',
+          hermesRefreshError: error instanceof Error ? error.message.slice(0, 240) : 'AI 重算失败',
+        };
+        await this.store.save(failedState);
+      }
+      throw error;
+    }
+  }
+
+  async appendFailureKnowledgeCard(input: {
+    sessionId: string;
+    jobId: string;
+    outputTail?: string | null;
+    error?: string | null;
+    policyViolations?: Array<{ reason?: string; pattern?: string; severity?: string }>;
+  }): Promise<void> {
+    const state = await this.store.load();
+    const cached = state.evaluations[input.sessionId];
+    if (!cached) return;
+    const evidence = [input.error, ...(input.policyViolations ?? []).map((item) => item.reason), input.outputTail]
+      .filter(Boolean)
+      .join('\n')
+      .slice(-1800);
+    const lower = evidence.toLowerCase();
+    const category: FailureKnowledgeCard['category'] =
+      /auth|401|token|signing in/i.test(lower)
+        ? 'auth'
+        : /missing environment variable|missing env|env\b|api_key/i.test(lower)
+          ? 'env'
+          : /npm err|module not found|dependency|pnpm|yarn|package/i.test(lower)
+            ? 'dependency'
+            : /test failed|failed tests|expect\(|assert/i.test(lower)
+              ? 'test'
+              : /ssh|connect timeout|connection refused|remote|unreachable/i.test(lower)
+                ? 'remote'
+                : (input.policyViolations?.length ?? 0) > 0
+                  ? 'policy'
+                  : /timeout|stale|无输出|卡住/i.test(lower)
+                    ? 'timeout'
+                    : /codex|worker|exit/i.test(lower)
+                      ? 'worker'
+                      : 'unknown';
+    const titleByCategory: Record<string, string> = {
+      auth: '认证或 token 失效',
+      env: '环境变量缺失',
+      dependency: '依赖或安装环境异常',
+      test: '测试失败',
+      remote: '远端机器或 SSH 不可达',
+      policy: '触发安全策略',
+      timeout: '任务卡住或超时',
+      worker: 'Codex worker 执行失败',
+      unknown: '任务失败原因待复核',
+    };
+    const card: FailureKnowledgeCard = {
+      id: `${input.jobId}:${Date.now()}`,
+      at: new Date().toISOString(),
+      jobId: input.jobId,
+      category,
+      title: titleByCategory[category] ?? titleByCategory.unknown,
+      summary: `job ${input.jobId} 失败或被停止，分类为：${titleByCategory[category] ?? titleByCategory.unknown}`,
+      evidence: evidence.replace(/\b(sk|nvapi)-[A-Za-z0-9_-]{12,}\b/g, '$1-[redacted]').slice(0, 1200),
+    };
+    const failureCards = [card, ...(cached.failureCards ?? []).filter((item) => item.jobId !== input.jobId)].slice(0, 20);
+    state.evaluations[input.sessionId] = {
+      ...cached,
+      failureCards,
+      keywords: [...new Set([...(cached.keywords ?? []), card.category, card.title])].slice(0, 40),
+      reviewSignals: [`失败知识卡片：${card.title}`, ...(cached.reviewSignals ?? [])].slice(0, 8),
+      searchText: buildEvaluationSearchText({ id: input.sessionId, cwd: cached.cwd, evaluation: { ...cached, failureCards } }),
+    };
+    await this.store.save(state);
+  }
+
+  async appendJobOutcome(input: JobOutcome): Promise<void> {
+    const state = await this.store.load();
+    const cached = state.evaluations[input.sessionId];
+    if (!cached) return;
+    const jobOutcomes = [input, ...(cached.jobOutcomes ?? []).filter((item) => item.jobId !== input.jobId)].slice(0, 30);
+    const outcomeKeywords = [
+      input.status,
+      input.mode,
+      input.cwd ?? '',
+      ...input.changedFiles,
+      ...input.tests,
+      input.needsReview ? 'needs-review' : '',
+    ].filter(Boolean);
+    state.evaluations[input.sessionId] = {
+      ...cached,
+      jobOutcomes,
+      keywords: [...new Set([...(cached.keywords ?? []), ...outcomeKeywords])].slice(0, 50),
+      reviewSignals: [
+        `最近 Codex worker：${input.status}${input.needsReview ? '，需要复核' : ''}`,
+        ...(cached.reviewSignals ?? []),
+      ].slice(0, 8),
+      searchText: buildEvaluationSearchText({ id: input.sessionId, cwd: cached.cwd, evaluation: { ...cached, jobOutcomes } }),
+    };
+    await this.store.save(state);
+  }
+
+  async getSessionOutcome(id: string) {
+    const state = await this.store.load();
+    const cached = state.evaluations[id];
+    if (!cached) return null;
+    return {
+      sessionId: id,
+      title: state.titles[id] || cached.title || cached.summary || id,
+      hermesLastJobId: cached.hermesLastJobId ?? null,
+      jobOutcomes: cached.jobOutcomes ?? [],
+      failureCards: cached.failureCards ?? [],
+      summary: cached.summary,
+      detailedSummary: cached.detailedSummary,
+      searchText: cached.searchText,
+    };
+  }
+
+  async findJobOutcome(jobId: string) {
+    const state = await this.store.load();
+    for (const [sessionId, evaluation] of Object.entries(state.evaluations)) {
+      const outcome = (evaluation.jobOutcomes ?? []).find((item) => item.jobId === jobId);
+      if (outcome) {
+        return {
+          sessionId,
+          title: state.titles[sessionId] || evaluation.title || evaluation.summary || sessionId,
+          outcome,
+          failureCards: (evaluation.failureCards ?? []).filter((card) => card.jobId === jobId),
+        };
+      }
+    }
+    return null;
   }
 
   async setKept(id: string, kept: boolean): Promise<CodexSession | null> {
@@ -711,7 +1065,9 @@ export class SessionService {
           cached.filePath !== filePath ||
           cached.bytes !== fileStat.size ||
           cached.mtimeMs !== fileStat.mtimeMs ||
-          cached.workflow !== EVALUATOR_WORKFLOW ||
+          !isEvaluationWorkflowComplete(cached.workflow) ||
+          cached.hermesNeedsRefresh === true ||
+          !hasCachedConversationPreview(cached) ||
           (options.includeFailed === true && cached.status === 'failed') ||
           !hasCachedMetadata(cached);
         if (!needsBackfill) continue;
@@ -758,7 +1114,16 @@ export class SessionService {
         messageCount: parsed.messageCount,
         userTurns: parsed.userTurns,
         assistantTurns: parsed.assistantTurns,
+        lastUserMessage: parsed.lastUserMessage,
+        lastAssistantMessage: parsed.lastAssistantMessage,
         shellSnapshotCount,
+        searchText: buildEvaluationSearchText({
+          id: parsed.id,
+          cwd: parsed.cwd,
+          lastUserMessage: parsed.lastUserMessage,
+          lastAssistantMessage: parsed.lastAssistantMessage,
+          evaluation,
+        }),
       };
       stateChanged = true;
       return {

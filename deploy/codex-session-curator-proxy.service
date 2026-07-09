@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Session Curator blue-green proxy
+After=network-online.target codex-session-curator-slot@blue.service codex-session-curator-slot@green.service
+
+[Service]
+Type=forking
+PIDFile=/home/grey/data/apps/codex-session-curator-blue-green/nginx/nginx.pid
+ExecStart=/usr/sbin/nginx -c /home/grey/data/apps/codex-session-curator-blue-green/nginx/nginx.conf -p /home/grey/data/apps/codex-session-curator-blue-green/nginx
+ExecReload=/usr/sbin/nginx -s reload -c /home/grey/data/apps/codex-session-curator-blue-green/nginx/nginx.conf -p /home/grey/data/apps/codex-session-curator-blue-green/nginx
+ExecStop=/usr/sbin/nginx -s quit -c /home/grey/data/apps/codex-session-curator-blue-green/nginx/nginx.conf -p /home/grey/data/apps/codex-session-curator-blue-green/nginx
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
