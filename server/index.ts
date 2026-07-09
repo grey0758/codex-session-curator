@@ -12,7 +12,7 @@ import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { getCodexHome, getStatePath } from './file-ops.js';
+import { getCodexHome, getStatePath, isClaudeSessionPath } from './file-ops.js';
 import { readAnalysisRuns } from './analysis-log.js';
 import { parseSessionHistory } from './session-parser.js';
 import {
@@ -688,8 +688,10 @@ async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
     .filter(([id]) => !state.deletedIds.includes(id))
     .map(([id, evaluation]) => {
       const activity = stateSessionActivity(evaluation.updatedAt ?? evaluation.evaluatedAt);
+      const agent = isClaudeSessionPath(evaluation.filePath) ? 'claude' : 'codex';
       return {
         id,
+        agent,
         filePath: evaluation.filePath,
         cwd: evaluation.cwd ?? null,
         startedAt: evaluation.startedAt ?? null,
@@ -703,7 +705,7 @@ async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
         shellSnapshotCount: evaluation.shellSnapshotCount ?? 0,
         title: state.titles[id] || evaluation.title || evaluation.summary || id,
         customTitle: state.titles[id] ?? null,
-        resumeCommand: `codex resume ${id}`,
+        resumeCommand: agent === 'claude' ? `claude --resume ${id}` : `codex resume ${id}`,
         machineId,
         kept: state.keptIds.includes(id),
         deleted: false,

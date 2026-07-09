@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { spawn as spawnPty, type IPty } from 'node-pty';
 import type { CodexSession } from './types.js';
-import { createTerminalEnv, getCodexBin } from './terminal.js';
+import { createTerminalEnv, getClaudeBin, getCodexBin } from './terminal.js';
 
 export type CodexJobStatus = 'running' | 'completed' | 'failed' | 'stopped';
 export type CodexJobMode = 'exec' | 'pty';
@@ -617,6 +617,19 @@ function buildExecArgs(input: { session: CodexSession; prompt: string; model?: s
   return args;
 }
 
+// Headless Claude Code worker: `claude --print --resume <id> [--model m] [...] <prompt>`.
+// The working directory is supplied via the spawn `cwd` option (Claude has no -C flag),
+// and permission behavior follows the user's ~/.claude settings (auto mode by default).
+function buildClaudeExecArgs(input: { session: CodexSession; prompt: string; model?: string | null; extraArgs?: string[] }): string[] {
+  const args = ['--print', '--resume', input.session.id];
+  if (input.model) args.push('--model', input.model);
+  for (const arg of input.extraArgs ?? []) {
+    if (typeof arg === 'string' && arg.trim()) args.push(arg);
+  }
+  args.push(input.prompt);
+  return args;
+}
+
 function buildInteractiveCommand(input: { session: CodexSession; model?: string | null }, cwd: string, env: NodeJS.ProcessEnv): string {
   const args = ['resume', '--include-non-interactive', '--no-alt-screen', '-C', cwd];
   if (input.model) args.push('-m', input.model);
@@ -685,24 +698,26 @@ export function startCodexResumeJob(input: {
 }): CodexResumeJob {
   const env = createTerminalEnv();
   const cwd = input.session.cwd || process.cwd();
-  const codexBin = getCodexBin(env);
-  const mode = input.mode ?? 'exec';
+  const isClaude = (input.session.agent ?? 'codex') === 'claude';
+  const workerBin = isClaude ? getClaudeBin(env) : getCodexBin(env);
+  // Claude workers run headless (exec) only; the interactive tmux/pty path is Codex-specific.
+  const mode = isClaude ? 'exec' : input.mode ?? 'exec';
   const supervisor = mergeSupervisorInput(input.supervisor, input.supervisorStrategy);
 
   if (mode === 'pty') return startCodexPtyJob({ ...input, cwd, env });
 
-  const args = buildExecArgs(input, cwd);
+  const args = isClaude ? buildClaudeExecArgs(input) : buildExecArgs(input, cwd);
   const job = baseJob({
     session: input.session,
     prompt: input.prompt,
     mode: 'exec',
-    command: [codexBin, ...args.map(shellQuote)].join(' '),
+    command: [workerBin, ...args.map(shellQuote)].join(' '),
     cwd,
     supervisor,
     policy: input.policy,
   });
 
-  const child = spawn(codexBin, args, {
+  const child = spawn(workerBin, args, {
     cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],

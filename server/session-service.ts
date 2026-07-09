@@ -7,9 +7,11 @@ import {
   copySessionToProject,
   countShellSnapshots,
   findJsonlFiles,
+  getClaudeProjectsRoot,
   getCodexHome,
   getRecycleRoot,
   getSessionsRoot,
+  isClaudeSessionPath,
   listRecycleArchives,
   purgeExpiredArchives,
   permanentlyDeleteArchive,
@@ -27,6 +29,7 @@ import { extractSessionId, parseSessionFile, parseSessionHistory, parseSessionMe
 import { CuratorStore } from './store.js';
 import type {
   ActivityStatus,
+  AgentKind,
   CodexSession,
   Evaluation,
   FailureKnowledgeCard,
@@ -418,8 +421,9 @@ function fastEvaluation(input: {
   };
 }
 
-function enrichSession(base: Omit<CodexSession, 'resumeCommand' | 'machineId' | 'activityStatus' | 'lastActiveAt' | 'inactiveDays'>): CodexSession {
+function enrichSession(base: Omit<CodexSession, 'agent' | 'resumeCommand' | 'machineId' | 'activityStatus' | 'lastActiveAt' | 'inactiveDays'>): CodexSession {
   const activity = getActivity(base.updatedAt);
+  const agent: AgentKind = isClaudeSessionPath(base.filePath) ? 'claude' : 'codex';
   let evaluation = base.evaluation;
   const shouldPromoteToDelete =
     !base.kept &&
@@ -436,8 +440,9 @@ function enrichSession(base: Omit<CodexSession, 'resumeCommand' | 'machineId' | 
   }
   return {
     ...base,
+    agent,
     evaluation,
-    resumeCommand: `codex resume ${base.id}`,
+    resumeCommand: agent === 'claude' ? `claude --resume ${base.id}` : `codex resume ${base.id}`,
     machineId: getMachineId(),
     ...activity,
   };
@@ -446,6 +451,7 @@ function enrichSession(base: Omit<CodexSession, 'resumeCommand' | 'machineId' | 
 export class SessionService {
   private codexHome = getCodexHome();
   private sessionsRoot = getSessionsRoot(this.codexHome);
+  private claudeProjectsRoot = getClaudeProjectsRoot();
   private store: CuratorStore;
 
   constructor(store: CuratorStore) {
@@ -457,10 +463,22 @@ export class SessionService {
       machineId: getMachineId(),
       codexHome: this.codexHome,
       sessionsRoot: this.sessionsRoot,
+      claudeProjectsRoot: this.claudeProjectsRoot,
       recycleRoot: getRecycleRoot(),
       recycleRetentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
       deleteMode: 'archive-then-local-clean',
     };
+  }
+
+  // Session files come from two roots: the Codex sessions root and the Claude
+  // Code projects root. Both hold *.jsonl transcripts; parseSessionFile detects
+  // the schema per file, so search / index / context-pack cover both agents.
+  private async discoverSessionFiles(): Promise<string[]> {
+    const [codexFiles, claudeFiles] = await Promise.all([
+      findJsonlFiles(this.sessionsRoot),
+      findJsonlFiles(this.claudeProjectsRoot),
+    ]);
+    return [...codexFiles, ...claudeFiles];
   }
 
   private async findSessionFilesByIds(ids: string[]): Promise<{
@@ -471,7 +489,7 @@ export class SessionService {
     const foundById = new Map<string, string>();
     if (!targetIds.size) return { found: [], missingIds: [] };
 
-    const files = await findJsonlFiles(this.sessionsRoot);
+    const files = await this.discoverSessionFiles();
     for (const filePath of files) {
       const id = extractSessionId(filePath);
       if (targetIds.has(id) && !foundById.has(id)) foundById.set(id, filePath);
@@ -484,7 +502,7 @@ export class SessionService {
 
   async listSessions(options: { refreshWorkflow?: boolean; fast?: boolean } = {}): Promise<CodexSession[]> {
     const state = await this.store.load();
-    const files = await findJsonlFiles(this.sessionsRoot);
+    const files = await this.discoverSessionFiles();
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const sessions: CodexSession[] = [];
     const parseQueue: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number }> = [];
@@ -1051,7 +1069,7 @@ export class SessionService {
 
   async backfillEvaluations(options: { limit?: number; includeFailed?: boolean } = {}) {
     const state = await this.store.load();
-    const files = await findJsonlFiles(this.sessionsRoot);
+    const files = await this.discoverSessionFiles();
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; updatedAt: string | null }> = [];
 

@@ -2,10 +2,12 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import type { HistoryMessage, ParsedMessage, SessionMessagesPage } from './types.js';
+import { isClaudeSessionPath } from './file-ops.js';
+import type { AgentKind, HistoryMessage, MessageRole, ParsedMessage, SessionMessagesPage } from './types.js';
 
 export interface ParsedSessionFile {
   id: string;
+  source: AgentKind;
   filePath: string;
   cwd: string | null;
   startedAt: string | null;
@@ -51,6 +53,33 @@ function normalizeMessageText(text: string, preserveWhitespace: boolean): string
   return preserveWhitespace ? text.trim() : normalizeText(text);
 }
 
+// Normalize a raw JSONL record from either agent into a role + content turn.
+// Codex uses `{ type: 'response_item', payload: { role, content } }`.
+// Claude Code uses `{ type: 'user' | 'assistant', message: { role, content } }`
+// with top-level cwd/timestamp; sidechain (sub-agent) and meta turns are skipped.
+function extractTurnFromRecord(
+  record: Record<string, unknown>,
+): { role: MessageRole; content: unknown; timestamp: string | null } | null {
+  const timestamp = typeof record.timestamp === 'string' ? record.timestamp : null;
+
+  if (record.type === 'response_item') {
+    const payload = record.payload as Record<string, unknown> | undefined;
+    const role = payload?.role;
+    if (role !== 'user' && role !== 'assistant') return null;
+    return { role, content: payload?.content, timestamp };
+  }
+
+  if (record.type === 'user' || record.type === 'assistant') {
+    if (record.isSidechain === true || record.isMeta === true) return null;
+    const message = record.message as Record<string, unknown> | undefined;
+    if (!message || typeof message !== 'object') return null;
+    const role = message.role === 'user' || message.role === 'assistant' ? message.role : record.type;
+    return { role, content: message.content, timestamp };
+  }
+
+  return null;
+}
+
 async function collectSessionMessages(input: {
   filePath: string;
   preserveWhitespace?: boolean;
@@ -70,18 +99,16 @@ async function collectSessionMessages(input: {
     } catch {
       continue;
     }
-    if (record.type !== 'response_item') continue;
-    const payload = record.payload as Record<string, unknown> | undefined;
-    const role = payload?.role;
-    if (role !== 'user' && role !== 'assistant') continue;
-    const text = textFromContent(payload?.content);
+    const turn = extractTurnFromRecord(record);
+    if (!turn) continue;
+    const text = textFromContent(turn.content);
     if (!text) continue;
 
     const current: HistoryMessage = {
       index: messageIndex,
-      role,
+      role: turn.role,
       text: normalizeMessageText(text, preserveWhitespace),
-      timestamp: typeof record.timestamp === 'string' ? record.timestamp : null,
+      timestamp: turn.timestamp,
     };
     messageIndex += 1;
 
@@ -170,6 +197,7 @@ export async function parseSessionMessages(input: {
 
 export async function parseSessionFile(filePath: string): Promise<ParsedSessionFile> {
   const fileStat = await stat(filePath);
+  const source: AgentKind = isClaudeSessionPath(filePath) ? 'claude' : 'codex';
   let id = extractSessionId(filePath);
   const stream = createReadStream(filePath, { encoding: 'utf8' });
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
@@ -195,6 +223,7 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
 
     const timestamp = typeof record.timestamp === 'string' ? record.timestamp : null;
     if (timestamp) updatedAt = timestamp;
+    if (!startedAt && timestamp) startedAt = timestamp;
 
     if (record.type === 'session_meta') {
       const payload = record.payload as Record<string, unknown> | undefined;
@@ -204,25 +233,29 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
       continue;
     }
 
-    if (record.type !== 'response_item') continue;
-    const payload = record.payload as Record<string, unknown> | undefined;
-    const role = payload?.role;
-    if (role !== 'user' && role !== 'assistant') continue;
+    // Claude Code carries the session id and cwd on each conversation record
+    // rather than in a dedicated meta line.
+    if (source === 'claude' && typeof record.sessionId === 'string') id = record.sessionId;
+    if (!cwd && typeof record.cwd === 'string') cwd = record.cwd;
 
-    const text = textFromContent(payload?.content);
+    const turn = extractTurnFromRecord(record);
+    if (!turn) continue;
+
+    const text = textFromContent(turn.content);
     if (!text) continue;
 
     messageCount += 1;
-    if (role === 'user') userTurns += 1;
-    if (role === 'assistant') assistantTurns += 1;
-    const message: ParsedMessage = { role, text: normalizeText(text), timestamp };
-    if (role === 'user') lastUserMessage = message;
-    if (role === 'assistant') lastAssistantMessage = message;
+    if (turn.role === 'user') userTurns += 1;
+    if (turn.role === 'assistant') assistantTurns += 1;
+    const message: ParsedMessage = { role: turn.role, text: normalizeText(text), timestamp };
+    if (turn.role === 'user') lastUserMessage = message;
+    if (turn.role === 'assistant') lastAssistantMessage = message;
     messages.push(message);
   }
 
   return {
     id,
+    source,
     filePath,
     cwd,
     startedAt,

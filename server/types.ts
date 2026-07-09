@@ -6,6 +6,10 @@ export type HermesRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'fail
 
 export type MessageRole = 'user' | 'assistant';
 
+// Which agent CLI produced a session. Codex sessions live under ~/.codex/sessions;
+// Claude Code sessions live under ~/.claude/projects. Derived from the file path.
+export type AgentKind = 'codex' | 'claude';
+
 export interface ParsedMessage {
   role: MessageRole;
   text: string;
@@ -98,6 +102,7 @@ export interface RemoteMachine {
 
 export interface CodexSession {
   id: string;
+  agent: AgentKind;
   filePath: string;
   cwd: string | null;
   startedAt: string | null;

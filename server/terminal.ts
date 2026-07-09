@@ -79,6 +79,12 @@ export function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
   return findCodexBin(env) ?? configured ?? 'codex';
 }
 
+export function getClaudeBin(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = process.env.CLAUDE_BIN || env.CLAUDE_BIN;
+  if (configured && canRunCommand(configured, env)) return configured;
+  return configured ?? 'claude';
+}
+
 function parseNullDelimitedEnv(raw: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const entry of raw.split('\0')) {

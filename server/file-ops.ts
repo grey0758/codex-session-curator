@@ -17,6 +17,22 @@ export function getSessionsRoot(codexHome: string): string {
   return join(codexHome, 'sessions');
 }
 
+export function getClaudeHome(): string {
+  return resolve(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'));
+}
+
+export function getClaudeProjectsRoot(claudeHome: string = getClaudeHome()): string {
+  return join(claudeHome, 'projects');
+}
+
+// A session file belongs to Claude Code when it lives under ~/.claude/projects.
+// Everything else (the Codex sessions root) is treated as a Codex session.
+export function isClaudeSessionPath(filePath: string): boolean {
+  const root = resolve(getClaudeProjectsRoot());
+  const child = resolve(filePath);
+  return child === root || child.startsWith(`${root}/`);
+}
+
 export function getShellSnapshotsRoot(codexHome: string): string {
   return join(codexHome, 'shell_snapshots');
 }
