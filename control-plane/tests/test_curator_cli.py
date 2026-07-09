@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import importlib.util
+import importlib.machinery
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+
+CLI_PATH = Path(__file__).resolve().parents[1] / "bin" / "curator"
+
+
+def load_cli():
+    loader = importlib.machinery.SourceFileLoader("curator_cli", str(CLI_PATH))
+    spec = importlib.util.spec_from_loader("curator_cli", loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CuratorCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = load_cli()
+
+    def test_env_file_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth.env"
+            path.write_text("CURATOR_ADMIN_TOKEN='secret-token'\nOTHER=value\n", encoding="utf-8")
+            self.assertEqual(self.cli.read_env_file(path)["CURATOR_ADMIN_TOKEN"], "secret-token")
+
+    def test_query_includes_token_without_printing_it(self) -> None:
+        old_token = os.environ.get("CURATOR_ADMIN_TOKEN")
+        old_base = os.environ.get("CURATOR_BASE_URL")
+        os.environ["CURATOR_ADMIN_TOKEN"] = "secret-token"
+        os.environ["CURATOR_BASE_URL"] = "http://example.test"
+        try:
+            url = self.cli.with_query("/api/test", {"q": "hello world"})
+        finally:
+            if old_token is None:
+                os.environ.pop("CURATOR_ADMIN_TOKEN", None)
+            else:
+                os.environ["CURATOR_ADMIN_TOKEN"] = old_token
+            if old_base is None:
+                os.environ.pop("CURATOR_BASE_URL", None)
+            else:
+                os.environ["CURATOR_BASE_URL"] = old_base
+        self.assertIn("admin_token=secret-token", url)
+        self.assertIn("q=hello+world", url)
+
+    def test_help_exits_cleanly(self) -> None:
+        with redirect_stdout(StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                self.cli.build_parser().parse_args(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+
+    def test_direct_action_start_payload(self) -> None:
+        args = self.cli.build_parser().parse_args([
+            "direct-action",
+            "start",
+            "--kind",
+            "direct-action",
+            "--goal",
+            "update CLI",
+            "--reason",
+            "control-plane maintenance",
+            "--scope",
+            "CLI and docs",
+            "--cwd",
+            "/tmp/control",
+            "--target-repo",
+            "/tmp/control",
+        ])
+
+        self.assertEqual(args.command, "direct-action")
+        self.assertEqual(args.direct_action_command, "start")
+        self.assertEqual(
+            self.cli.direct_action_start_body(args),
+            {
+                "kind": "direct-action",
+                "goal": "update CLI",
+                "reason": "control-plane maintenance",
+                "scope": "CLI and docs",
+                "cwd": "/tmp/control",
+                "targetRepo": "/tmp/control",
+            },
+        )
+
+    def test_direct_action_finish_payload_splits_csv_fields(self) -> None:
+        args = self.cli.build_parser().parse_args([
+            "direct-action",
+            "finish",
+            "act-123",
+            "--status",
+            "completed",
+            "--changed-files",
+            "AGENTS.md, bin/curator",
+            "--tests",
+            "python -m unittest tests/test_curator_cli.py",
+            "--verification",
+            "payload constructed, no service call",
+            "--follow-up",
+            "none",
+        ])
+
+        self.assertEqual(
+            self.cli.direct_action_finish_body(args),
+            {
+                "status": "completed",
+                "changedFiles": ["AGENTS.md", "bin/curator"],
+                "tests": ["python -m unittest tests/test_curator_cli.py"],
+                "verification": ["payload constructed", "no service call"],
+                "followUp": "none",
+            },
+        )
+
+    def test_direct_action_main_posts_expected_request(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"id": "act-123"}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "direct-action",
+                "finish",
+                "act-123",
+                "--status",
+                "blocked",
+                "--changed-files",
+                "bin/curator",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "PATCH",
+                    "/api/commander-actions/act-123",
+                    None,
+                    {"status": "blocked", "changedFiles": ["bin/curator"]},
+                )
+            ],
+        )
+
+    def test_direct_action_list_uses_collection_endpoint(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"actions": []}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main(["direct-action", "list"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("GET", "/api/commander-actions", None, None)])
+
+    def test_session_index_uses_hermes_index_endpoint(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"sessions": []}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main(["session-index", "curator", "--limit", "12", "--no-remote"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [("GET", "/api/hermes/session-index", {"q": "curator", "limit": 12, "remote": "0"}, None)],
+        )
+
+    def test_dispatch_payload_includes_project_context(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"status": "started"}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "dispatch",
+                "fix curator knowledge search",
+                "--cwd",
+                "/home/grey/work/codex-control-plane",
+                "--repo",
+                "/home/grey/data/apps/codex-session-curator",
+                "--limit",
+                "6",
+                "--no-remote",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "/api/hermes/dispatch",
+                    {"remote": "0"},
+                    {
+                        "query": "fix curator knowledge search",
+                        "cwd": "/home/grey/work/codex-control-plane",
+                        "repo": "/home/grey/data/apps/codex-session-curator",
+                        "limit": 6,
+                        "mode": "exec",
+                    },
+                )
+            ],
+        )
+
+    def test_knowledge_search_uses_expected_endpoint_and_params(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"results": []}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "knowledge-search",
+                "resume policy",
+                "--type",
+                "preference",
+                "--type",
+                "runbook",
+                "--project",
+                "codex-control-plane",
+                "--repo",
+                "/home/grey/work/codex-control-plane",
+                "--limit",
+                "7",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "GET",
+                    "/api/hermes/knowledge-search",
+                    {
+                        "q": "resume policy",
+                        "type": ["preference", "runbook"],
+                        "project": "codex-control-plane",
+                        "repo": "/home/grey/work/codex-control-plane",
+                        "limit": 7,
+                    },
+                    None,
+                )
+            ],
+        )
+
+    def test_context_pack_uses_expected_endpoint_and_params(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"context": ""}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "context-pack",
+                "CLI strategy",
+                "--cwd",
+                "/home/grey/work/codex-control-plane",
+                "--repo",
+                "/home/grey/work/codex-control-plane",
+                "--limit",
+                "9",
+                "--no-remote",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "GET",
+                    "/api/hermes/context-pack",
+                    {
+                        "q": "CLI strategy",
+                        "cwd": "/home/grey/work/codex-control-plane",
+                        "repo": "/home/grey/work/codex-control-plane",
+                        "limit": 9,
+                        "remote": "0",
+                    },
+                    None,
+                )
+            ],
+        )
+
+    def test_server_identity_list_uses_expected_endpoint(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"machines": []}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main(["server-identity", "list", "--include-deprecated"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [("GET", "/api/server-identity/machines", {"includeDeprecated": "1"}, None)],
+        )
+
+    def test_server_identity_patch_reads_json_payload(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"machine": {"alias": "jp001"}}
+
+        self.cli.request_json = fake_request_json
+        with patch("sys.stdin", StringIO('{"notes":"verified"}')), redirect_stdout(StringIO()):
+            exit_code = self.cli.main(["server-identity", "patch", "jp001"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "PATCH",
+                    "/api/server-identity/machines/jp001",
+                    None,
+                    {"notes": "verified"},
+                )
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

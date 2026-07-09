@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec /home/grey/work/agent-knowledge-stack/scripts/build_server_identity_sqlite.py "$@"

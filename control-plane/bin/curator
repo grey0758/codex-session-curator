@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""Small CLI wrapper for codex-session-curator control-plane APIs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_BASE_URL = "http://127.0.0.1:54177"
+DEFAULT_AUTH_FILE = Path.home() / ".config" / "codex-session-curator" / "auth.env"
+
+
+class CuratorError(RuntimeError):
+    pass
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip('"').strip("'")
+        values[key.strip()] = value
+    return values
+
+
+def get_admin_token() -> str | None:
+    if os.environ.get("CURATOR_ADMIN_TOKEN"):
+        return os.environ["CURATOR_ADMIN_TOKEN"]
+    return read_env_file(DEFAULT_AUTH_FILE).get("CURATOR_ADMIN_TOKEN")
+
+
+def base_url() -> str:
+    return os.environ.get("CURATOR_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def with_query(path: str, params: dict[str, Any] | None = None) -> str:
+    token = get_admin_token()
+    query: dict[str, Any] = {}
+    if params:
+        query.update({key: value for key, value in params.items() if value is not None})
+    if token:
+        query["admin_token"] = token
+    encoded = urllib.parse.urlencode(query, doseq=True)
+    return f"{base_url()}{path}{'?' + encoded if encoded else ''}"
+
+
+def request_json(method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> Any:
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(with_query(path, params), data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=float(os.environ.get("CURATOR_TIMEOUT", "60"))) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        raise CuratorError(f"HTTP {error.code}: {raw}") from error
+    except urllib.error.URLError as error:
+        raise CuratorError(f"request failed: {error.reason}") from error
+    except TimeoutError as error:
+        raise CuratorError("request timed out") from error
+
+
+def request_text(method: str, path: str, params: dict[str, Any] | None = None) -> str:
+    request = urllib.request.Request(with_query(path, params), headers={"Accept": "text/plain"}, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=float(os.environ.get("CURATOR_TIMEOUT", "60"))) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        raise CuratorError(f"HTTP {error.code}: {raw}") from error
+    except urllib.error.URLError as error:
+        raise CuratorError(f"request failed: {error.reason}") from error
+
+
+def print_json(data: Any) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def print_search(data: dict[str, Any]) -> None:
+    sessions = data.get("sessions") or []
+    print(f"query: {data.get('query', '')}")
+    print(f"count: {len(sessions)}")
+    for session in sessions:
+        title = session.get("title") or "(untitled)"
+        print()
+        print(f"- {title}")
+        print(f"  id: {session.get('id')}")
+        print(f"  machine: {session.get('machineId')}")
+        print(f"  cwd: {session.get('cwd') or 'unknown'}")
+        print(f"  score: {session.get('score')}")
+        print(f"  resume: {session.get('resumeCommand')}")
+        summary = (session.get("summary") or "").strip()
+        if summary:
+            print(f"  summary: {summary[:300]}")
+
+
+def print_job(data: dict[str, Any]) -> None:
+    job = data.get("job") or data
+    print(f"id: {job.get('id')}")
+    print(f"status: {job.get('status')}")
+    print(f"session: {job.get('sessionId')}")
+    print(f"machine: {job.get('machineId')}")
+    print(f"cwd: {job.get('cwd')}")
+    if job.get("exitCode") is not None:
+        print(f"exitCode: {job.get('exitCode')}")
+    tail = (job.get("outputTail") or "").strip()
+    if tail:
+        print()
+        print(tail[-4000:])
+
+
+def session_context_text(data: dict[str, Any]) -> str:
+    session = data.get("session") if isinstance(data.get("session"), dict) else data
+    evaluation = session.get("evaluation") if isinstance(session.get("evaluation"), dict) else {}
+    lines = [
+        f"# {evaluation.get('title') or session.get('title') or '(untitled)'}",
+        f"- id: {session.get('id')}",
+        f"- machine: {session.get('machineId')}",
+        f"- cwd: {session.get('cwd') or 'unknown'}",
+    ]
+    resume_command = session.get("resumeCommand")
+    if resume_command:
+        lines.append(f"- resume: {resume_command}")
+    recommendation = evaluation.get("recommendation")
+    if recommendation:
+        lines.append(f"- recommendation: {recommendation}")
+
+    summary = (evaluation.get("summary") or session.get("summary") or "").strip()
+    detailed = (evaluation.get("detailedSummary") or "").strip()
+    if summary:
+        lines.extend(["", summary])
+    if detailed and detailed != summary:
+        lines.extend(["", detailed])
+
+    history = data.get("history")
+    if isinstance(history, dict):
+        items = history.get("messages") or history.get("items") or []
+    elif isinstance(history, list):
+        items = history
+    else:
+        items = []
+    if items:
+        lines.append("")
+        lines.append("## Recent History")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role") or item.get("type") or "message"
+            text = str(item.get("text") or item.get("content") or item.get("message") or "").strip()
+            if not text:
+                continue
+            lines.append(f"- {role}: {text[:500]}")
+    return "\n".join(lines)
+
+
+def fetch_session_context(session_id: str, history_limit: int) -> dict[str, Any]:
+    quoted_id = urllib.parse.quote(session_id, safe="")
+    try:
+        return request_json("GET", f"/api/hermes/sessions/{quoted_id}/context", {"historyLimit": history_limit})
+    except CuratorError as error:
+        if "HTTP 410" not in str(error):
+            raise
+
+    context_source = "api-session"
+    try:
+        if history_limit <= 0:
+            raise CuratorError("skipping full session fetch for history-limit 0")
+        session = request_json("GET", f"/api/sessions/{quoted_id}")
+    except CuratorError as error:
+        session_error = error
+        index = request_json("GET", "/api/hermes/session-index", {"q": session_id, "limit": 10, "remote": "0"})
+        matches = [item for item in index.get("sessions", []) if item.get("id") == session_id]
+        if not matches:
+            raise session_error
+        item = matches[0]
+        session = {
+            "id": item.get("id"),
+            "machineId": item.get("machineId"),
+            "cwd": item.get("cwd"),
+            "resumeCommand": item.get("resumeCommand"),
+            "evaluation": {
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "recommendation": item.get("recommendation"),
+            },
+        }
+        context_source = "session-index-fallback"
+    data: dict[str, Any] = {"session": session, "contextSource": context_source, "contextText": session_context_text(session)}
+    if history_limit > 0:
+        try:
+            history = request_json("GET", f"/api/sessions/{quoted_id}/history", {"limit": history_limit})
+            data["history"] = history
+            data["contextText"] = session_context_text(data)
+        except CuratorError as history_error:
+            data["historyError"] = str(history_error)
+    return data
+
+
+def add_common_output_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true", help="print raw JSON response")
+
+
+def add_direct_action_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("direct-action", help="record Commander direct actions")
+    action_sub = p.add_subparsers(dest="direct_action_command", required=True)
+
+    start = action_sub.add_parser("start", help="start a direct-action record")
+    start.add_argument("--kind", choices=["self-repair", "direct-action", "manual-note"], required=True)
+    start.add_argument("--goal", required=True)
+    start.add_argument("--reason", required=True)
+    start.add_argument("--scope")
+    start.add_argument("--cwd")
+    start.add_argument("--target-repo")
+    add_common_output_flags(start)
+
+    finish = action_sub.add_parser("finish", help="finish a direct-action record")
+    finish.add_argument("action_id")
+    finish.add_argument("--status", choices=["completed", "failed", "blocked"], required=True)
+    finish.add_argument("--changed-files", help="comma-separated changed files")
+    finish.add_argument("--tests", help="comma-separated test commands or names")
+    finish.add_argument("--verification", help="comma-separated verification notes or commands")
+    finish.add_argument("--follow-up")
+    add_common_output_flags(finish)
+
+    list_actions = action_sub.add_parser("list", help="list direct-action records")
+    add_common_output_flags(list_actions)
+
+
+def add_server_identity_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("server-identity", help="read and update xiannai server identity facts through Curator API")
+    identity_sub = p.add_subparsers(dest="server_identity_command", required=True)
+
+    list_machines = identity_sub.add_parser("list", help="list machines")
+    list_machines.add_argument("--include-deprecated", action="store_true")
+
+    get_machine = identity_sub.add_parser("get", help="get a machine by alias")
+    get_machine.add_argument("alias")
+
+    upsert_machine = identity_sub.add_parser("upsert", help="insert or update a machine from JSON")
+    upsert_machine.add_argument("--file", default="-", help="JSON file to read, or '-' for stdin")
+
+    patch_machine = identity_sub.add_parser("patch", help="patch a machine from JSON")
+    patch_machine.add_argument("alias")
+    patch_machine.add_argument("--file", default="-", help="JSON file to read, or '-' for stdin")
+
+    export_inventory = identity_sub.add_parser("export", help="export machine inventory JSON")
+    export_inventory.add_argument("--include-deprecated", action="store_true")
+
+    ssh_config = identity_sub.add_parser("ssh-config", help="render OpenSSH config")
+    ssh_config.add_argument("--include-deprecated", action="store_true")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Control codex-session-curator from the Codex control plane.")
+    parser.add_argument("--base-url", help=f"Curator base URL, default {DEFAULT_BASE_URL}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("search", help="search indexed sessions")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("documents", help="search unified documents")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("session-index", help="list resumable session index entries")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("knowledge-search", help="search indexed durable knowledge")
+    p.add_argument("query")
+    p.add_argument("--type", action="append", help="filter by knowledge type; may be repeated")
+    p.add_argument("--project")
+    p.add_argument("--repo")
+    p.add_argument("--limit", type=int, default=20)
+    add_common_output_flags(p)
+
+    p = sub.add_parser("context-pack", help="build a compact context pack for a task")
+    p.add_argument("query")
+    p.add_argument("--cwd")
+    p.add_argument("--repo")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("context", help="read session context")
+    p.add_argument("session_id")
+    p.add_argument("--history-limit", type=int, default=20)
+    add_common_output_flags(p)
+
+    p = sub.add_parser("dispatch", help="select a matching session and start a Codex worker")
+    p.add_argument("query")
+    p.add_argument("--prompt")
+    p.add_argument("--session-id")
+    p.add_argument("--cwd")
+    p.add_argument("--repo")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--mode", choices=["exec", "pty"], default="exec")
+    p.add_argument("--model")
+    p.add_argument("--template", choices=["fix", "test", "deploy", "review", "migrate", "investigate"])
+    p.add_argument("--policy-profile", choices=["read_only", "code_edit", "test_only", "deploy_allowed", "dangerous_ops_allowed"])
+    p.add_argument("--require-confirmation-below-score", type=int)
+    p.add_argument("--supervisor", action="store_true")
+    p.add_argument("--auto-stop", action="store_true")
+    p.add_argument("--auto-retry", action="store_true")
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("resume", help="start a worker for a specific session")
+    p.add_argument("session_id")
+    p.add_argument("prompt")
+    p.add_argument("--mode", choices=["exec", "pty"], default="exec")
+    p.add_argument("--model")
+    p.add_argument("--template", choices=["fix", "test", "deploy", "review", "migrate", "investigate"])
+    p.add_argument("--policy-profile", choices=["read_only", "code_edit", "test_only", "deploy_allowed", "dangerous_ops_allowed"])
+    p.add_argument("--supervisor", action="store_true")
+    p.add_argument("--auto-stop", action="store_true")
+    p.add_argument("--auto-retry", action="store_true")
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("jobs", help="list local jobs")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("registry", help="list local and remote jobs")
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("job", help="inspect a job")
+    p.add_argument("job_id")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("events", help="read job events")
+    p.add_argument("job_id")
+    p.add_argument("--after-seq", type=int, default=0)
+    p.add_argument("--no-remote", action="store_true")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("outcome", help="read a job outcome")
+    p.add_argument("job_id")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("stop", help="stop a job")
+    p.add_argument("job_id")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("guide", help="send guidance to a running PTY job or record guidance on an exec job")
+    p.add_argument("job_id")
+    p.add_argument("text")
+    p.add_argument("--source", choices=["hermes", "supervisor", "api"], default="api")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("protocol", help="send a structured worker protocol command")
+    p.add_argument("job_id")
+    p.add_argument("kind", choices=["guide", "pause", "continue", "summarize", "handoff", "verify"])
+    p.add_argument("text", nargs="?")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("supervise", help="run one supervisor check for a job")
+    p.add_argument("job_id")
+    p.add_argument("--instruction")
+    p.add_argument("--auto-stop", action="store_true")
+    p.add_argument("--auto-retry", action="store_true")
+    p.add_argument("--semantic", action="store_true")
+    p.add_argument("--check-interval-ms", type=int)
+    p.add_argument("--stale-output-ms", type=int)
+    add_common_output_flags(p)
+
+    p = sub.add_parser("refresh", help="enqueue AI re-evaluation for a session")
+    p.add_argument("session_id")
+    add_common_output_flags(p)
+
+    add_direct_action_parser(sub)
+    add_server_identity_parser(sub)
+
+    return parser
+
+
+def supervisor_payload(args: argparse.Namespace) -> bool | dict[str, Any] | None:
+    if args.auto_stop or args.auto_retry:
+        return {"autoStop": args.auto_stop, "autoRetry": args.auto_retry}
+    return True if getattr(args, "supervisor", False) else None
+
+
+def dispatch_body(args: argparse.Namespace) -> dict[str, Any]:
+    body = {
+        "query": args.query,
+        "prompt": args.prompt,
+        "sessionId": args.session_id,
+        "cwd": args.cwd,
+        "repo": args.repo,
+        "limit": args.limit,
+        "mode": args.mode,
+        "model": args.model,
+        "template": args.template,
+        "policyProfile": args.policy_profile,
+        "requireConfirmationBelowScore": args.require_confirmation_below_score,
+        "supervisor": supervisor_payload(args),
+    }
+    return {key: value for key, value in body.items() if value is not None}
+
+
+def resume_body(args: argparse.Namespace) -> dict[str, Any]:
+    body = {
+        "sessionId": args.session_id,
+        "prompt": args.prompt,
+        "mode": args.mode,
+        "model": args.model,
+        "template": args.template,
+        "policyProfile": args.policy_profile,
+        "supervisor": supervisor_payload(args),
+    }
+    return {key: value for key, value in body.items() if value is not None}
+
+
+def csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def direct_action_start_body(args: argparse.Namespace) -> dict[str, Any]:
+    body = {
+        "kind": args.kind,
+        "goal": args.goal,
+        "reason": args.reason,
+        "scope": args.scope,
+        "cwd": args.cwd,
+        "targetRepo": args.target_repo,
+    }
+    return {key: value for key, value in body.items() if value is not None}
+
+
+def direct_action_finish_body(args: argparse.Namespace) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "status": args.status,
+        "changedFiles": csv_list(args.changed_files),
+        "tests": csv_list(args.tests),
+        "verification": csv_list(args.verification),
+        "followUp": args.follow_up,
+    }
+    return {key: value for key, value in body.items() if value not in (None, [])}
+
+
+def read_json_payload(path: str) -> dict[str, Any]:
+    try:
+        raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise CuratorError("JSON payload must be an object")
+        return payload
+    except (OSError, json.JSONDecodeError) as error:
+        raise CuratorError(f"invalid JSON payload: {error}") from error
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.base_url:
+        os.environ["CURATOR_BASE_URL"] = args.base_url
+
+    try:
+        if args.command == "search":
+            data = request_json("GET", "/api/hermes/search", {"q": args.query, "limit": args.limit, "remote": "0" if args.no_remote else None})
+            print_json(data) if args.json else print_search(data)
+        elif args.command == "documents":
+            data = request_json("GET", "/api/hermes/search-documents", {"q": args.query, "limit": args.limit, "remote": "0" if args.no_remote else None})
+            print_json(data)
+        elif args.command == "session-index":
+            data = request_json("GET", "/api/hermes/session-index", {"q": args.query, "limit": args.limit, "remote": "0" if args.no_remote else None})
+            print_json(data)
+        elif args.command == "knowledge-search":
+            data = request_json(
+                "GET",
+                "/api/hermes/knowledge-search",
+                {"q": args.query, "type": args.type, "project": args.project, "repo": args.repo, "limit": args.limit},
+            )
+            print_json(data)
+        elif args.command == "context-pack":
+            data = request_json(
+                "GET",
+                "/api/hermes/context-pack",
+                {
+                    "q": args.query,
+                    "cwd": args.cwd,
+                    "repo": args.repo,
+                    "limit": args.limit,
+                    "remote": "0" if args.no_remote else None,
+                },
+            )
+            print_json(data)
+        elif args.command == "context":
+            data = fetch_session_context(args.session_id, args.history_limit)
+            print_json(data) if args.json else print(data.get("contextText", ""))
+        elif args.command == "dispatch":
+            data = request_json("POST", "/api/hermes/dispatch", {"remote": "0" if args.no_remote else None}, dispatch_body(args))
+            print_json(data)
+        elif args.command == "resume":
+            data = request_json("POST", "/api/hermes/jobs/resume", {"remote": "0" if args.no_remote else None}, resume_body(args))
+            print_json(data)
+        elif args.command == "jobs":
+            data = request_json("GET", "/api/hermes/jobs")
+            print_json(data)
+        elif args.command == "registry":
+            data = request_json("GET", "/api/hermes/job-registry", {"remote": "0" if args.no_remote else None})
+            print_json(data)
+        elif args.command == "job":
+            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}")
+            print_json(data) if args.json else print_job(data)
+        elif args.command == "events":
+            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/events", {"afterSeq": args.after_seq, "remote": "0" if args.no_remote else None})
+            print_json(data)
+        elif args.command == "outcome":
+            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/outcome")
+            print_json(data)
+        elif args.command == "stop":
+            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/stop", body={})
+            print_json(data) if args.json else print_job(data)
+        elif args.command == "guide":
+            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/guidance", body={"text": args.text, "source": args.source})
+            print_json(data) if args.json else print_job(data)
+        elif args.command == "protocol":
+            body = {"kind": args.kind}
+            if args.text:
+                body["text"] = args.text
+            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/protocol", body=body)
+            print_json(data)
+        elif args.command == "supervise":
+            body = {
+                "instruction": args.instruction,
+                "autoStop": args.auto_stop or None,
+                "autoRetry": args.auto_retry or None,
+                "semantic": args.semantic or None,
+                "checkIntervalMs": args.check_interval_ms,
+                "staleOutputMs": args.stale_output_ms,
+            }
+            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/supervise", body={k: v for k, v in body.items() if v is not None})
+            print_json(data)
+        elif args.command == "refresh":
+            data = request_json("POST", f"/api/evaluations/{urllib.parse.quote(args.session_id, safe='')}/refresh", body={})
+            print_json(data)
+        elif args.command == "direct-action":
+            if args.direct_action_command == "start":
+                data = request_json("POST", "/api/commander-actions", body=direct_action_start_body(args))
+                print_json(data)
+            elif args.direct_action_command == "finish":
+                path = f"/api/commander-actions/{urllib.parse.quote(args.action_id, safe='')}"
+                data = request_json("PATCH", path, body=direct_action_finish_body(args))
+                print_json(data)
+            elif args.direct_action_command == "list":
+                data = request_json("GET", "/api/commander-actions")
+                print_json(data)
+            else:
+                parser.error(f"unknown direct-action command: {args.direct_action_command}")
+        elif args.command == "server-identity":
+            if args.server_identity_command == "list":
+                data = request_json(
+                    "GET",
+                    "/api/server-identity/machines",
+                    {"includeDeprecated": "1" if args.include_deprecated else None},
+                )
+                print_json(data)
+            elif args.server_identity_command == "get":
+                data = request_json("GET", f"/api/server-identity/machines/{urllib.parse.quote(args.alias, safe='')}")
+                print_json(data)
+            elif args.server_identity_command == "upsert":
+                data = request_json("POST", "/api/server-identity/machines", body=read_json_payload(args.file))
+                print_json(data)
+            elif args.server_identity_command == "patch":
+                data = request_json(
+                    "PATCH",
+                    f"/api/server-identity/machines/{urllib.parse.quote(args.alias, safe='')}",
+                    body=read_json_payload(args.file),
+                )
+                print_json(data)
+            elif args.server_identity_command == "export":
+                data = request_json(
+                    "POST",
+                    "/api/server-identity/export",
+                    body={"includeDeprecated": "1"} if args.include_deprecated else {},
+                )
+                print_json(data)
+            elif args.server_identity_command == "ssh-config":
+                text = request_text(
+                    "GET",
+                    "/api/server-identity/ssh-config",
+                    {"includeDeprecated": "1" if args.include_deprecated else None},
+                )
+                print(text, end="")
+            else:
+                parser.error(f"unknown server-identity command: {args.server_identity_command}")
+        else:
+            parser.error(f"unknown command: {args.command}")
+    except CuratorError as error:
+        print(f"curator: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

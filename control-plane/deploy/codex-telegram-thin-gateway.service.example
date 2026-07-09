@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex Telegram Thin Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grey
+WorkingDirectory=/home/grey/work/codex-control-plane/telegram-gateway
+Environment=NODE_ENV=production
+Environment=CODEX_CONTROL_PLANE_DIR=/home/grey/work/codex-control-plane
+Environment=CODEX_BIN=codex
+Environment=CODEX_MODEL=
+Environment=TELEGRAM_ALLOWED_USER_IDS=
+EnvironmentFile=-/etc/codex-control-plane/telegram-gateway.env
+ExecStart=/usr/bin/env node /home/grey/work/codex-control-plane/telegram-gateway/src/gateway.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

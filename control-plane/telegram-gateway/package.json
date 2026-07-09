@@ -1,0 +1,13 @@
+{
+  "name": "codex-telegram-thin-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin Telegram long-polling gateway for Codex Control Plane.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/gateway.mjs"
+  }
+}

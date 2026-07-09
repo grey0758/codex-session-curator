@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# claude-plane: thin Claude-native control-plane wrapper.
+#
+# Mirrors the common verbs of codex-control-plane's `bin/curator`, but maps them
+# onto Claude Code's native primitives (resumable sessions, per-project memory,
+# scheduled routines, headless workers) instead of an external Curator service.
+#
+# The richer primitives (in-session sub-agents, /schedule, workflows) are invoked
+# from inside a Claude session; this wrapper covers the shell-reachable verbs.
+set -euo pipefail
+
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECTS_DIR="$CLAUDE_HOME/projects"
+SKILLS_DIR="$CLAUDE_HOME/skills"
+
+usage() {
+  cat <<'EOF'
+Usage: claude-plane <command> [args]
+
+Claude-native control plane. Verbs are aligned with codex-control-plane/bin/curator.
+
+Commands:
+  sessions [limit]        List recent resumable Claude sessions (default 20)
+  resume [id]             Resume a session interactively (claude --resume [id])
+  continue                Resume the most recent conversation (claude --continue)
+  dispatch "<task>" [--repo DIR]
+                          Run a scoped headless worker (claude -p) in DIR (default: cwd)
+  memory                  Show shared panel memory/ and Claude auto-memory paths
+  skills                  List skills installed for Claude (~/.claude/skills)
+  schedule                How to create recurring routines (in-session /schedule)
+  doctor                  Check claude CLI, sessions dir, and skills are present
+  help                    Show this help
+
+Notes:
+  - resume/continue/dispatch shell out to the `claude` CLI; override with CLAUDE_BIN.
+  - dispatch uses headless mode (claude -p) as a worker; prefer in-session
+    sub-agents (Task/Agent tool) when you are already inside a Claude session.
+EOF
+}
+
+cmd_sessions() {
+  local limit="${1:-20}"
+  if [[ ! -d "$PROJECTS_DIR" ]]; then
+    echo "No sessions dir at $PROJECTS_DIR" >&2
+    return 0
+  fi
+  echo "Recent resumable sessions (newest first):"
+  # Each *.jsonl under projects/<sanitized-cwd>/ is one session transcript.
+  find "$PROJECTS_DIR" -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -n "$limit" \
+    | while read -r _ path; do
+        local proj sid
+        proj="$(basename "$(dirname "$path")")"
+        sid="$(basename "$path" .jsonl)"
+        printf '  %-45s %s\n' "$proj" "$sid"
+      done
+}
+
+cmd_resume() {
+  if [[ $# -ge 1 ]]; then
+    exec "$CLAUDE_BIN" --resume "$1"
+  fi
+  exec "$CLAUDE_BIN" --resume
+}
+
+cmd_continue() {
+  exec "$CLAUDE_BIN" --continue
+}
+
+cmd_dispatch() {
+  local task="" repo="$PWD"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) task="$1"; shift ;;
+    esac
+  done
+  if [[ -z "$task" ]]; then
+    echo "dispatch requires a task string" >&2
+    exit 2
+  fi
+  if [[ ! -d "$repo" ]]; then
+    echo "target repo not found: $repo" >&2
+    exit 2
+  fi
+  echo "Dispatching headless worker in: $repo" >&2
+  ( cd "$repo" && exec "$CLAUDE_BIN" -p "$task" )
+}
+
+cmd_memory() {
+  local shared here_auto
+  shared="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/memory"
+  echo "Shared panel memory (committed):"
+  echo "  $shared"
+  [[ -d "$shared" ]] && ls -1 "$shared" | sed 's/^/    /'
+  echo "Claude per-project auto-memory (local):"
+  echo "  $PROJECTS_DIR/<sanitized-cwd>/memory/"
+}
+
+cmd_skills() {
+  if [[ ! -d "$SKILLS_DIR" ]]; then
+    echo "No skills installed at $SKILLS_DIR" >&2
+    return 0
+  fi
+  echo "Skills installed for Claude ($SKILLS_DIR):"
+  ls -1 "$SKILLS_DIR" | sed 's/^/  /'
+}
+
+cmd_schedule() {
+  cat <<'EOF'
+Recurring / scheduled work is a native Claude primitive, created in-session:
+
+  /schedule        create, list, or run scheduled cloud routines (cron)
+  /loop <interval> <prompt|/command>   poll or repeat on an interval
+
+These are not shell CLIs; open a Claude session and use the slash commands.
+EOF
+}
+
+cmd_doctor() {
+  local ok=0
+  if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    echo "OK   claude CLI: $(command -v "$CLAUDE_BIN")"
+  else
+    echo "MISS claude CLI not found (set CLAUDE_BIN)"; ok=1
+  fi
+  if [[ -d "$PROJECTS_DIR" ]]; then
+    echo "OK   sessions dir: $PROJECTS_DIR ($(find "$PROJECTS_DIR" -name '*.jsonl' 2>/dev/null | wc -l) transcripts)"
+  else
+    echo "MISS sessions dir: $PROJECTS_DIR"; ok=1
+  fi
+  if [[ -d "$SKILLS_DIR" ]]; then
+    echo "OK   skills dir: $SKILLS_DIR ($(ls -1 "$SKILLS_DIR" 2>/dev/null | wc -l) skills)"
+  else
+    echo "MISS skills dir: $SKILLS_DIR"; ok=1
+  fi
+  return $ok
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    sessions) cmd_sessions "$@" ;;
+    resume)   cmd_resume "$@" ;;
+    continue) cmd_continue "$@" ;;
+    dispatch) cmd_dispatch "$@" ;;
+    memory)   cmd_memory "$@" ;;
+    skills)   cmd_skills "$@" ;;
+    schedule) cmd_schedule "$@" ;;
+    doctor)   cmd_doctor "$@" ;;
+    -h|--help|help) usage ;;
+    *) echo "Unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
