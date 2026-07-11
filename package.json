@@ -10,11 +10,12 @@
     "test:codex-worker": "node --import tsx --test tests/codex-worker.e2e.test.ts",
     "test:hermes-dispatch": "node --import tsx --test tests/hermes-dispatch.e2e.test.ts",
     "test:server-identity": "node --import tsx --test tests/server-identity-api.test.ts",
+    "test:store": "node --import tsx --test tests/store-concurrency.test.ts",
+    "verify:panel-browser": "node scripts/verify-panel-browser-e2e.mjs",
     "verify:terminal-browser": "node scripts/verify-terminal-browser-e2e.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "test:server-identity": "node --import tsx --test tests/server-identity-api.test.ts"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@fastify/compress": "^8.3.1",

@@ -129,6 +129,13 @@ function getActivity(updatedAt: string | null): { activityStatus: ActivityStatus
   };
 }
 
+export function sessionBackfillSortTimeMs(input: { cachedUpdatedAt?: string | null; fileMtimeMs: number }): number {
+  const cachedTime = input.cachedUpdatedAt ? Date.parse(input.cachedUpdatedAt) : Number.NaN;
+  const validCachedTime = Number.isFinite(cachedTime) ? cachedTime : 0;
+  const validFileTime = Number.isFinite(input.fileMtimeMs) ? input.fileMtimeMs : 0;
+  return Math.max(validCachedTime, validFileTime);
+}
+
 function getCodexBin(): string {
   return process.env.CODEX_BIN || 'codex';
 }
@@ -709,7 +716,7 @@ export class SessionService {
   }
 
   async getSessionHistory(id: string, options: { limit?: number; beforeIndex?: number | null } = {}) {
-    const session = await this.getSession(id);
+    const session = await this.getSessionFast(id);
     if (!session) throw new Error(`Session not found: ${id}`);
     return parseSessionHistory({
       filePath: session.filePath,
@@ -974,14 +981,12 @@ export class SessionService {
     return null;
   }
 
-  async setKept(id: string, kept: boolean): Promise<CodexSession | null> {
+  async setKept(id: string, kept: boolean): Promise<void> {
     await this.store.setKept(id, kept);
-    return this.getSession(id);
   }
 
-  async setTitle(id: string, title: string): Promise<CodexSession | null> {
+  async setTitle(id: string, title: string): Promise<void> {
     await this.store.setTitle(id, title);
-    return this.getSession(id);
   }
 
   async deleteSession(id: string): Promise<{
@@ -1071,7 +1076,7 @@ export class SessionService {
     const state = await this.store.load();
     const files = await this.discoverSessionFiles();
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
-    const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; updatedAt: string | null }> = [];
+    const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; sortTimeMs: number }> = [];
 
     for (const filePath of files) {
       try {
@@ -1089,14 +1094,23 @@ export class SessionService {
           (options.includeFailed === true && cached.status === 'failed') ||
           !hasCachedMetadata(cached);
         if (!needsBackfill) continue;
-        candidates.push({ filePath, id, bytes: fileStat.size, mtimeMs: fileStat.mtimeMs, updatedAt: cached?.updatedAt ?? null });
+        candidates.push({
+          filePath,
+          id,
+          bytes: fileStat.size,
+          mtimeMs: fileStat.mtimeMs,
+          sortTimeMs: sessionBackfillSortTimeMs({
+            cachedUpdatedAt: cached?.updatedAt ?? null,
+            fileMtimeMs: fileStat.mtimeMs,
+          }),
+        });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
         console.warn('[SessionService] Skipping unreadable session file:', filePath, error);
       }
     }
 
-    candidates.sort((a, b) => Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? ''));
+    candidates.sort((a, b) => b.sortTimeMs - a.sortTimeMs || b.filePath.localeCompare(a.filePath));
     const limit = Math.max(1, Math.min(200, Math.floor(options.limit ?? 8)));
     const batch = candidates.slice(0, limit);
     let stateChanged = false;

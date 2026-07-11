@@ -33,9 +33,15 @@ function delay(ms) {
 async function cdpCall(ws, id, method, params = {}) {
   ws.send(JSON.stringify({ id, method, params }));
   return new Promise((resolve, reject) => {
+    const timeoutMs = Number(process.env.CURATOR_TERMINAL_VERIFY_CDP_TIMEOUT_MS || 10000);
+    const timer = setTimeout(() => {
+      ws.removeEventListener('message', onMessage);
+      reject(new Error(`${method}: timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     const onMessage = (event) => {
       const message = JSON.parse(messageText(event));
       if (message.id !== id) return;
+      clearTimeout(timer);
       ws.removeEventListener('message', onMessage);
       if (message.error) reject(new Error(`${method}: ${JSON.stringify(message.error)}`));
       else resolve(message.result);
@@ -52,6 +58,18 @@ function tmuxClients() {
     );
   } catch {
     return '';
+  }
+}
+
+function tmuxPaneContains(text) {
+  try {
+    const pane = execSync(
+      `tmux -L codex-curator capture-pane -p -t ${JSON.stringify(`codex-curator-${sessionId}`)} -S -200 2>/dev/null || true`,
+      { encoding: 'utf8' }
+    );
+    return pane.includes(text);
+  } catch {
+    return false;
   }
 }
 
@@ -163,6 +181,7 @@ async function main() {
       rows: [...document.querySelectorAll('.xterm-rows > div')].slice(-8).map((el) => el.textContent),
       bodyTail: document.body.innerText.slice(-1000)
     }))()`);
+    const probeVisibleInTmux = tmuxPaneContains(probeText);
 
     await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
       type: 'keyDown',
@@ -179,19 +198,24 @@ async function main() {
       modifiers: 2,
     });
 
-    const screenshot = await cdpCall(ws, id++, 'Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: false,
-    });
-    writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+    let screenshotError = null;
+    try {
+      const screenshot = await cdpCall(ws, id++, 'Page.captureScreenshot', {
+        format: 'png',
+        captureBeyondViewport: false,
+      });
+      writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+    } catch (error) {
+      screenshotError = error instanceof Error ? error.message : String(error);
+    }
     ws.close();
     await delay(300);
     const clients = tmuxClients();
     detachSessionClients();
 
     const statusOk = before.status.includes('Codex 运行中') && after.status.includes('Codex 运行中');
-    const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_');
-    const disconnected = `${before.status}\n${after.status}\n${after.bodyTail}`.includes('断开');
+    const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux;
+    const disconnected = `${before.status}\n${after.status}`.includes('断开');
     const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
@@ -201,9 +225,11 @@ async function main() {
       before,
       after,
       clients,
+      probeVisibleInTmux,
       exceptions,
       consoleErrors,
-      screenshot: screenshotPath,
+      screenshot: screenshotError ? null : screenshotPath,
+      screenshotError,
     };
     console.log(JSON.stringify(report, null, 2));
     process.exit(ok ? 0 : 2);

@@ -11,9 +11,18 @@ function serverIdentityCliPath(): string {
   return process.env.CURATOR_SERVER_IDENTITY_CLI || DEFAULT_SERVER_IDENTITY_CLI;
 }
 
+function serverIdentityGlobalArgs(): string[] {
+  const args: string[] = [];
+  const inventory = process.env.SERVER_IDENTITY_INVENTORY || process.env.CURATOR_SERVER_IDENTITY_INVENTORY;
+  const db = process.env.SERVER_IDENTITY_DB || process.env.CURATOR_SERVER_IDENTITY_DB;
+  if (inventory?.trim()) args.push('--inventory', inventory.trim());
+  if (db?.trim()) args.push('--db', db.trim());
+  return args;
+}
+
 function runServerIdentityCli(args: string[], input?: string): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(serverIdentityCliPath(), args, {
+    const child = spawn(serverIdentityCliPath(), [...serverIdentityGlobalArgs(), ...args], {
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });

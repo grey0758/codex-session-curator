@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,6 +65,7 @@ async function stopServer(server: ChildProcessWithoutNullStreams): Promise<void>
 test('server identity API can upsert, patch, export, and render SSH config', async () => {
   const testRoot = await mkdtemp(join(tmpdir(), 'curator-server-identity-api-'));
   const codexHome = join(testRoot, 'codex-home');
+  const inventoryPath = join(testRoot, 'server-identity.yaml');
   const dbPath = join(testRoot, 'server-identity.sqlite3');
   const port = 56_000 + Math.floor(Math.random() * 2000);
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -72,6 +73,7 @@ test('server identity API can upsert, patch, export, and render SSH config', asy
   let server: ChildProcessWithoutNullStreams | null = null;
 
   await mkdir(codexHome, { recursive: true });
+  await writeFile(inventoryPath, 'version: 1\nmachines: []\n', 'utf8');
 
   try {
     server = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
@@ -81,6 +83,7 @@ test('server identity API can upsert, patch, export, and render SSH config', asy
         CODEX_HOME: codexHome,
         CODEX_CURATOR_STATE: join(codexHome, 'session-curator-state.json'),
         CURATOR_SERVER_IDENTITY_CLI: serverIdentityCli,
+        SERVER_IDENTITY_INVENTORY: inventoryPath,
         SERVER_IDENTITY_DB: dbPath,
         CURATOR_REMOTE_AGENTS: '',
         CURATOR_AUTO_BACKFILL: '0',

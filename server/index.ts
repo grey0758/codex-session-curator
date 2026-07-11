@@ -28,7 +28,13 @@ import {
 import { SessionService } from './session-service.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
-import type { CodexSession, CommanderAction, KnowledgeItem, KnowledgeItemType } from './types.js';
+import type {
+  CodexSession,
+  CommanderAction,
+  KnowledgeItem,
+  KnowledgeItemType,
+  PersistedState,
+} from './types.js';
 import {
   exportServerIdentityInventory,
   getServerIdentityMachine,
@@ -352,6 +358,16 @@ function toSessionSummary(session: SessionListItem) {
       reviewSignals: (session.evaluation.reviewSignals ?? []).slice(0, 3),
       remoteMachines: session.evaluation.remoteMachines.slice(0, 3),
     },
+  };
+}
+
+function applyPanelSessionState<T extends CodexSession>(session: T, state: PersistedState): T {
+  const customTitle = state.titles[session.id] ?? session.customTitle ?? null;
+  return {
+    ...session,
+    title: customTitle || session.title,
+    customTitle,
+    kept: state.keptIds.includes(session.id),
   };
 }
 
@@ -1325,6 +1341,11 @@ async function getLocalSessionsCached(refreshWorkflow: boolean, fast: boolean) {
   return localSessionsCache.promise;
 }
 
+async function findLocalSessionCached(sessionId: string) {
+  const sessions = await getLocalSessionsCached(false, true);
+  return sessions.find((session) => session.id === sessionId) ?? null;
+}
+
 async function getRemoteSessionsCached() {
   if (!remoteAgents.length) return [];
   if (remoteSessionCacheTtlMs <= 0) return (await Promise.all(remoteAgents.map((agent) => fetchAgentSessions(agent)))).flat();
@@ -1351,26 +1372,15 @@ async function findRemoteSession(
   sessionId: string,
   preferredMachineId?: string | null
 ): Promise<{ agent: (typeof remoteAgents)[number]; session: CodexSession } | null> {
+  const sessions = await getRemoteSessionsCached();
   for (const agent of orderedRemoteAgents(preferredMachineId)) {
-    try {
-      const payload = await fetchAgentJson<{ sessions?: CodexSession[] }>(
-        agent,
-        `/api/hermes/session-index?q=${encodeURIComponent(sessionId)}&limit=10&remote=0`
-      );
-      const session = (payload.sessions ?? []).find((candidate) => candidate.id === sessionId);
-      if (!session) continue;
-      return { agent, session: { ...session, machineId: session.machineId || agent.id } };
-    } catch {
-      // Try the next remote agent.
-    }
+    const session = sessions.find(
+      (candidate) => candidate.id === sessionId && (!candidate.machineId || candidate.machineId === agent.id)
+    );
+    if (!session) continue;
+    return { agent, session: { ...session, machineId: session.machineId || agent.id } };
   }
   return null;
-}
-
-function shouldPreferRemoteSession(localSession: CodexSession | null, remoteSession: CodexSession): boolean {
-  if (!localSession) return true;
-  const localMachineId = service.getMeta().machineId;
-  return Boolean(remoteSession.machineId && remoteSession.machineId !== localMachineId);
 }
 
 async function fetchRemoteJobRegistryCached(agent: (typeof remoteAgents)[number]): Promise<{
@@ -2303,12 +2313,6 @@ app.get('/api/hermes/sessions/:id/context', async (request, reply) => {
   return { session, history, contextText };
 });
 
-app.get('/api/hermes/sessions/:id/context', async (_request, reply) => {
-  return reply.code(410).send({
-    error: 'Hermes session context endpoint has been retired. Use /api/codex/sessions/:id/context.',
-  });
-});
-
 app.post('/api/hermes/jobs/resume', async (request, reply) => {
   const body = resumeJobSchema.parse(request.body ?? {});
   const query = remoteControlSchema.parse(request.query);
@@ -2836,7 +2840,8 @@ app.get('/api/sessions', async (request) => {
   const remoteSessions = refreshWorkflow || !includeRemote
     ? []
     : await getRemoteSessionsCached();
-  const sessions = [...localSessions, ...remoteSessions];
+  const panelState = await store.load();
+  const sessions = [...localSessions, ...remoteSessions].map((session) => applyPanelSessionState(session, panelState));
   const filtered = sessions.filter((session) => {
     const matchesRecommendation =
       !query.recommendation ||
@@ -2867,47 +2872,57 @@ app.get('/api/remote-agents', async () => ({
 
 app.get('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const panelState = await store.load();
+  const session = await findLocalSessionCached(params.id);
+  if (session) return applyPanelSessionState(session, panelState);
   const remote = await findRemoteSession(params.id);
-  if (remote && shouldPreferRemoteSession(null, remote.session)) return remote.session;
-  const fastSession = await service.getSessionFast(params.id);
-  const session = fastSession ? (await service.getSession(params.id)) ?? fastSession : null;
-  if (!session) return reply.code(404).send({ error: 'Session not found' });
-  return session;
+  if (remote) return applyPanelSessionState(remote.session, panelState);
+  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.get('/api/sessions/:id/files', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionFilesQuerySchema.parse(request.query);
-  const remote = await findRemoteSession(params.id);
-  if (remote && shouldPreferRemoteSession(null, remote.session)) {
+  const session = await findLocalSessionCached(params.id);
+  if (session) {
     try {
-      return await listRemoteSessionWorkdir(remote.session, query.path);
+      return await listSessionWorkdir(session, query.path);
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list remote session cwd' });
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list session cwd' });
     }
   }
-  const session = await service.getSessionFast(params.id);
-  if (remote && shouldPreferRemoteSession(session, remote.session)) {
-    try {
-      return await listRemoteSessionWorkdir(remote.session, query.path);
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list remote session cwd' });
-    }
-  }
-  if (!session) return reply.code(404).send({ error: 'Session not found' });
 
-  try {
-    return await listSessionWorkdir(session, query.path);
-  } catch (error) {
-    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list session cwd' });
+  const remote = await findRemoteSession(params.id);
+  if (remote) {
+    try {
+      return await listRemoteSessionWorkdir(remote.session, query.path);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list remote session cwd' });
+    }
   }
+  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.get('/api/sessions/:id/files/download', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionFilesQuerySchema.parse(request.query);
+  const session = await findLocalSessionCached(params.id);
+  if (session) {
+    try {
+      const { targetReal } = await resolveSessionWorkdirPath(session, query.path);
+      const targetStat = await stat(targetReal);
+      if (!targetStat.isFile()) return reply.code(400).send({ error: 'Path is not a file' });
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Length', String(targetStat.size));
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(basename(targetReal))}"`);
+      return reply.send(createReadStream(targetReal));
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to download file' });
+    }
+  }
+
   const remote = await findRemoteSession(params.id);
-  if (remote && shouldPreferRemoteSession(null, remote.session)) {
+  if (remote) {
     try {
       const file = await statRemoteSessionFile(remote.session, query.path);
       const child = spawnRemoteFileDownload(file.target, remote.session, query.path);
@@ -2921,20 +2936,7 @@ app.get('/api/sessions/:id/files/download', async (request, reply) => {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to download remote file' });
     }
   }
-  const session = await service.getSessionFast(params.id);
-  if (!session) return reply.code(404).send({ error: 'Session not found on this agent' });
-
-  try {
-    const { targetReal } = await resolveSessionWorkdirPath(session, query.path);
-    const targetStat = await stat(targetReal);
-    if (!targetStat.isFile()) return reply.code(400).send({ error: 'Path is not a file' });
-    reply.header('Content-Type', 'application/octet-stream');
-    reply.header('Content-Length', String(targetStat.size));
-    reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(basename(targetReal))}"`);
-    return reply.send(createReadStream(targetReal));
-  } catch (error) {
-    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to download file' });
-  }
+  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, async (request, reply) => {
@@ -2942,8 +2944,31 @@ app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, asy
   const query = sessionFileUploadQuerySchema.parse(request.query);
   const body = request.body;
   if (!Buffer.isBuffer(body)) return reply.code(400).send({ error: 'Expected application/octet-stream upload body' });
+  const session = await findLocalSessionCached(params.id);
+  if (session) {
+    try {
+      const overwrite = query.overwrite === '1' || query.overwrite === 'true';
+      const { target, directoryReal, relativePath } = await resolveSessionUploadPath(session, query.path, query.name);
+      await mkdir(directoryReal, { recursive: true });
+      await writeFile(target, body, { flag: overwrite ? 'w' : 'wx' });
+      const uploaded = await stat(target);
+      return {
+        ok: true,
+        entry: {
+          name: basename(target),
+          path: fileEntryPath(relativePath, basename(target)),
+          type: 'file',
+          size: uploaded.size,
+          mtime: uploaded.mtime.toISOString(),
+        },
+      };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to upload file' });
+    }
+  }
+
   const remote = await findRemoteSession(params.id);
-  if (remote && shouldPreferRemoteSession(null, remote.session)) {
+  if (remote) {
     try {
       const overwrite = query.overwrite === '1' || query.overwrite === 'true';
       return await uploadRemoteSessionFile(remote.session, query.path, query.name, overwrite, body);
@@ -2951,29 +2976,7 @@ app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, asy
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to upload remote file' });
     }
   }
-
-  const session = await service.getSessionFast(params.id);
-  if (!session) return reply.code(404).send({ error: 'Session not found on this agent' });
-
-  try {
-    const overwrite = query.overwrite === '1' || query.overwrite === 'true';
-    const { target, directoryReal, relativePath } = await resolveSessionUploadPath(session, query.path, query.name);
-    await mkdir(directoryReal, { recursive: true });
-    await writeFile(target, body, { flag: overwrite ? 'w' : 'wx' });
-    const uploaded = await stat(target);
-    return {
-      ok: true,
-      entry: {
-        name: basename(target),
-        path: fileEntryPath(relativePath, basename(target)),
-        type: 'file',
-        size: uploaded.size,
-        mtime: uploaded.mtime.toISOString(),
-      },
-    };
-  } catch (error) {
-    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to upload file' });
-  }
+  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.get('/api/sessions/:id/history', async (request, reply) => {
@@ -3049,9 +3052,9 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
       rows: z.coerce.number().int().min(12).max(160).optional(),
     })
     .parse(request.query);
-  const remote = await findRemoteSession(params.id);
-  if (remote && shouldPreferRemoteSession(null, remote.session)) {
-    const terminal = startCodexTerminal(remote.session, (message) => {
+  const session = await findLocalSessionCached(params.id);
+  if (session) {
+    const terminal = startCodexTerminal(session, (message) => {
       if (socket.readyState === 1) socket.send(JSON.stringify(message));
     }, query);
     socket.on('message', (raw: { toString(): string }) => {
@@ -3065,15 +3068,15 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
     socket.on('error', () => terminal.close());
     return;
   }
-  const session = await service.getSessionFast(params.id);
-  const terminalSession = remote && shouldPreferRemoteSession(session, remote.session) ? remote.session : session;
-  if (!terminalSession) {
+
+  const remote = await findRemoteSession(params.id);
+  if (!remote) {
     socket.send(JSON.stringify({ type: 'error', data: 'Session not found' }));
     socket.close();
     return;
   }
 
-  const terminal = startCodexTerminal(terminalSession, (message) => {
+  const terminal = startCodexTerminal(remote.session, (message) => {
     if (socket.readyState === 1) socket.send(JSON.stringify(message));
   }, query);
 
@@ -3116,22 +3119,20 @@ app.delete('/api/recycle-bin/:id', async (request, reply) => {
   }
 });
 
-app.post('/api/sessions/:id/keep', async (request, reply) => {
+app.post('/api/sessions/:id/keep', async (request) => {
   const params = sessionIdSchema.parse(request.params);
   const body = keepSchema.parse(request.body);
-  const session = await service.setKept(params.id, body.kept);
-  if (!session) return reply.code(404).send({ error: 'Session not found' });
+  await service.setKept(params.id, body.kept);
   clearSessionCaches();
-  return session;
+  return { id: params.id, kept: body.kept };
 });
 
-app.post('/api/sessions/:id/title', async (request, reply) => {
+app.post('/api/sessions/:id/title', async (request) => {
   const params = sessionIdSchema.parse(request.params);
   const body = titleSchema.parse(request.body);
-  const session = await service.setTitle(params.id, body.title);
-  if (!session) return reply.code(404).send({ error: 'Session not found' });
+  await service.setTitle(params.id, body.title);
   clearSessionCaches();
-  return session;
+  return { id: params.id, title: body.title.trim().slice(0, 120) };
 });
 
 app.post('/api/sessions/:id/migrate', async (request, reply) => {

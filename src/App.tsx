@@ -249,18 +249,11 @@ interface HistoryPayload {
   totalMessages?: number;
 }
 
-type EvaluationRefreshJobStatus = 'queued' | 'running' | 'completed' | 'failed';
-
-interface EvaluationRefreshJob {
-  id: string;
-  sessionId: string;
-  reason: string;
-  status: EvaluationRefreshJobStatus;
-  createdAt: string;
-  startedAt: string | null;
-  completedAt: string | null;
-  result: { title?: string; status?: string; error?: string } | null;
-  error: string | null;
+interface RecentUserMessagesState {
+  sessionId: string | null;
+  messages: HistoryMessage[];
+  loading: boolean;
+  error: boolean;
 }
 
 interface CodexWorkerGuidance {
@@ -489,8 +482,6 @@ interface RemoteAgentStatus {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
 
-const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
 interface TerminalSessionTarget {
   id: string;
   machineId: string;
@@ -674,22 +665,6 @@ const recommendationTone: Record<Recommendation, string> = {
   delete: 'tone-delete',
 };
 
-const aiRefreshLabel: Record<AiRefreshStatus, string> = {
-  never: '未重算',
-  pending: '待 AI 重算',
-  running: 'AI 重算中',
-  ok: '已 AI 重算',
-  failed: '重算失败',
-};
-
-const aiRefreshTone: Record<AiRefreshStatus, string> = {
-  never: 'tone-review',
-  pending: 'tone-review',
-  running: 'tone-review',
-  ok: 'tone-keep',
-  failed: 'tone-delete',
-};
-
 const workerStatusLabel: Record<string, string> = {
   running: '运行中',
   completed: '已完成',
@@ -731,6 +706,21 @@ const supervisorDecisionTone: Record<string, string> = {
   failed: 'tone-delete',
 };
 
+const commanderActionKindLabel: Record<string, string> = {
+  'direct-action': 'direct action',
+  'self-repair': 'self repair',
+  'manual-note': 'manual note',
+};
+
+const commanderActionStatusTone: Record<string, string> = {
+  completed: 'tone-keep',
+  ok: 'tone-keep',
+  failed: 'tone-delete',
+  error: 'tone-delete',
+  running: 'tone-review',
+  pending: 'tone-review',
+};
+
 const cadenceLabel: Record<UpdateCadence, string> = {
   new: '新会话',
   quiet: '无新增',
@@ -756,6 +746,57 @@ function formatDate(value: string | null): string {
     hour: '2-digit',
     minute: '2-digit',
   }).format(date);
+}
+
+function RecentUserMessageCard({ sessionId, message }: { sessionId: string; message: HistoryMessage }) {
+  const textRef = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(message.text.length > 240);
+
+  useEffect(() => {
+    if (expanded || !textRef.current) return;
+    const element = textRef.current;
+    let frame = 0;
+    const measure = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        setCanExpand(message.text.length > 240 || element.scrollHeight > element.clientHeight + 1);
+      });
+    };
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(element);
+    return () => {
+      observer?.disconnect();
+      window.cancelAnimationFrame(frame);
+    };
+  }, [expanded, message.text]);
+
+  return (
+    <article
+      className={expanded ? 'expanded' : undefined}
+      data-recent-user-message
+      data-role="user"
+      data-session-id={sessionId}
+    >
+      <span>用户发送</span>
+      <p className="recent-message-text" ref={textRef}>{message.text}</p>
+      <div className="recent-message-footer">
+        {message.timestamp ? <em>{formatDate(message.timestamp)}</em> : <span />}
+        {canExpand ? (
+          <button
+            type="button"
+            className="recent-message-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((current) => !current)}
+          >
+            <ChevronDown size={15} />
+            {expanded ? '收起' : '展开'}
+          </button>
+        ) : null}
+      </div>
+    </article>
+  );
 }
 
 function previewText(message: SessionMessagePreview | null, fallback = '暂无记录'): string {
@@ -814,6 +855,10 @@ function formatUnknownValue(value: unknown): string {
 
 function workerJobTime(job: CodexWorkerJob): number {
   return Date.parse(job.updatedAt ?? job.startedAt ?? '') || 0;
+}
+
+function commanderActionTime(action: CommanderAction): number {
+  return Date.parse(action.completedAt ?? action.startedAt ?? '') || 0;
 }
 
 function isWorkerJobRunning(job: CodexWorkerJob): boolean {
@@ -1552,6 +1597,12 @@ function App() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
+  const [recentUserMessages, setRecentUserMessages] = useState<RecentUserMessagesState>({
+    sessionId: null,
+    messages: [],
+    loading: false,
+    error: false,
+  });
   const [recycleQuery, setRecycleQuery] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
@@ -1593,6 +1644,26 @@ function App() {
       setRemoteStatuses(payload.agents);
     } catch {
       setRemoteStatuses((current) => current.map((agent) => ({ ...agent, online: false, error: '状态刷新失败', latencyMs: null })));
+    }
+  }, []);
+
+  const loadCommanderActions = useCallback(async () => {
+    setCommanderActionsLoading(true);
+    setCommanderActionsError(null);
+    try {
+      const response = await fetch('/api/commander-actions');
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      const payload = (await response.json().catch(() => ({}))) as { actions?: CommanderAction[]; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      const actions = Array.isArray(payload.actions) ? payload.actions : [];
+      setCommanderActions([...actions].sort((a, b) => commanderActionTime(b) - commanderActionTime(a)));
+    } catch (err) {
+      setCommanderActionsError(err instanceof Error ? err.message : 'commander actions 加载失败');
+    } finally {
+      setCommanderActionsLoading(false);
     }
   }, []);
 
@@ -1872,7 +1943,7 @@ function App() {
         await loadTerminalOnlySession();
         return;
       }
-      await loadSessions();
+      await Promise.all([loadSessions(), loadCommanderActions()]);
     } catch (err) {
       setAuthMessage(err instanceof Error ? err.message : '登录失败');
     } finally {
@@ -1886,16 +1957,17 @@ function App() {
     setAllSessions([]);
     setSessionDetails({});
     setRecycleArchives([]);
+    setCommanderActions([]);
     setSelectedId(null);
   }
 
   useEffect(() => {
     if (isTerminalOnlyPage || isFilesOnlyPage) return;
     const handle = window.setTimeout(() => {
-      void loadSessions();
+      void Promise.all([loadSessions(), loadCommanderActions()]);
     }, 150);
     return () => window.clearTimeout(handle);
-  }, [isFilesOnlyPage, isTerminalOnlyPage, loadSessions]);
+  }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadSessions]);
 
   useEffect(() => {
     if (!terminalOnlySessionId || authRequired) return;
@@ -1967,8 +2039,6 @@ function App() {
     [selectedId, visibleSessions]
   );
   const selected = selectedSummary ? (sessionDetails[selectedSummary.id] ?? selectedSummary) : null;
-  const selectedAiRefreshStatus: AiRefreshStatus = selected?.evaluation.hermesRefreshStatus
-    ?? (selected?.evaluation.hermesNeedsRefresh ? 'pending' : 'never');
   const visibleSessionIds = useMemo(() => visibleSessions.map((session) => session.id), [visibleSessions]);
   const selectedIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectedVisibleCount = useMemo(
@@ -2094,6 +2164,7 @@ function App() {
   const currentWorkerGuidanceDraft = currentWorkerJob ? (workerGuidanceDrafts[currentWorkerJob.id] ?? '') : '';
   const currentWorkerSupervisorDraft = currentWorkerJob ? (workerSupervisorDrafts[currentWorkerJob.id] ?? '') : '';
   const currentWorkerSupervisorAutoStop = currentWorkerJob ? (workerSupervisorAutoStop[currentWorkerJob.id] ?? false) : false;
+  const recentCommanderActions = useMemo(() => commanderActions.slice(0, 8), [commanderActions]);
   const jobRegistryMachines = useMemo(() => {
     const machines = new Map<string, CodexJobRegistryHealth & { runningJobs: number; totalJobs: number }>();
     const localMachineId = jobRegistryMachineId ?? 'local';
@@ -2287,6 +2358,48 @@ function App() {
   }, [activeTab, selected?.id]);
 
   useEffect(() => {
+    if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedSummary?.id) {
+      const resetHandle = window.setTimeout(() => {
+        setRecentUserMessages({ sessionId: null, messages: [], loading: false, error: false });
+      }, 0);
+      return () => window.clearTimeout(resetHandle);
+    }
+
+    const sessionId = selectedSummary.id;
+    const controller = new AbortController();
+    let cancelled = false;
+    const loadingHandle = window.setTimeout(() => {
+      if (!cancelled) setRecentUserMessages({ sessionId, messages: [], loading: true, error: false });
+    }, 0);
+
+    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history?limit=200`, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<HistoryPayload>;
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        window.clearTimeout(loadingHandle);
+        const messages = payload.messages
+          .filter((message) => message.role === 'user')
+          .slice(-4)
+          .reverse();
+        setRecentUserMessages({ sessionId, messages, loading: false, error: false });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        window.clearTimeout(loadingHandle);
+        setRecentUserMessages({ sessionId, messages: [], loading: false, error: true });
+      });
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(loadingHandle);
+      controller.abort();
+    };
+  }, [activeTab, isTerminalOnlyPage, selectedSummary?.bytes, selectedSummary?.id, selectedSummary?.updatedAt]);
+
+  useEffect(() => {
     if (!selectedSummary || activeTab === 'recycle' || sessionDetails[selectedSummary.id]) return;
     let cancelled = false;
     void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}`)
@@ -2332,7 +2445,11 @@ function App() {
         body: JSON.stringify({ kept }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await loadSessions();
+      setAllSessions((current) => current.map((item) => (item.id === session.id ? { ...item, kept } : item)));
+      setSessionDetails((current) => {
+        const detail = current[session.id];
+        return detail ? { ...current, [session.id]: { ...detail, kept } } : current;
+      });
     } finally {
       setBusyId(null);
     }
@@ -2442,49 +2559,6 @@ function App() {
       await loadSessions(true);
     } catch (err) {
       setActionMessage(`摘要重试失败：${err instanceof Error ? err.message : '未知错误'}`);
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function refreshSessionEvaluation(session: CodexSession) {
-    setBusyId(`${session.id}:refresh-evaluation`);
-    setActionMessage(null);
-    try {
-      const response = await fetch(`/api/evaluations/${session.id}/refresh`, { method: 'POST' });
-      const payload = (await response.json()) as { job?: EvaluationRefreshJob; title?: string; status?: string; error?: string };
-      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      await loadSessions();
-
-      if (!payload.job) {
-        setActionMessage(`已重算当前会话：${payload.title ?? session.title}`);
-        return;
-      }
-
-      let job = payload.job;
-      setActionMessage(`已加入 AI 重算队列：${session.title}`);
-      for (let attempt = 0; attempt < 120; attempt += 1) {
-        if (job.status === 'completed' || job.status === 'failed') break;
-        await sleep(job.status === 'queued' ? 1200 : 2000);
-        const jobResponse = await fetch(`/api/evaluations/refresh-jobs/${job.id}`);
-        const jobPayload = (await jobResponse.json()) as { job?: EvaluationRefreshJob; error?: string };
-        if (!jobResponse.ok || !jobPayload.job) throw new Error(jobPayload.error || `HTTP ${jobResponse.status}`);
-        job = jobPayload.job;
-        if (attempt % 3 === 0) {
-          setActionMessage(job.status === 'queued' ? 'AI 重算排队中...' : 'AI 重算正在后台运行...');
-          await loadSessions();
-        }
-      }
-      await loadSessions(true);
-      if (job.status === 'completed') {
-        setActionMessage(`已重算当前会话：${job.result?.title ?? session.title}`);
-      } else if (job.status === 'failed') {
-        throw new Error(job.error || job.result?.error || 'AI 重算失败');
-      } else {
-        setActionMessage('AI 重算仍在后台运行，稍后刷新面板查看结果。');
-      }
-    } catch (err) {
-      setActionMessage(`当前会话重算失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
@@ -2801,7 +2875,7 @@ function App() {
                 </div>
               ))
             : groupedSessions.map((group) => {
-                const collapsed = collapsedGroups[group.key] ?? true;
+                const collapsed = query.trim() ? false : collapsedGroups[group.key] ?? true;
                 const groupIds = group.sessions.map((session) => session.id);
                 const selectedInGroup = groupIds.filter((id) => selectedIdSet.has(id)).length;
                 const groupChecked = selectedInGroup === groupIds.length && groupIds.length > 0;
@@ -2838,6 +2912,7 @@ function App() {
                       : group.sessions.map((session) => (
                           <div
                             key={session.id}
+                            data-session-id={session.id}
                             className={`session-row ${selected?.id === session.id ? 'selected' : ''}`}
                             onClick={() => setSelectedId(session.id)}
                             onKeyDown={(event) => {
@@ -2901,7 +2976,7 @@ function App() {
                 </button>
               </>
             ) : null}
-            <button type="button" className="icon-button" title="刷新" onClick={() => void loadSessions()}>
+            <button type="button" className="icon-button" title="刷新" onClick={() => void Promise.all([loadSessions(), loadCommanderActions()])}>
               <RefreshCw size={18} />
             </button>
             <button
@@ -3094,34 +3169,33 @@ function App() {
             <section className="primary-panel">
               <div className="panel-heading">
                 <h3>最近对话</h3>
-                <span className={`status-pill ${aiRefreshTone[selectedAiRefreshStatus]}`}>
-                  {selectedAiRefreshStatus === 'running' ? <Loader2 size={14} className="spin" /> : null}
-                  {aiRefreshLabel[selectedAiRefreshStatus]}
-                </span>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={
-                    busyId === `${selected.id}:refresh-evaluation` ||
-                    selectedAiRefreshStatus === 'running'
-                  }
-                  onClick={() => void refreshSessionEvaluation(selected)}
-                >
-                  <Sparkles size={16} />
-                  重算当前
-                </button>
               </div>
-              <div className="recent-dialogue">
-                <article>
-                  <span>用户最后发送</span>
-                  <p>{previewText(selected.lastUserMessage)}</p>
-                  {selected.lastUserMessage?.timestamp ? <em>{formatDate(selected.lastUserMessage.timestamp)}</em> : null}
-                </article>
-                <article>
-                  <span>Agent 最后回复</span>
-                  <p>{previewText(selected.lastAssistantMessage)}</p>
-                  {selected.lastAssistantMessage?.timestamp ? <em>{formatDate(selected.lastAssistantMessage.timestamp)}</em> : null}
-                </article>
+              <div
+                className="recent-dialogue"
+                data-session-id={selected.id}
+                aria-busy={recentUserMessages.sessionId !== selected.id || recentUserMessages.loading}
+              >
+                {recentUserMessages.sessionId === selected.id
+                  ? recentUserMessages.messages.map((message) => (
+                      <RecentUserMessageCard
+                        key={`${selected.id}:${message.index}`}
+                        sessionId={selected.id}
+                        message={message}
+                      />
+                    ))
+                  : null}
+                {recentUserMessages.sessionId !== selected.id || recentUserMessages.loading ? (
+                  <div className="empty compact">正在读取最近用户消息...</div>
+                ) : null}
+                {recentUserMessages.sessionId === selected.id && !recentUserMessages.loading && recentUserMessages.error ? (
+                  <div className="empty compact">最近用户消息读取失败</div>
+                ) : null}
+                {recentUserMessages.sessionId === selected.id &&
+                !recentUserMessages.loading &&
+                !recentUserMessages.error &&
+                !recentUserMessages.messages.length ? (
+                  <div className="empty compact">暂无用户消息</div>
+                ) : null}
               </div>
               <div className="workflow">
                 <Sparkles size={16} />

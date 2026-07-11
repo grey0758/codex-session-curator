@@ -105,7 +105,7 @@ create_release() {
     --exclude 'session-recycle-bin' \
     "$RUNTIME_DIR/" "$release/"
   rsync -a --delete "$SOURCE_DIR/dist/" "$release/dist/"
-  rsync -a "$SOURCE_DIR/server/terminal.ts" "$release/server/terminal.ts"
+  rsync -a --delete "$SOURCE_DIR/server/" "$release/server/"
   ln -s "$RUNTIME_DIR/node_modules" "$release/node_modules"
   printf '%s\n' "$stamp" > "$release/RELEASE_ID"
   printf '%s\n' "$release"

@@ -198,4 +198,5 @@ export interface PersistedState {
   deletedIds: string[];
   titles: Record<string, string>;
   evaluations: Record<string, StoredEvaluation>;
+  commanderActions: Record<string, CommanderAction>;
 }
