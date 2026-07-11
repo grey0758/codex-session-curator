@@ -14,7 +14,8 @@ const sshTarget = process.env.CURATOR_TERMINAL_VERIFY_SSH_TARGET || '';
 const sshCommand = process.env.CURATOR_TERMINAL_VERIFY_SSH_COMMAND || 'ssh';
 const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
 const tmuxSession = `${agent}-curator-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)}`;
-const probeText = `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
+const probeText = process.env.CURATOR_TERMINAL_VERIFY_PROBE || `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
+const submitProbe = process.env.CURATOR_TERMINAL_VERIFY_SUBMIT === '1';
 
 function readAdminToken() {
   const authEnv = readFileSync(join(homedir(), '.config/codex-session-curator/auth.env'), 'utf8');
@@ -33,6 +34,27 @@ function messageText(event) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForSessionMarker(token) {
+  if (!submitProbe) return false;
+  const deadline = Date.now() + Number(process.env.CURATOR_TERMINAL_VERIFY_SUBMIT_WAIT_MS || 45000);
+  while (Date.now() < deadline) {
+    try {
+      const url = new URL(`/api/sessions/${encodeURIComponent(sessionId)}`, baseUrl);
+      url.searchParams.set('admin_token', token);
+      url.searchParams.set('ts', String(Date.now()));
+      const response = await fetch(url);
+      if (response.ok) {
+        const session = await response.json();
+        if (session.lastUserMessage?.text?.includes(probeText)) return true;
+      }
+    } catch {
+      // Retry while the remote session cache and transcript update settle.
+    }
+    await delay(2000);
+  }
+  return false;
 }
 
 async function cdpCall(ws, id, method, params = {}) {
@@ -139,6 +161,10 @@ async function main() {
     let id = 1;
     const exceptions = [];
     const consoleErrors = [];
+    let probeFrameSent = false;
+    const probeInputFrames = [];
+    const inputFrameMeta = [];
+    const terminalEvents = [];
     ws.addEventListener('message', (event) => {
       const message = JSON.parse(messageText(event));
       if (message.method === 'Runtime.exceptionThrown') {
@@ -147,10 +173,60 @@ async function main() {
       if (message.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(message.params.type)) {
         consoleErrors.push(message.params.args.map((arg) => arg.value || arg.description || '').join(' '));
       }
+      if (message.method === 'Network.webSocketFrameSent') {
+        const payloadData = message.params.response?.payloadData || '';
+        probeFrameSent ||= payloadData.includes(probeText);
+        try {
+          const input = JSON.parse(payloadData);
+          if (input.type === 'input' && typeof input.data === 'string') {
+            inputFrameMeta.push({
+              length: input.data.length,
+              hasCr: input.data.includes('\r'),
+              hasLf: input.data.includes('\n'),
+              firstCode: input.data.length ? input.data.charCodeAt(0) : null,
+              lastCode: input.data.length ? input.data.charCodeAt(input.data.length - 1) : null,
+            });
+          }
+        } catch {
+          // Ignore non-JSON WebSocket frames.
+        }
+        if (payloadData.includes(probeText)) {
+          try {
+            const input = JSON.parse(payloadData);
+            const data = typeof input.data === 'string' ? input.data : '';
+            probeInputFrames.push({
+              type: input.type ?? null,
+              length: data.length,
+              hasCr: data.includes('\r'),
+              hasLf: data.includes('\n'),
+              firstCode: data.length ? data.charCodeAt(0) : null,
+              lastCode: data.length ? data.charCodeAt(data.length - 1) : null,
+            });
+          } catch {
+            probeInputFrames.push({ type: 'unparsed', length: payloadData.length });
+          }
+        }
+      }
+      if (message.method === 'Network.webSocketFrameReceived') {
+        try {
+          const terminalEvent = JSON.parse(message.params.response?.payloadData || '{}');
+          if (['ready', 'error', 'exit'].includes(terminalEvent.type)) {
+            terminalEvents.push({
+              type: terminalEvent.type,
+              code: terminalEvent.code ?? null,
+              signal: terminalEvent.signal ?? null,
+              data: terminalEvent.type === 'error' ? terminalEvent.data : undefined,
+            });
+          }
+        } catch {
+          // Ignore non-JSON WebSocket frames.
+        }
+      }
     });
 
     await cdpCall(ws, id++, 'Runtime.enable');
     await cdpCall(ws, id++, 'Page.enable');
+    await cdpCall(ws, id++, 'Network.enable');
     await delay(Number(process.env.CURATOR_TERMINAL_VERIFY_WAIT_MS || 9000));
 
     async function evaluate(expression) {
@@ -180,8 +256,39 @@ async function main() {
     })()`);
 
     await evaluate(`document.querySelector('.xterm-helper-textarea')?.focus(); true`);
+    if (process.env.CURATOR_TERMINAL_VERIFY_ESCAPE_FIRST === '1') {
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27,
+      });
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27,
+      });
+      await delay(600);
+    }
     await cdpCall(ws, id++, 'Input.insertText', { text: probeText });
-    await delay(1800);
+    if (submitProbe) {
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Enter',
+        code: 'Enter',
+        windowsVirtualKeyCode: 13,
+        text: '\r',
+        unmodifiedText: '\r',
+      });
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: 'Enter',
+        code: 'Enter',
+        windowsVirtualKeyCode: 13,
+      });
+    }
+    await delay(Number(process.env.CURATOR_TERMINAL_VERIFY_INPUT_WAIT_MS || 1800));
 
     const after = await evaluate(`(() => ({
       status: document.querySelector('.terminal-toolbar span')?.textContent || '',
@@ -190,21 +297,24 @@ async function main() {
       bodyTail: document.body.innerText.slice(-1000)
     }))()`);
     const probeVisibleInTmux = tmuxPaneContains(probeText);
+    const submittedMarkerRecorded = await waitForSessionMarker(token);
 
-    await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
-      type: 'keyDown',
-      key: 'u',
-      code: 'KeyU',
-      windowsVirtualKeyCode: 85,
-      modifiers: 2,
-    });
-    await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
-      type: 'keyUp',
-      key: 'u',
-      code: 'KeyU',
-      windowsVirtualKeyCode: 85,
-      modifiers: 2,
-    });
+    if (!submitProbe) {
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'u',
+        code: 'KeyU',
+        windowsVirtualKeyCode: 85,
+        modifiers: 2,
+      });
+      await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: 'u',
+        code: 'KeyU',
+        windowsVirtualKeyCode: 85,
+        modifiers: 2,
+      });
+    }
 
     let screenshotError = null;
     try {
@@ -223,7 +333,7 @@ async function main() {
 
     const expectedStatus = `${agent === 'claude' ? 'Claude' : 'Codex'} 运行中`;
     const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);
-    const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux;
+    const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux || submittedMarkerRecorded;
     const disconnected = `${before.status}\n${after.status}`.includes('断开');
     const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
@@ -238,6 +348,11 @@ async function main() {
       after,
       clients,
       probeVisibleInTmux,
+      submittedMarkerRecorded,
+      probeFrameSent,
+      probeInputFrames,
+      inputFrameMeta,
+      terminalEvents,
       exceptions,
       consoleErrors,
       screenshot: screenshotError ? null : screenshotPath,
