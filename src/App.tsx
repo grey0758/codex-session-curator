@@ -40,6 +40,7 @@ type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
 type SessionListViewMode = 'folder' | 'activityDate';
 type AiRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
 type MessageRole = 'user' | 'assistant';
+type AgentKind = 'codex' | 'claude';
 type CodexWorkerJobStatus = 'running' | 'completed' | 'failed' | 'stopped' | string;
 type CodexWorkerMode = 'exec' | 'pty' | string;
 type WorkerProtocolKind = 'guide' | 'pause' | 'continue' | 'summarize' | 'handoff' | 'verify';
@@ -91,6 +92,7 @@ interface SessionMessagePreview {
 
 interface CodexSession {
   id: string;
+  agent: AgentKind;
   filePath: string;
   cwd: string | null;
   startedAt: string | null;
@@ -117,6 +119,7 @@ interface CodexSession {
 interface ApiPayload {
   meta: {
     codexHome: string;
+    claudeProjectsRoot?: string;
     sessionsRoot: string;
     recycleRoot: string;
     recycleRetentionDays: number;
@@ -207,6 +210,7 @@ function normalizeSession(raw: unknown): CodexSession {
   return {
     ...session,
     id,
+    agent: session.agent === 'claude' ? 'claude' : 'codex',
     filePath: session.filePath ?? '',
     cwd: session.cwd ?? null,
     startedAt: session.startedAt ?? null,
@@ -384,6 +388,7 @@ interface KnowledgeItemResult {
 
 interface ContextPackSession {
   id: string;
+  agent: AgentKind;
   title: string;
   machineId: string;
   cwd: string | null;
@@ -484,6 +489,7 @@ type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-runni
 
 interface TerminalSessionTarget {
   id: string;
+  agent?: AgentKind;
   machineId: string;
   cwd: string | null;
   title?: string;
@@ -531,8 +537,12 @@ const terminalStatusLabel: Record<TerminalStatus, string> = {
   disconnected: '断开',
   connecting: '连接中',
   connected: '已连接',
-  'codex-running': 'Codex 运行中',
+  'codex-running': 'Agent 运行中',
 };
+
+function agentLabel(agent: AgentKind | null | undefined): string {
+  return agent === 'claude' ? 'Claude' : 'Codex';
+}
 
 const MACHINE_FILTER_STORAGE_KEY = 'codex-session-curator:last-machine-filter';
 
@@ -579,6 +589,7 @@ function filesPageUrl(sessionId: string): string {
 function terminalPlaceholderSession(sessionId: string): TerminalSessionTarget {
   return {
     id: sessionId,
+    agent: 'codex',
     machineId: 'unknown',
     cwd: null,
     title: `SSH 终端 ${sessionId}`,
@@ -897,8 +908,8 @@ function LoginPanel({ busy, message, onLogin }: LoginPanelProps) {
             <KeyRound size={22} />
           </div>
           <div>
-            <h1>Codex Session Curator</h1>
-            <p>整理、检索和归档本机 Codex 会话</p>
+            <h1>Agent Session Curator</h1>
+            <p>整理、检索和归档 Codex / Claude 会话</p>
           </div>
         </div>
         <form className="login-form" onSubmit={submit}>
@@ -963,6 +974,7 @@ function matchesSearch(session: CodexSession, query: string): boolean {
     session.resumeCommand,
     session.cwd ?? '',
     session.machineId,
+    session.agent,
     session.lastUserMessage?.text ?? '',
     session.lastAssistantMessage?.text ?? '',
     session.evaluation.summary,
@@ -1377,7 +1389,9 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   return (
     <div className={`terminal-panel${fullscreen ? ' fullscreen' : ''}${active ? '' : ' inactive'}`}>
       <div className="terminal-toolbar">
-        <span>SSH 终端代理 · {terminalStatusLabel[terminalStatus]}</span>
+        <span>
+          SSH 终端代理 · {terminalStatus === 'codex-running' ? `${agentLabel(session.agent)} 运行中` : terminalStatusLabel[terminalStatus]}
+        </span>
         <button
           type="button"
           className="icon-button terminal-icon-button"
@@ -2745,8 +2759,8 @@ function App() {
             <KeyRound size={22} />
           </div>
           <div>
-            <h1>Codex 会话清理服务</h1>
-            <p>评估、保留、删除本机记录</p>
+            <h1>Agent 会话清理服务</h1>
+            <p>评估、保留、删除 Codex / Claude 记录</p>
           </div>
         </div>
 
@@ -2847,7 +2861,7 @@ function App() {
           {loading ? (
             <div className="empty">
               <Loader2 className="spin" size={22} />
-              扫描并评估本机 Codex 会话
+              扫描并评估本机 Codex / Claude 会话
             </div>
           ) : null}
           {!loading && activeTab !== 'recycle' && visibleSessions.length === 0 ? <div className="empty">没有匹配的会话</div> : null}
@@ -2946,7 +2960,7 @@ function App() {
                               </span>
                             </span>
                             <span className="session-time">
-                              {session.kept ? '已保留 · ' : ''}
+                              {agentLabel(session.agent)} · {session.kept ? '已保留 · ' : ''}
                               {session.activityStatus === 'active' ? '活跃' : '非活跃'} · {formatDate(session.updatedAt)}
                             </span>
                           </div>
@@ -2960,7 +2974,7 @@ function App() {
       <section className="detail">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Local Codex Records</p>
+            <p className="eyebrow">Local Codex / Claude Records</p>
             <h2>{selected ? selected.title : '未选择会话'}</h2>
           </div>
           <div className="topbar-actions">
@@ -3080,6 +3094,7 @@ function App() {
                 <span className={`status-pill ${recommendationTone[selected.evaluation.recommendation]}`}>
                   {recommendationLabel[selected.evaluation.recommendation]}
                 </span>
+                <span className="status-pill">{agentLabel(selected.agent)}</span>
                 <span className="score">score {selected.evaluation.score}</span>
                 <span className={`activity ${selected.activityStatus}`}>
                   {selected.activityStatus === 'active' ? '三天内活跃' : `非活跃${selected.inactiveDays ?? '?'}天`}
@@ -3313,7 +3328,7 @@ function App() {
                       </div>
                       <div className="context-pack-card">
                         <span>sessions</span>
-                        <p>{contextPack.sessions.map((session) => `${session.title} · ${session.canResume ? 'resume' : 'no resume'}`).slice(0, 5).join('\n') || 'none'}</p>
+                        <p>{contextPack.sessions.map((session) => `${agentLabel(session.agent)} · ${session.title} · ${session.canResume ? 'resume' : 'no resume'}`).slice(0, 5).join('\n') || 'none'}</p>
                       </div>
                     </div>
                   ) : null}
@@ -3394,7 +3409,7 @@ function App() {
             <section className="primary-panel worker-console">
               <div className="panel-heading worker-heading">
                 <div>
-                  <h3>Codex Worker 控制台</h3>
+                  <h3>{agentLabel(selected.agent)} Worker 控制台</h3>
                   <span>{selectedWorkerJobs.length ? `当前会话 ${selectedWorkerJobs.length} 个 job` : '当前会话暂无 job'}</span>
                 </div>
                 <div className="worker-heading-actions">
@@ -3803,7 +3818,7 @@ function App() {
               <div className="history-list" aria-busy={historyLoading}>
                 {historyMessages.map((message) => (
                   <div className={`history-message ${message.role}`} key={message.index}>
-                    <span>{message.role === 'user' ? '用户' : 'Codex'} · {formatDate(message.timestamp)}</span>
+                    <span>{message.role === 'user' ? '用户' : agentLabel(selected.agent)} · {formatDate(message.timestamp)}</span>
                     <p>{message.text}</p>
                   </div>
                 ))}
@@ -3966,11 +3981,12 @@ function App() {
             </section>
           </div>
         ) : (
-          <div className="blank-state">没有可显示的 Codex 会话</div>
+          <div className="blank-state">没有可显示的 Codex / Claude 会话</div>
         )}
 
         <footer className="footer">
           <span>Codex home: {meta?.codexHome ?? 'loading'}</span>
+          <span>Claude projects: {meta?.claudeProjectsRoot ?? 'loading'}</span>
           <span>回收站: {meta?.recycleRoot ?? 'loading'} · {meta?.recycleRetentionDays ?? 30}天</span>
           <span>删除模式: {meta?.deleteMode ?? 'archive-then-local-clean'}</span>
         </footer>

@@ -1,8 +1,9 @@
 import { basename } from 'node:path';
-import type { CommanderAction } from './types.js';
+import type { AgentKind, CommanderAction } from './types.js';
 
 export interface ContextPackSession {
   id: string;
+  agent: AgentKind;
   title: string;
   machineId: string;
   cwd: string | null;
@@ -144,7 +145,7 @@ export function buildWorkerPromptContext(input: ContextPackInput & {
   newSessionReason: string | null;
 }): string {
   const lines = [
-    'Context pack for Codex dispatch:',
+    'Context pack for agent dispatch:',
     `- Current task is highest priority: ${input.query || '(empty query)'}`,
     '- Historical sessions, commander actions, job outcomes, and knowledge items are only location/reference context.',
     '- Prefer resuming an indexed matching session when recommendedResume is present and confidence is sufficient.',
@@ -162,7 +163,7 @@ export function buildWorkerPromptContext(input: ContextPackInput & {
       : '- Runbooks: none found in matched knowledge.',
     input.sessions.length ? '- Relevant sessions:' : '- Relevant sessions: none.',
     ...input.sessions.slice(0, input.limit).map((session, index) =>
-      `  ${index + 1}. ${session.title} [${session.id}] cwd=${session.cwd ?? 'unknown'} resume=${session.resumeCommand} tech=${shortList(session.techStack, 8)}`
+      `  ${index + 1}. ${session.title} [${session.agent}:${session.id}] cwd=${session.cwd ?? 'unknown'} resume=${session.resumeCommand} tech=${shortList(session.techStack, 8)}`
     ),
     input.commanderActions.length ? '- Relevant commander actions:' : '- Relevant commander actions: none.',
     ...input.commanderActions.slice(0, Math.min(input.limit, 8)).map((action, index) =>

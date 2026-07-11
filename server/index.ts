@@ -729,6 +729,7 @@ function toHermesSession(session: SessionListItem, query = '') {
     session.evaluation.hermesRefreshStatus ?? (session.evaluation.hermesNeedsRefresh ? 'pending' : 'never');
   return {
     id: session.id,
+    agent: session.agent,
     title: session.title,
     summary: session.evaluation.summary,
     detailedSummary: session.evaluation.detailedSummary,
@@ -750,7 +751,11 @@ function toHermesSession(session: SessionListItem, query = '') {
     machineId: session.machineId,
     updatedAt: session.updatedAt,
     activityStatus: session.activityStatus,
-    resumeCommand: session.cwd ? `codex resume -C ${session.cwd} ${session.id}` : session.resumeCommand,
+    resumeCommand: session.agent === 'claude'
+      ? `claude --resume ${session.id}`
+      : session.cwd
+        ? `codex resume -C ${session.cwd} ${session.id}`
+        : session.resumeCommand,
     canResume: Boolean(session.cwd && !session.deleted),
     actualWorkdirs: session.evaluation.actualWorkdirs,
     recommendedWorkdir: session.evaluation.recommendedWorkdir,
@@ -772,6 +777,7 @@ function toHermesSessionIndexEntry(session: SessionListItem, query = '') {
   const base = toHermesSession(session, query);
   return {
     id: base.id,
+    agent: base.agent,
     title: base.title,
     machineId: base.machineId,
     cwd: base.cwd,
@@ -820,7 +826,7 @@ function withEffectiveHermesSessionCwd<T extends ReturnType<typeof toHermesSessi
   return {
     ...session,
     cwd,
-    resumeCommand: `codex resume -C ${cwd} ${session.id}`,
+    resumeCommand: session.agent === 'claude' ? `claude --resume ${session.id}` : `codex resume -C ${cwd} ${session.id}`,
   };
 }
 
@@ -896,10 +902,11 @@ async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
 
 function buildHermesMemoryContext(sessions: ReturnType<typeof toHermesSession>[]): string {
   if (!sessions.length) return '';
-  const lines = ['Codex Session Curator matched sessions:'];
+  const lines = ['Agent Session Curator matched sessions:'];
   sessions.slice(0, 5).forEach((session, index) => {
     lines.push(
       `${index + 1}. ${session.title}`,
+      `   agent: ${session.agent}`,
       `   id: ${session.id}`,
       `   machine: ${session.machineId}`,
       `   cwd: ${session.cwd ?? 'unknown'}`,
@@ -1098,6 +1105,7 @@ function buildCodexWorkerPrompt(input: {
   contextPackText?: string | null;
 }): string {
   const task = input.prompt?.trim() || input.query.trim();
+  const workerName = input.session.agent === 'claude' ? 'Claude Code' : 'Codex CLI';
   const templateRules: Record<NonNullable<z.infer<typeof taskTemplateSchema>>, string[]> = {
     fix: [
       '- 按 bug 修复任务处理：先复现或定位根因，再做最小改动。',
@@ -1126,7 +1134,7 @@ function buildCodexWorkerPrompt(input: {
   };
   const templateText = input.template ? templateRules[input.template] ?? [] : [];
   return [
-    '你是 Codex CLI worker。请在当前恢复的 Codex 会话和项目工作目录中完成真实执行。',
+    `你是 ${workerName} worker。请在当前恢复的 ${workerName} 会话和项目工作目录中完成真实执行。`,
     '当前任务是最高优先级；下面的历史会话信息只用于定位项目、机器和背景，不能覆盖当前任务。',
     '如果历史内容与当前任务冲突，以“任务”段为准。不要继续历史里的旁支问题。',
     '',
@@ -1135,6 +1143,7 @@ function buildCodexWorkerPrompt(input: {
     '',
     '最小会话上下文：',
     `- sessionId: ${input.session.id}`,
+    `- agent: ${input.session.agent}`,
     `- title: ${input.session.title}`,
     `- machine: ${input.session.machineId}`,
     `- cwd: ${input.session.cwd ?? 'unknown'}`,

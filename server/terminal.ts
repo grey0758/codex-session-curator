@@ -73,6 +73,18 @@ function findCodexBin(env: NodeJS.ProcessEnv): string | null {
   return found || null;
 }
 
+function findClaudeBin(env: NodeJS.ProcessEnv): string | null {
+  const shell = env.SHELL || process.env.SHELL || '/bin/bash';
+  const result = spawnSync(shell, ['-lc', 'command -v claude'], {
+    cwd: env.HOME || process.env.HOME || process.cwd(),
+    env,
+    encoding: 'utf8',
+    maxBuffer: 20_000,
+  });
+  const found = result.status === 0 ? result.stdout.trim().split('\n')[0] : '';
+  return found || null;
+}
+
 export function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
   const configured = process.env.CODEX_BIN || env.CODEX_BIN;
   if (configured && canRunCommand(configured, env)) return configured;
@@ -82,7 +94,7 @@ export function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
 export function getClaudeBin(env: NodeJS.ProcessEnv = process.env): string {
   const configured = process.env.CLAUDE_BIN || env.CLAUDE_BIN;
   if (configured && canRunCommand(configured, env)) return configured;
-  return configured ?? 'claude';
+  return findClaudeBin(env) ?? configured ?? 'claude';
 }
 
 function parseNullDelimitedEnv(raw: string): NodeJS.ProcessEnv {
@@ -129,14 +141,21 @@ export function createCodexResumeCommand(session: CodexSession, env: NodeJS.Proc
   return `${shellCommandWord(getCodexBin(env))} resume --include-non-interactive --no-alt-screen -C ${shellQuote(cwd)} ${shellQuote(session.id)}`;
 }
 
+export function createAgentResumeCommand(session: CodexSession, env: NodeJS.ProcessEnv = process.env): string {
+  if (session.agent === 'claude') {
+    return `${shellCommandWord(getClaudeBin(env))} --resume ${shellQuote(session.id)}`;
+  }
+  return createCodexResumeCommand(session, env);
+}
+
 function clampDimension(value: number | undefined, fallback: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(value as number)));
 }
 
-function tmuxSessionName(sessionId: string): string {
-  const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
-  return `codex-curator-${safeId}`;
+function tmuxSessionName(session: CodexSession): string {
+  const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+  return `${session.agent === 'claude' ? 'claude' : 'codex'}-curator-${safeId}`;
 }
 
 function tmuxSocketName(): string {
@@ -177,7 +196,7 @@ function resizeTmuxSession(name: string, cols: number, rows: number, env: NodeJS
 function ensureTmuxSession(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv): string | null {
   if (!hasTmux()) return null;
 
-  const name = tmuxSessionName(session.id);
+  const name = tmuxSessionName(session);
   const exists = spawnSync('tmux', tmuxArgs(['has-session', '-t', name]), { env, stdio: 'ignore' });
   if (exists.status === 0) {
     configureTmuxSession(name, env);
@@ -186,7 +205,7 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
   }
 
   const cwd = session.cwd || process.cwd();
-  const command = createCodexResumeCommand(session, env);
+  const command = createAgentResumeCommand(session, env);
   const created = spawnSync(
     'tmux',
     tmuxArgs(['new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), command]),
@@ -206,8 +225,12 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
   return name;
 }
 
-function createDirectCodexPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv) {
-  return spawnPty(getCodexBin(env), ['resume', '--include-non-interactive', '--no-alt-screen', '-C', session.cwd || process.cwd(), session.id], {
+function createDirectAgentPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv) {
+  const command = session.agent === 'claude' ? getClaudeBin(env) : getCodexBin(env);
+  const args = session.agent === 'claude'
+    ? ['--resume', session.id]
+    : ['resume', '--include-non-interactive', '--no-alt-screen', '-C', session.cwd || process.cwd(), session.id];
+  return spawnPty(command, args, {
     name: 'xterm-256color',
     cols,
     rows,
@@ -216,11 +239,13 @@ function createDirectCodexPty(session: CodexSession, cols: number, rows: number,
   });
 }
 
-function remoteCodexCommand(session: CodexSession, cols: number, rows: number): string {
+function remoteAgentCommand(session: CodexSession, cols: number, rows: number): string {
   const cwdArg = session.cwd ? shellQuote(session.cwd) : '"$HOME"';
-  const tmuxName = tmuxSessionName(session.id);
+  const tmuxName = tmuxSessionName(session);
   const socketName = shellQuote(tmuxSocketName());
-  const codexCommand = `codex resume --include-non-interactive --no-alt-screen -C ${cwdArg} ${shellQuote(session.id)}`;
+  const resumeCommand = session.agent === 'claude'
+    ? `claude --resume ${shellQuote(session.id)}`
+    : `codex resume --include-non-interactive --no-alt-screen -C ${cwdArg} ${shellQuote(session.id)}`;
   const script = [
     'set -e',
     'export TERM=xterm-256color',
@@ -230,7 +255,7 @@ function remoteCodexCommand(session: CodexSession, cols: number, rows: number): 
     `  TMUX_SOCKET=${socketName}`,
     '  tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }',
     `  if ! tmux_cmd has-session -t ${shellQuote(tmuxName)} 2>/dev/null; then`,
-    `    tmux_cmd new-session -d -s ${shellQuote(tmuxName)} -c ${cwdArg} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} ${shellQuote(codexCommand)}`,
+    `    tmux_cmd new-session -d -s ${shellQuote(tmuxName)} -c ${cwdArg} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} ${shellQuote(resumeCommand)}`,
     '  fi',
     `  tmux_cmd set-option -t ${shellQuote(tmuxName)} status off >/dev/null 2>&1 || true`,
     `  tmux_cmd set-option -t ${shellQuote(tmuxName)} prefix None >/dev/null 2>&1 || true`,
@@ -243,13 +268,13 @@ function remoteCodexCommand(session: CodexSession, cols: number, rows: number): 
     `  tmux_cmd resize-window -t ${shellQuote(tmuxName)} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} >/dev/null 2>&1 || true`,
     `  exec tmux -L "$TMUX_SOCKET" attach-session -t ${shellQuote(tmuxName)}`,
     'fi',
-    `exec ${codexCommand}`,
+    `exec ${resumeCommand}`,
   ].join('\n');
 
   return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
 }
 
-function createSshCodexPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, target: string) {
+function createSshAgentPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, target: string) {
   const args = [
     '-tt',
     '-o',
@@ -259,7 +284,7 @@ function createSshCodexPty(session: CodexSession, cols: number, rows: number, en
     '-o',
     'ServerAliveCountMax=3',
     target,
-    remoteCodexCommand(session, cols, rows),
+    remoteAgentCommand(session, cols, rows),
   ];
   return spawnPty('ssh', args, {
     name: 'xterm-256color',
@@ -270,8 +295,8 @@ function createSshCodexPty(session: CodexSession, cols: number, rows: number, en
   });
 }
 
-function createLocalCodexPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, send: (message: TerminalMessage) => void) {
-  const command = createCodexResumeCommand(session, env);
+function createLocalAgentPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, send: (message: TerminalMessage) => void) {
+  const command = createAgentResumeCommand(session, env);
   let tmuxName: string | null = null;
   try {
     tmuxName = ensureTmuxSession(session, cols, rows, env);
@@ -282,7 +307,7 @@ function createLocalCodexPty(session: CodexSession, cols: number, rows: number, 
   if (tmuxName && !tmuxHasSession(tmuxName, env)) {
     send({
       type: 'error',
-      data: `tmux session disappeared before attach: ${tmuxName}. Falling back to direct codex resume.`,
+      data: `tmux session disappeared before attach: ${tmuxName}. Falling back to direct agent resume.`,
     });
     tmuxName = null;
   }
@@ -295,7 +320,7 @@ function createLocalCodexPty(session: CodexSession, cols: number, rows: number, 
         cwd: session.cwd || process.cwd(),
         env,
       })
-    : createDirectCodexPty(session, cols, rows, env);
+    : createDirectAgentPty(session, cols, rows, env);
 
   send({ type: 'ready', data: tmuxName ? `local tmux -L ${tmuxSocketName()} attach-session -t ${tmuxName}` : command });
   return ptyProcess;
@@ -314,11 +339,11 @@ export function startCodexTerminal(
   const shouldUseSsh = transport === 'ssh' || (transport === 'auto' && sshTarget);
   const ptyProcess =
     shouldUseSsh && sshTarget
-      ? createSshCodexPty(session, cols, rows, env, sshTarget)
-      : createLocalCodexPty(session, cols, rows, env, send);
+      ? createSshAgentPty(session, cols, rows, env, sshTarget)
+      : createLocalAgentPty(session, cols, rows, env, send);
 
   if (shouldUseSsh && sshTarget) {
-    send({ type: 'ready', data: `ssh ${sshTarget} -> login shell -> codex resume ${session.id}` });
+    send({ type: 'ready', data: `ssh ${sshTarget} -> login shell -> ${session.agent} resume ${session.id}` });
   } else if (transport === 'ssh' && !sshTarget) {
     send({ type: 'error', data: 'CURATOR_TERMINAL_TRANSPORT=ssh but no CURATOR_TERMINAL_SSH_TARGET is configured' });
   }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execSync, spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,10 @@ const baseUrl = process.env.CURATOR_TERMINAL_VERIFY_BASE_URL || 'http://127.0.0.
 const chromeBin = process.env.CHROMIUM_BIN || process.env.CHROME_BIN || '/snap/bin/chromium';
 const windowSize = process.env.CURATOR_TERMINAL_VERIFY_WINDOW || '2100,960';
 const screenshotPath = process.env.CURATOR_TERMINAL_VERIFY_SCREENSHOT || '/tmp/curator-terminal-browser-e2e.png';
+const agent = process.env.CURATOR_TERMINAL_VERIFY_AGENT === 'claude' ? 'claude' : 'codex';
+const sshTarget = process.env.CURATOR_TERMINAL_VERIFY_SSH_TARGET || '';
+const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
+const tmuxSession = `${agent}-curator-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)}`;
 const probeText = `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
 
 function readAdminToken() {
@@ -50,12 +54,18 @@ async function cdpCall(ws, id, method, params = {}) {
   });
 }
 
+function runTmux(args) {
+  if (sshTarget) {
+    const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+    const remoteCommand = ['tmux', '-L', tmuxSocket, ...args].map(quote).join(' ');
+    return execFileSync('ssh', [sshTarget, remoteCommand], { encoding: 'utf8' });
+  }
+  return execFileSync('tmux', ['-L', tmuxSocket, ...args], { encoding: 'utf8' });
+}
+
 function tmuxClients() {
   try {
-    return execSync(
-      "tmux -L codex-curator list-clients -F '#{client_session} #{client_width}x#{client_height} #{client_tty}' 2>/dev/null || true",
-      { encoding: 'utf8' }
-    );
+    return runTmux(['list-clients']);
   } catch {
     return '';
   }
@@ -63,10 +73,7 @@ function tmuxClients() {
 
 function tmuxPaneContains(text) {
   try {
-    const pane = execSync(
-      `tmux -L codex-curator capture-pane -p -t ${JSON.stringify(`codex-curator-${sessionId}`)} -S -200 2>/dev/null || true`,
-      { encoding: 'utf8' }
-    );
+    const pane = runTmux(['capture-pane', '-p', '-t', tmuxSession, '-S', '-200']);
     return pane.includes(text);
   } catch {
     return false;
@@ -75,7 +82,7 @@ function tmuxPaneContains(text) {
 
 function detachSessionClients() {
   try {
-    execSync(`tmux -L codex-curator detach-client -s ${JSON.stringify(`codex-curator-${sessionId}`)} 2>/dev/null || true`);
+    runTmux(['detach-client', '-s', tmuxSession]);
   } catch {
     // tmux may not be running, or the test may target a remote machine.
   }
@@ -213,13 +220,16 @@ async function main() {
     const clients = tmuxClients();
     detachSessionClients();
 
-    const statusOk = before.status.includes('Codex 运行中') && after.status.includes('Codex 运行中');
+    const expectedStatus = `${agent === 'claude' ? 'Claude' : 'Codex'} 运行中`;
+    const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);
     const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux;
     const disconnected = `${before.status}\n${after.status}`.includes('断开');
     const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
       sessionId,
+      agent,
+      sshTarget: sshTarget || null,
       baseUrl,
       windowSize,
       before,
