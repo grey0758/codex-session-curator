@@ -41,9 +41,9 @@ function shellCommandWord(value: string): string {
   return /^[a-zA-Z0-9_./-]+$/.test(value) ? value : shellQuote(value);
 }
 
-function envNameForMachine(machineId: string | null | undefined): string | null {
+function envNameForMachine(prefix: string, machineId: string | null | undefined): string | null {
   const normalized = machineId?.trim().replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
-  return normalized ? `CURATOR_TERMINAL_SSH_TARGET_${normalized}` : null;
+  return normalized ? `${prefix}_${normalized}` : null;
 }
 
 function terminalTransport(): TerminalTransport {
@@ -52,9 +52,20 @@ function terminalTransport(): TerminalTransport {
 }
 
 function sshTargetForSession(session: CodexSession): string | null {
-  const machineEnvName = envNameForMachine(session.machineId);
+  const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_TARGET', session.machineId);
   const configured = (machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_TARGET;
   return configured?.trim() || null;
+}
+
+function sshCommandForSession(session: CodexSession): string {
+  const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_COMMAND', session.machineId);
+  return ((machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_COMMAND || 'ssh').trim();
+}
+
+function sshHostFirstForSession(session: CodexSession): boolean {
+  const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_HOST_FIRST', session.machineId);
+  const configured = (machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_HOST_FIRST;
+  return configured === '1' || configured === 'true';
 }
 
 function canRunCommand(command: string, env: NodeJS.ProcessEnv): boolean {
@@ -274,19 +285,30 @@ function remoteAgentCommand(session: CodexSession, cols: number, rows: number): 
   return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
 }
 
-function createSshAgentPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv, target: string) {
-  const args = [
-    '-tt',
-    '-o',
-    'RequestTTY=force',
-    '-o',
-    'ServerAliveInterval=30',
-    '-o',
-    'ServerAliveCountMax=3',
-    target,
-    remoteAgentCommand(session, cols, rows),
-  ];
-  return spawnPty('ssh', args, {
+function createSshAgentPty(
+  session: CodexSession,
+  cols: number,
+  rows: number,
+  env: NodeJS.ProcessEnv,
+  target: string,
+  sshCommand: string,
+  hostFirst: boolean
+) {
+  const remoteCommand = remoteAgentCommand(session, cols, rows);
+  const args = hostFirst
+    ? [target, remoteCommand]
+    : [
+        '-tt',
+        '-o',
+        'RequestTTY=force',
+        '-o',
+        'ServerAliveInterval=30',
+        '-o',
+        'ServerAliveCountMax=3',
+        target,
+        remoteCommand,
+      ];
+  return spawnPty(sshCommand, args, {
     name: 'xterm-256color',
     cols,
     rows,
@@ -336,14 +358,16 @@ export function startCodexTerminal(
   const env = createTerminalEnv();
   const transport = terminalTransport();
   const sshTarget = sshTargetForSession(session);
+  const sshCommand = sshCommandForSession(session);
+  const sshHostFirst = sshHostFirstForSession(session);
   const shouldUseSsh = transport === 'ssh' || (transport === 'auto' && sshTarget);
   const ptyProcess =
     shouldUseSsh && sshTarget
-      ? createSshAgentPty(session, cols, rows, env, sshTarget)
+      ? createSshAgentPty(session, cols, rows, env, sshTarget, sshCommand, sshHostFirst)
       : createLocalAgentPty(session, cols, rows, env, send);
 
   if (shouldUseSsh && sshTarget) {
-    send({ type: 'ready', data: `ssh ${sshTarget} -> login shell -> ${session.agent} resume ${session.id}` });
+    send({ type: 'ready', data: `${sshCommand} ${sshTarget} -> login shell -> ${session.agent} resume ${session.id}` });
   } else if (transport === 'ssh' && !sshTarget) {
     send({ type: 'error', data: 'CURATOR_TERMINAL_TRANSPORT=ssh but no CURATOR_TERMINAL_SSH_TARGET is configured' });
   }

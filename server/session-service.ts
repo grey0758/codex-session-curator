@@ -1,6 +1,7 @@
 import { stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
+import { relative, sep } from 'node:path';
 import {
   archiveSessionFilesBulk,
   archiveSessionFiles,
@@ -485,7 +486,11 @@ export class SessionService {
       findJsonlFiles(this.sessionsRoot),
       findJsonlFiles(this.claudeProjectsRoot),
     ]);
-    return [...codexFiles, ...claudeFiles];
+    const primaryClaudeFiles = claudeFiles.filter((filePath) => {
+      const segments = relative(this.claudeProjectsRoot, filePath).split(sep);
+      return !segments.includes('subagents');
+    });
+    return [...codexFiles, ...primaryClaudeFiles];
   }
 
   private async findSessionFilesByIds(ids: string[]): Promise<{
