@@ -11,6 +11,7 @@ const windowSize = process.env.CURATOR_TERMINAL_VERIFY_WINDOW || '2100,960';
 const screenshotPath = process.env.CURATOR_TERMINAL_VERIFY_SCREENSHOT || '/tmp/curator-terminal-browser-e2e.png';
 const agent = process.env.CURATOR_TERMINAL_VERIFY_AGENT === 'claude' ? 'claude' : 'codex';
 const sshTarget = process.env.CURATOR_TERMINAL_VERIFY_SSH_TARGET || '';
+const sshCommand = process.env.CURATOR_TERMINAL_VERIFY_SSH_COMMAND || 'ssh';
 const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
 const tmuxSession = `${agent}-curator-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)}`;
 const probeText = `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
@@ -58,7 +59,7 @@ function runTmux(args) {
   if (sshTarget) {
     const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
     const remoteCommand = ['tmux', '-L', tmuxSocket, ...args].map(quote).join(' ');
-    return execFileSync('ssh', [sshTarget, remoteCommand], { encoding: 'utf8' });
+    return execFileSync(sshCommand, [sshTarget, remoteCommand], { encoding: 'utf8' });
   }
   return execFileSync('tmux', ['-L', tmuxSocket, ...args], { encoding: 'utf8' });
 }
@@ -230,6 +231,7 @@ async function main() {
       sessionId,
       agent,
       sshTarget: sshTarget || null,
+      sshCommand: sshTarget ? sshCommand : null,
       baseUrl,
       windowSize,
       before,
