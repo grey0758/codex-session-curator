@@ -41,6 +41,7 @@ type SessionListViewMode = 'folder' | 'activityDate';
 type AiRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
 type MessageRole = 'user' | 'assistant';
 type AgentKind = 'codex' | 'claude';
+type AgentFilter = 'all' | AgentKind;
 type CodexWorkerJobStatus = 'running' | 'completed' | 'failed' | 'stopped' | string;
 type CodexWorkerMode = 'exec' | 'pty' | string;
 type WorkerProtocolKind = 'guide' | 'pause' | 'continue' | 'summarize' | 'handoff' | 'verify';
@@ -545,10 +546,20 @@ function agentLabel(agent: AgentKind | null | undefined): string {
 }
 
 const MACHINE_FILTER_STORAGE_KEY = 'codex-session-curator:last-machine-filter';
+const AGENT_FILTER_STORAGE_KEY = 'codex-session-curator:last-agent-filter';
 
 function readStoredMachineFilter(): string {
   try {
     return window.localStorage.getItem(MACHINE_FILTER_STORAGE_KEY) || 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+function readStoredAgentFilter(): AgentFilter {
+  try {
+    const stored = window.localStorage.getItem(AGENT_FILTER_STORAGE_KEY);
+    return stored === 'codex' || stored === 'claude' ? stored : 'all';
   } catch {
     return 'all';
   }
@@ -1593,6 +1604,7 @@ function App() {
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
   const [machineFilter, setMachineFilter] = useState(readStoredMachineFilter);
+  const [agentFilter, setAgentFilter] = useState<AgentFilter>(readStoredAgentFilter);
   const [listViewMode, setListViewMode] = useState<SessionListViewMode>('folder');
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1999,10 +2011,32 @@ function App() {
   }, [machineFilter]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(AGENT_FILTER_STORAGE_KEY, agentFilter);
+    } catch {
+      // Browser storage may be unavailable in private contexts.
+    }
+  }, [agentFilter]);
+
+  useEffect(() => {
     if (!allSessions.length) return;
     if (machineOptions.includes(machineFilter)) return;
     setMachineFilter('all');
   }, [allSessions.length, machineFilter, machineOptions]);
+
+  const agentFilterCounts = useMemo(() => {
+    const sessions = allSessions.filter(
+      (session) =>
+        filterByTab(session, activeTab) &&
+        (machineFilter === 'all' || session.machineId === machineFilter) &&
+        matchesSearch(session, query)
+    );
+    return {
+      all: sessions.length,
+      codex: sessions.filter((session) => session.agent === 'codex').length,
+      claude: sessions.filter((session) => session.agent === 'claude').length,
+    };
+  }, [activeTab, allSessions, machineFilter, query]);
 
   const visibleSessions = useMemo(
     () =>
@@ -2010,9 +2044,10 @@ function App() {
         (session) =>
           filterByTab(session, activeTab) &&
           (machineFilter === 'all' || session.machineId === machineFilter) &&
+          (agentFilter === 'all' || session.agent === agentFilter) &&
           matchesSearch(session, query)
       ),
-    [activeTab, allSessions, machineFilter, query]
+    [activeTab, agentFilter, allSessions, machineFilter, query]
   );
 
   const groupedSessions = useMemo(() => {
@@ -2435,7 +2470,12 @@ function App() {
 
   const stats = useMemo(() => {
     return allSessions
-      .filter((session) => (machineFilter === 'all' || session.machineId === machineFilter) && matchesSearch(session, query))
+      .filter(
+        (session) =>
+          (machineFilter === 'all' || session.machineId === machineFilter) &&
+          (agentFilter === 'all' || session.agent === agentFilter) &&
+          matchesSearch(session, query)
+      )
       .reduce(
       (acc, session) => {
         acc[session.evaluation.recommendation] += 1;
@@ -2448,7 +2488,7 @@ function App() {
         active: number;
       }
       );
-  }, [allSessions, machineFilter, query]);
+  }, [agentFilter, allSessions, machineFilter, query]);
 
   async function setKept(session: CodexSession, kept: boolean) {
     setBusyId(session.id);
@@ -2780,6 +2820,44 @@ function App() {
           </select>
         </div>
 
+        {activeTab !== 'recycle' ? (
+          <div className="agent-switch" role="group" aria-label="会话代理筛选">
+            <button
+              type="button"
+              data-agent-filter="all"
+              className={agentFilter === 'all' ? 'active' : ''}
+              aria-pressed={agentFilter === 'all'}
+              onClick={() => setAgentFilter('all')}
+            >
+              <FolderOpen size={15} />
+              <span>全部</span>
+              <em>{agentFilterCounts.all}</em>
+            </button>
+            <button
+              type="button"
+              data-agent-filter="codex"
+              className={agentFilter === 'codex' ? 'active' : ''}
+              aria-pressed={agentFilter === 'codex'}
+              onClick={() => setAgentFilter('codex')}
+            >
+              <TerminalIcon size={15} />
+              <span>Codex</span>
+              <em>{agentFilterCounts.codex}</em>
+            </button>
+            <button
+              type="button"
+              data-agent-filter="claude"
+              className={agentFilter === 'claude' ? 'active' : ''}
+              aria-pressed={agentFilter === 'claude'}
+              onClick={() => setAgentFilter('claude')}
+            >
+              <Sparkles size={15} />
+              <span>Claude</span>
+              <em>{agentFilterCounts.claude}</em>
+            </button>
+          </div>
+        ) : null}
+
         <div className="view-switch" role="group" aria-label="列表显示方式">
           <button
             type="button"
@@ -2839,7 +2917,7 @@ function App() {
           {metricLabel(stats.delete, '删除')}
         </div>
 
-        <div className="filter-note">保留面板是手动标签；推荐保留、复核、建议删除是 AI 分类，可与机器和搜索筛选叠加。</div>
+        <div className="filter-note">保留面板是手动标签；推荐保留、复核、建议删除是 AI 分类，可与代理、机器和搜索筛选叠加。</div>
 
         {activeTab !== 'recycle' ? (
           <div className="bulk-toolbar">
@@ -2927,6 +3005,7 @@ function App() {
                           <div
                             key={session.id}
                             data-session-id={session.id}
+                            data-agent={session.agent}
                             className={`session-row ${selected?.id === session.id ? 'selected' : ''}`}
                             onClick={() => setSelectedId(session.id)}
                             onKeyDown={(event) => {

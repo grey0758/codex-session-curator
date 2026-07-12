@@ -167,6 +167,74 @@
   background: transparent;
 }
 
+.agent-switch {
+  margin: 0 20px 12px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.agent-switch button {
+  min-width: 0;
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.agent-switch button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-switch button em {
+  min-width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #eef2f6;
+  color: #526172;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.agent-switch button[data-agent-filter='all'].active {
+  border-color: #a8b4c2;
+  background: #f1f5f9;
+  color: #17212e;
+}
+
+.agent-switch button[data-agent-filter='codex'].active {
+  border-color: #8cb9df;
+  background: #edf6fd;
+  color: #174d73;
+}
+
+.agent-switch button[data-agent-filter='claude'].active {
+  border-color: #e2ae7c;
+  background: #fff5eb;
+  color: #713f17;
+}
+
+.agent-switch button.active em {
+  background: rgba(255, 255, 255, 0.78);
+  color: inherit;
+}
+
 .view-switch {
   margin: 0 20px 12px;
   display: grid;

@@ -129,15 +129,27 @@ async function main() {
       throw new Error(`${label}: timed out after ${timeoutMs}ms`);
     }
 
-    async function focusSession(sessionId) {
+    async function setSearchQuery(value) {
       await evaluate(`(() => {
         const input = document.querySelector('input[placeholder*="搜索 key"]');
         if (!input) return false;
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-        setter?.call(input, ${JSON.stringify(sessionId)});
+        setter?.call(input, ${JSON.stringify(value)});
         input.dispatchEvent(new Event('input', { bubbles: true }));
         return true;
       })()`);
+    }
+
+    async function selectAgentFilter(agent) {
+      await evaluate(`(() => {
+        const button = document.querySelector('.agent-switch button[data-agent-filter=${JSON.stringify(agent)}]');
+        button?.click();
+        return Boolean(button);
+      })()`);
+    }
+
+    async function focusSession(sessionId) {
+      await setSearchQuery(sessionId);
       await waitFor(
         `Boolean([...document.querySelectorAll('.session-row[data-session-id]')].find((row) => row.dataset.sessionId === ${JSON.stringify(sessionId)}))`,
         Boolean,
@@ -160,14 +172,70 @@ async function main() {
       loadErrorVisible: document.body.innerText.includes('加载失败')
     }))()`);
 
-    await evaluate(`(() => {
-      const input = document.querySelector('input[placeholder*="搜索 key"]');
-      if (!input) return false;
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      setter?.call(input, ${JSON.stringify(query)});
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
+    const agentCandidates = await evaluate(`(async () => {
+      const response = await fetch('/api/sessions?detail=0');
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+      const byMachine = new Map();
+      for (const session of sessions) {
+        if (!session?.machineId || !['codex', 'claude'].includes(session.agent)) continue;
+        const agents = byMachine.get(session.machineId) || new Set();
+        agents.add(session.agent);
+        byMachine.set(session.machineId, agents);
+      }
+      const sharedMachine = [...byMachine.entries()].find(([, agents]) => agents.has('codex') && agents.has('claude'))?.[0] || null;
+      return {
+        sharedMachine,
+        codexId: sessions.find((session) => session.agent === 'codex')?.id || null,
+        claudeId: sessions.find((session) => session.agent === 'claude')?.id || null
+      };
     })()`);
+    if (!agentCandidates?.sharedMachine || !agentCandidates.codexId || !agentCandidates.claudeId) {
+      throw new Error('agent filter verification needs indexed Codex and Claude sessions on one machine');
+    }
+
+    const agentFilterSnapshotExpression = `(() => {
+      const buttons = [...document.querySelectorAll('.agent-switch button[data-agent-filter]')];
+      const rows = [...document.querySelectorAll('.session-row[data-agent]')];
+      return {
+        active: buttons.find((button) => button.classList.contains('active'))?.dataset.agentFilter || null,
+        labels: buttons.map((button) => button.querySelector('span')?.textContent || ''),
+        counts: Object.fromEntries(buttons.map((button) => [button.dataset.agentFilter, Number(button.querySelector('em')?.textContent || 0)])),
+        agents: rows.map((row) => row.dataset.agent || '')
+      };
+    })()`;
+
+    await setSearchQuery(agentCandidates.sharedMachine);
+    await selectAgentFilter('all');
+    const allAgents = await waitFor(
+      agentFilterSnapshotExpression,
+      (value) => value.active === 'all' && value.agents.includes('codex') && value.agents.includes('claude'),
+      'all agent filter'
+    );
+    await selectAgentFilter('codex');
+    const codexAgents = await waitFor(
+      agentFilterSnapshotExpression,
+      (value) => value.active === 'codex' && value.agents.length > 0 && value.agents.every((agent) => agent === 'codex'),
+      'Codex agent filter'
+    );
+    await selectAgentFilter('claude');
+    const claudeAgents = await waitFor(
+      agentFilterSnapshotExpression,
+      (value) => value.active === 'claude' && value.agents.length > 0 && value.agents.every((agent) => agent === 'claude'),
+      'Claude agent filter'
+    );
+    await selectAgentFilter('all');
+
+    const agentFilterOk =
+      JSON.stringify(allAgents.labels) === JSON.stringify(['全部', 'Codex', 'Claude']) &&
+      allAgents.counts.all === allAgents.counts.codex + allAgents.counts.claude &&
+      allAgents.counts.codex > 0 &&
+      allAgents.counts.claude > 0 &&
+      codexAgents.agents.every((agent) => agent === 'codex') &&
+      claudeAgents.agents.every((agent) => agent === 'claude');
+
+    await setSearchQuery(query);
     await delay(700);
 
     const after = await evaluate(`(() => ({
@@ -333,6 +401,7 @@ async function main() {
       after.sessionRows > 0 &&
       !before.loadErrorVisible &&
       !after.loadErrorVisible &&
+      agentFilterOk &&
       recentOk &&
       exceptions.length === 0 &&
       consoleErrors.length === 0;
@@ -342,6 +411,13 @@ async function main() {
       query,
       before,
       after,
+      agentFilter: {
+        ok: agentFilterOk,
+        machineId: agentCandidates.sharedMachine,
+        counts: allAgents.counts,
+        codexRows: codexAgents.agents.length,
+        claudeRows: claudeAgents.agents.length,
+      },
       recent: {
         ok: recentOk,
         firstSessionId: firstCandidate.sessionId,
