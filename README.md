@@ -26,8 +26,9 @@ Archive delete moves data into a recycle bin first:
 - `~/.codex/sessions/**/rollout-*.jsonl`
 - matching `~/.codex/shell_snapshots/<session-id>.*`
 - matching entries in `~/.codex/history.jsonl`
+- `~/.claude/projects/**/*.jsonl` (without touching Codex history or shell snapshots)
 
-The recycle bin is stored under the app runtime directory by default and can be restored from the UI. Expired archives are cleaned after the configured retention period.
+The recycle bin defaults to the deployment-independent `~/.codex/session-curator-recycle-bin` and can be restored from the UI. Expired archives are cleaned after the configured retention period.
 
 Do not expose this app publicly without authentication. It can read and remove local Codex session files.
 
@@ -127,7 +128,7 @@ HOST=127.0.0.1
 PORT=54177
 CODEX_HOME=/home/you/.codex
 CODEX_CURATOR_STATE=/home/you/.codex/session-curator-state.json
-CURATOR_RECYCLE_ROOT=/home/you/data/codex-session-curator/session-recycle-bin
+CURATOR_RECYCLE_ROOT=/home/you/.codex/session-curator-recycle-bin
 CURATOR_RECYCLE_RETENTION_DAYS=30
 CURATOR_MACHINE_ID=workstation
 CODEX_BIN=/usr/bin/codex

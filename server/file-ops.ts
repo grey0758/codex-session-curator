@@ -2,7 +2,7 @@ import { createReadStream } from 'node:fs';
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
 export function getCodexHome(): string {
@@ -27,10 +27,10 @@ export function getClaudeProjectsRoot(claudeHome: string = getClaudeHome()): str
 
 // A session file belongs to Claude Code when it lives under ~/.claude/projects.
 // Everything else (the Codex sessions root) is treated as a Codex session.
-export function isClaudeSessionPath(filePath: string): boolean {
-  const root = resolve(getClaudeProjectsRoot());
+export function isClaudeSessionPath(filePath: string, claudeProjectsRoot: string = getClaudeProjectsRoot()): boolean {
+  const root = resolve(claudeProjectsRoot);
   const child = resolve(filePath);
-  return child === root || child.startsWith(`${root}/`);
+  return child === root || child.startsWith(`${root}${sep}`);
 }
 
 export function getShellSnapshotsRoot(codexHome: string): string {
@@ -38,15 +38,50 @@ export function getShellSnapshotsRoot(codexHome: string): string {
 }
 
 export function getRecycleRoot(): string {
-  return resolve(process.env.CURATOR_RECYCLE_ROOT || join(process.cwd(), 'session-recycle-bin'));
+  return resolve(process.env.CURATOR_RECYCLE_ROOT || join(getCodexHome(), 'session-curator-recycle-bin'));
 }
 
 export function assertInside(childPath: string, parentPath: string): void {
   const child = resolve(childPath);
   const parent = resolve(parentPath);
-  if (child !== parent && !child.startsWith(`${parent}/`)) {
+  if (child !== parent && !child.startsWith(`${parent}${sep}`)) {
     throw new Error(`Path escapes allowed root: ${child}`);
   }
+}
+
+type SessionArchiveAgent = 'codex' | 'claude';
+
+function isInside(childPath: string, parentPath: string): boolean {
+  const child = resolve(childPath);
+  const parent = resolve(parentPath);
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+function sessionPathInfo(input: {
+  codexHome: string;
+  filePath: string;
+  claudeProjectsRoot?: string;
+}): { agent: SessionArchiveAgent; root: string; relativePath: string } {
+  const filePath = resolve(input.filePath);
+  const claudeProjectsRoot = resolve(input.claudeProjectsRoot ?? getClaudeProjectsRoot());
+  if (isInside(filePath, claudeProjectsRoot)) {
+    return {
+      agent: 'claude',
+      root: claudeProjectsRoot,
+      relativePath: relative(claudeProjectsRoot, filePath),
+    };
+  }
+
+  const sessionsRoot = resolve(getSessionsRoot(input.codexHome));
+  if (isInside(filePath, sessionsRoot)) {
+    return {
+      agent: 'codex',
+      root: sessionsRoot,
+      relativePath: relative(sessionsRoot, filePath),
+    };
+  }
+
+  throw new Error(`Path escapes allowed session roots: ${filePath}`);
 }
 
 export async function findJsonlFiles(root: string): Promise<string[]> {
@@ -152,22 +187,26 @@ export async function deleteSessionFiles(input: {
   codexHome: string;
   sessionId: string;
   filePath: string;
+  claudeProjectsRoot?: string;
 }): Promise<{ deletedFiles: string[]; removedHistoryEntries: number }> {
-  const sessionsRoot = getSessionsRoot(input.codexHome);
-  assertInside(input.filePath, sessionsRoot);
+  const pathInfo = sessionPathInfo(input);
 
   const deletedFiles: string[] = [];
   await rm(input.filePath, { force: true });
   deletedFiles.push(input.filePath);
 
-  const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
-  for (const snapshot of snapshots) {
-    assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
-    await rm(snapshot, { force: true });
-    deletedFiles.push(snapshot);
+  if (pathInfo.agent === 'codex') {
+    const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
+    for (const snapshot of snapshots) {
+      assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
+      await rm(snapshot, { force: true });
+      deletedFiles.push(snapshot);
+    }
   }
 
-  const removedHistoryEntries = await removeHistoryEntries(input.codexHome, input.sessionId);
+  const removedHistoryEntries = pathInfo.agent === 'codex'
+    ? await removeHistoryEntries(input.codexHome, input.sessionId)
+    : 0;
   return { deletedFiles, removedHistoryEntries };
 }
 
@@ -189,15 +228,16 @@ export async function archiveSessionFiles(input: {
   recycleRoot?: string;
   retentionDays?: number;
   skipHistoryCleanup?: boolean;
+  claudeProjectsRoot?: string;
 }): Promise<{
+  agent: SessionArchiveAgent;
   archiveDir: string;
   archivedFiles: string[];
   removedOriginalFiles: string[];
   removedHistoryEntries: number;
   expiresAt: string;
 }> {
-  const sessionsRoot = getSessionsRoot(input.codexHome);
-  assertInside(input.filePath, sessionsRoot);
+  const pathInfo = sessionPathInfo(input);
 
   const recycleRoot = input.recycleRoot ?? getRecycleRoot();
   const deletedAt = new Date();
@@ -210,26 +250,33 @@ export async function archiveSessionFiles(input: {
   const archivedFiles: string[] = [];
   const removedOriginalFiles: string[] = [];
 
-  const archivedSession = join(archiveDir, 'sessions', basename(input.filePath));
+  const archivedSession = pathInfo.agent === 'claude'
+    ? join(archiveDir, 'claude-projects', pathInfo.relativePath)
+    : join(archiveDir, 'sessions', basename(input.filePath));
   await moveFileToArchive(input.filePath, archivedSession);
   archivedFiles.push(archivedSession);
   removedOriginalFiles.push(input.filePath);
 
-  const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
-  for (const snapshot of snapshots) {
-    assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
-    const archivedSnapshot = join(archiveDir, 'shell_snapshots', basename(snapshot));
-    await moveFileToArchive(snapshot, archivedSnapshot);
-    archivedFiles.push(archivedSnapshot);
-    removedOriginalFiles.push(snapshot);
+  if (pathInfo.agent === 'codex') {
+    const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
+    for (const snapshot of snapshots) {
+      assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
+      const archivedSnapshot = join(archiveDir, 'shell_snapshots', basename(snapshot));
+      await moveFileToArchive(snapshot, archivedSnapshot);
+      archivedFiles.push(archivedSnapshot);
+      removedOriginalFiles.push(snapshot);
+    }
   }
 
-  const removedHistoryEntries = input.skipHistoryCleanup ? 0 : await removeHistoryEntries(input.codexHome, input.sessionId);
+  const removedHistoryEntries = input.skipHistoryCleanup || pathInfo.agent === 'claude'
+    ? 0
+    : await removeHistoryEntries(input.codexHome, input.sessionId);
   await writeFile(
     join(archiveDir, 'manifest.json'),
     `${JSON.stringify(
       {
         sessionId: input.sessionId,
+        agent: pathInfo.agent,
         originalSessionFile: input.filePath,
         deletedAt: deletedAt.toISOString(),
         expiresAt,
@@ -244,7 +291,7 @@ export async function archiveSessionFiles(input: {
     'utf8'
   );
 
-  return { archiveDir, archivedFiles, removedOriginalFiles, removedHistoryEntries, expiresAt };
+  return { agent: pathInfo.agent, archiveDir, archivedFiles, removedOriginalFiles, removedHistoryEntries, expiresAt };
 }
 
 async function updateArchiveHistoryCount(archiveDir: string, removedHistoryEntries: number): Promise<void> {
@@ -259,8 +306,10 @@ export async function archiveSessionFilesBulk(input: {
   sessions: Array<{ sessionId: string; filePath: string }>;
   recycleRoot?: string;
   retentionDays?: number;
+  claudeProjectsRoot?: string;
 }): Promise<Array<{
   sessionId: string;
+  agent: SessionArchiveAgent;
   archiveDir: string;
   archivedFiles: string[];
   removedOriginalFiles: string[];
@@ -276,13 +325,14 @@ export async function archiveSessionFilesBulk(input: {
       recycleRoot: input.recycleRoot,
       retentionDays: input.retentionDays,
       skipHistoryCleanup: true,
+      claudeProjectsRoot: input.claudeProjectsRoot,
     });
     archived.push({ sessionId: session.sessionId, ...result });
   }
 
   const removedBySessionId = await removeHistoryEntriesBatch(
     input.codexHome,
-    archived.map((item) => item.sessionId)
+    archived.filter((item) => item.agent === 'codex').map((item) => item.sessionId)
   );
   for (const item of archived) {
     item.removedHistoryEntries = removedBySessionId.get(item.sessionId) ?? 0;
@@ -331,6 +381,7 @@ export async function purgeExpiredArchives(input: {
 
 export interface RecycleArchive {
   sessionId: string;
+  agent: SessionArchiveAgent | null;
   archiveDir: string;
   originalSessionFile: string | null;
   deletedAt: string | null;
@@ -339,6 +390,25 @@ export interface RecycleArchive {
   archivedFiles: string[];
   removedOriginalFiles: string[];
   removedHistoryEntries: number;
+}
+
+function rebaseArchivedFile(archiveDir: string, archivedFile: string): string {
+  if (isInside(archivedFile, archiveDir)) return resolve(archivedFile);
+
+  const normalized = resolve(archivedFile);
+  const archiveMarker = `${sep}${basename(archiveDir)}${sep}`;
+  const archiveIndex = normalized.lastIndexOf(archiveMarker);
+  if (archiveIndex >= 0) {
+    return join(archiveDir, normalized.slice(archiveIndex + archiveMarker.length));
+  }
+
+  for (const section of ['sessions', 'shell_snapshots', 'claude-projects']) {
+    const marker = `${sep}${section}${sep}`;
+    const sectionIndex = normalized.lastIndexOf(marker);
+    if (sectionIndex >= 0) return join(archiveDir, normalized.slice(sectionIndex + 1));
+  }
+
+  return normalized;
 }
 
 export async function listRecycleArchives(input: { recycleRoot?: string } = {}): Promise<RecycleArchive[]> {
@@ -359,12 +429,17 @@ export async function listRecycleArchives(input: { recycleRoot?: string } = {}):
       const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Partial<RecycleArchive>;
       archives.push({
         sessionId: typeof manifest.sessionId === 'string' ? manifest.sessionId : entry.name.split('-').at(-1) ?? entry.name,
+        agent: manifest.agent === 'codex' || manifest.agent === 'claude' ? manifest.agent : null,
         archiveDir,
         originalSessionFile: typeof manifest.originalSessionFile === 'string' ? manifest.originalSessionFile : null,
         deletedAt: typeof manifest.deletedAt === 'string' ? manifest.deletedAt : null,
         expiresAt: typeof manifest.expiresAt === 'string' ? manifest.expiresAt : null,
         retentionDays: typeof manifest.retentionDays === 'number' ? manifest.retentionDays : null,
-        archivedFiles: Array.isArray(manifest.archivedFiles) ? manifest.archivedFiles.filter((item): item is string => typeof item === 'string') : [],
+        archivedFiles: Array.isArray(manifest.archivedFiles)
+          ? manifest.archivedFiles
+              .filter((item): item is string => typeof item === 'string')
+              .map((item) => rebaseArchivedFile(archiveDir, item))
+          : [],
         removedOriginalFiles: Array.isArray(manifest.removedOriginalFiles)
           ? manifest.removedOriginalFiles.filter((item): item is string => typeof item === 'string')
           : [],
@@ -373,6 +448,7 @@ export async function listRecycleArchives(input: { recycleRoot?: string } = {}):
     } catch {
       archives.push({
         sessionId: entry.name,
+        agent: null,
         archiveDir,
         originalSessionFile: null,
         deletedAt: null,
@@ -397,6 +473,7 @@ export async function restoreArchive(input: {
   codexHome: string;
   recycleRoot?: string;
   sessionId: string;
+  claudeProjectsRoot?: string;
 }): Promise<{ sessionId: string; restoredFiles: string[]; archiveDir: string }> {
   const recycleRoot = input.recycleRoot ?? getRecycleRoot();
   const archive = await findArchiveBySessionId(recycleRoot, input.sessionId);
@@ -404,14 +481,25 @@ export async function restoreArchive(input: {
 
   const sessionsRoot = getSessionsRoot(input.codexHome);
   const snapshotsRoot = getShellSnapshotsRoot(input.codexHome);
+  const claudeProjectsRoot = input.claudeProjectsRoot ?? getClaudeProjectsRoot();
   const restoredFiles: string[] = [];
 
   for (const archivedFile of archive.archivedFiles) {
     assertInside(archivedFile, archive.archiveDir);
     const fileName = basename(archivedFile);
-    const targetRoot = archivedFile.includes('/shell_snapshots/') ? snapshotsRoot : sessionsRoot;
-    const preferredOriginal = archive.removedOriginalFiles.find((file) => basename(file) === fileName);
-    const target = preferredOriginal ?? join(targetRoot, fileName);
+    const shellArchiveRoot = join(archive.archiveDir, 'shell_snapshots');
+    const claudeArchiveRoot = join(archive.archiveDir, 'claude-projects');
+    const isSnapshot = isInside(archivedFile, shellArchiveRoot);
+    const isClaude = archive.agent === 'claude' || isInside(archivedFile, claudeArchiveRoot);
+    const targetRoot = isSnapshot ? snapshotsRoot : isClaude ? claudeProjectsRoot : sessionsRoot;
+    const preferredOriginal = [archive.originalSessionFile, ...archive.removedOriginalFiles]
+      .find((file): file is string => Boolean(file && basename(file) === fileName && isInside(file, targetRoot)));
+    const fallbackRelative = isClaude
+      ? relative(claudeArchiveRoot, archivedFile)
+      : isSnapshot
+        ? fileName
+        : relative(join(archive.archiveDir, 'sessions'), archivedFile);
+    const target = preferredOriginal ?? join(targetRoot, fallbackRelative || fileName);
     assertInside(target, targetRoot);
     await mkdir(dirname(target), { recursive: true });
     await moveFileToArchive(archivedFile, target);

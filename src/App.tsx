@@ -136,6 +136,8 @@ interface ApiPayload {
 
 interface RecycleArchive {
   sessionId: string;
+  agent: AgentKind | null;
+  machineId: string;
   archiveDir: string;
   originalSessionFile: string | null;
   deletedAt: string | null;
@@ -149,6 +151,7 @@ interface RecycleArchive {
 interface RecyclePayload {
   meta: ApiPayload['meta'];
   archives: RecycleArchive[];
+  errors?: Array<{ machineId: string; error: string }>;
 }
 
 function asArray<T>(value: T[] | null | undefined): T[] {
@@ -2107,7 +2110,7 @@ function App() {
     const needle = (recycleQuery || query).trim().toLowerCase();
     if (!needle) return recycleArchives;
     return recycleArchives.filter((archive) =>
-      [archive.sessionId, archive.archiveDir, archive.originalSessionFile ?? '', ...archive.archivedFiles, ...archive.removedOriginalFiles]
+      [archive.sessionId, archive.machineId, archive.agent ?? '', archive.archiveDir, archive.originalSessionFile ?? '', ...archive.archivedFiles, ...archive.removedOriginalFiles]
         .join(' ')
         .toLowerCase()
         .includes(needle)
@@ -2524,17 +2527,23 @@ function App() {
   }
 
   async function deleteSession(session: CodexSession) {
-    if (!window.confirm(`只删除当前机器 ${session.machineId} 上的会话：${session.id}？会先移入回收站，原 Codex 活跃目录会被清除。`)) return;
+    if (!window.confirm(`只删除当前机器 ${session.machineId} 上的会话：${session.id}？会先移入回收站，原 Codex / Claude 活跃目录会被清除。`)) return;
     setBusyId(session.id);
+    setActionMessage(null);
     try {
-      const response = await fetch(`/api/sessions/${session.id}`, {
+      const params = new URLSearchParams({ machineId: session.machineId });
+      const response = await fetch(`/api/sessions/${session.id}?${params.toString()}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       removeSessionsFromPanel([session.id]);
+      setActionMessage(`已将 ${session.machineId} 上的 ${agentLabel(session.agent)} 会话移入回收站`);
       void loadSessions();
+    } catch (err) {
+      setActionMessage(`删除失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
@@ -2571,48 +2580,42 @@ function App() {
   }
 
   async function pruneRecommended() {
-    if (!window.confirm('将所有未手动保留且被建议删除的 Codex 会话移入回收站？原位置会被清除。')) return;
+    if (!window.confirm('将本机及已连接 worker 上所有未手动保留、且被建议删除的 Codex / Claude 会话移入回收站？原位置会被清除。')) return;
     setBusyId('prune');
+    setActionMessage(null);
     try {
       const response = await fetch('/api/sessions/prune', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json().catch(() => ({}))) as { deleted?: number; failed?: number; error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`建议删除清理完成：已移入回收站 ${payload.deleted ?? 0} 个，失败 ${payload.failed ?? 0} 个`);
       await loadSessions();
+    } catch (err) {
+      setActionMessage(`建议删除清理失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
   }
 
   async function pruneNonKept() {
-    if (!window.confirm('将所有未进入保留面板的本机 Codex 会话移入回收站？原位置会被清除。')) return;
+    if (!window.confirm('将本机及已连接 worker 上所有未进入保留面板的 Codex / Claude 会话移入回收站？原位置会被清除。')) return;
     setBusyId('prune-non-kept');
+    setActionMessage(null);
     try {
       const response = await fetch('/api/sessions/prune-non-kept', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await loadSessions();
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function retryFailedSummaries() {
-    setBusyId('retry-failed');
-    setActionMessage(null);
-    try {
-      const response = await fetch('/api/evaluations/retry-failed', { method: 'POST' });
-      const payload = (await response.json()) as { queued?: number; error?: string };
+      const payload = (await response.json().catch(() => ({}))) as { deleted?: number; failed?: number; error?: string };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      setActionMessage(`已加入摘要重试队列 ${payload.queued ?? 0} 个；下次刷新或 AI 重算时会重新生成。`);
-      await loadSessions(true);
+      setActionMessage(`非保留清理完成：已移入回收站 ${payload.deleted ?? 0} 个，失败 ${payload.failed ?? 0} 个`);
+      await loadSessions();
     } catch (err) {
-      setActionMessage(`摘要重试失败：${err instanceof Error ? err.message : '未知错误'}`);
+      setActionMessage(`非保留清理失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
@@ -2693,32 +2696,44 @@ function App() {
   }
 
   async function restoreArchive(archive: RecycleArchive) {
-    if (!window.confirm(`恢复回收站会话 ${archive.sessionId} 到原 Codex 目录？`)) return;
+    if (!window.confirm(`恢复 ${archive.machineId} 回收站中的会话 ${archive.sessionId} 到原 Codex / Claude 目录？`)) return;
     setBusyId(`${archive.sessionId}:restore`);
+    setActionMessage(null);
     try {
-      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}/restore`, {
+      const params = new URLSearchParams({ machineId: archive.machineId });
+      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}/restore?${params.toString()}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`已恢复 ${archive.machineId} 上的回收站会话 ${archive.sessionId}`);
       await loadSessions();
+    } catch (err) {
+      setActionMessage(`恢复失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
   }
 
   async function purgeArchive(archive: RecycleArchive) {
-    if (!window.confirm(`立即永久删除回收站归档 ${archive.sessionId}？这个操作不可恢复。`)) return;
+    if (!window.confirm(`立即永久删除 ${archive.machineId} 上的回收站归档 ${archive.sessionId}？这个操作不可恢复。`)) return;
     setBusyId(`${archive.sessionId}:purge`);
+    setActionMessage(null);
     try {
-      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}`, {
+      const params = new URLSearchParams({ machineId: archive.machineId });
+      const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}?${params.toString()}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`已永久删除 ${archive.machineId} 上的回收站归档 ${archive.sessionId}`);
       await loadSessions();
+    } catch (err) {
+      setActionMessage(`永久删除失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
       setBusyId(null);
     }
@@ -2952,9 +2967,11 @@ function App() {
           {!loading && activeTab === 'recycle' && visibleRecycleArchives.length === 0 ? <div className="empty">回收站为空</div> : null}
           {activeTab === 'recycle'
             ? visibleRecycleArchives.map((archive) => (
-                <div key={archive.archiveDir} className="archive-row">
+                <div key={`${archive.machineId}:${archive.archiveDir}`} className="archive-row">
                   <span className="session-key">{archive.sessionId}</span>
-                  <span className="session-summary">删除：{formatDate(archive.deletedAt)} · 过期：{formatDate(archive.expiresAt)}</span>
+                  <span className="session-summary">
+                    {archive.machineId} · {archive.agent ? agentLabel(archive.agent) : '未知来源'} · 删除：{formatDate(archive.deletedAt)} · 过期：{formatDate(archive.expiresAt)}
+                  </span>
                   <span className="session-summary">{archive.archiveDir}</span>
                   <span className="archive-actions">
                     <button type="button" className="primary-button" disabled={busyId === `${archive.sessionId}:restore`} onClick={() => void restoreArchive(archive)}>
@@ -3074,26 +3091,6 @@ function App() {
             </button>
             <button
               type="button"
-              className="primary-button"
-              disabled={loading}
-              title="调用当前 AI 模型，重算整段摘要和目录识别"
-              onClick={() => void loadSessions(true)}
-            >
-              <Sparkles size={17} />
-              AI 重算
-            </button>
-            <button
-              type="button"
-              className="primary-button"
-              disabled={busyId === 'retry-failed'}
-              title="只清空失败摘要缓存，然后重新进入总结工作流"
-              onClick={() => void retryFailedSummaries()}
-            >
-              <RefreshCw size={17} />
-              重试失败摘要
-            </button>
-            <button
-              type="button"
               className="danger-button"
               disabled={busyId === 'prune'}
               onClick={() => void pruneRecommended()}
@@ -3144,12 +3141,13 @@ function App() {
             <section className="primary-panel">
               <h3>回收站会话记录</h3>
               <p className="long-summary">
-                回收站只展示归档元数据和路径；原始会话已从 Codex 活跃目录清除，归档文件会在过期时间后自动删除。
+                回收站汇总本机与 worker 的归档元数据和路径；原始会话已从 Codex / Claude 活跃目录清除，归档文件会在过期时间后自动删除。
               </p>
               <div className="archive-detail-list">
                 {visibleRecycleArchives.map((archive) => (
-                  <div className="archive-detail" key={archive.archiveDir}>
+                  <div className="archive-detail" key={`${archive.machineId}:${archive.archiveDir}`}>
                     <strong>{archive.sessionId}</strong>
+                    <span>机器：{archive.machineId} · 来源：{archive.agent ? agentLabel(archive.agent) : '未知'}</span>
                     <span>删除时间：{formatDate(archive.deletedAt)}</span>
                     <span>自动清理：{formatDate(archive.expiresAt)}</span>
                     <code>{archive.archiveDir}</code>

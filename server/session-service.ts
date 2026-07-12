@@ -996,6 +996,7 @@ export class SessionService {
 
   async deleteSession(id: string): Promise<{
     sessionId: string;
+    agent: AgentKind;
     archiveDir: string;
     archivedFiles: string[];
     removedOriginalFiles: string[];
@@ -1010,6 +1011,7 @@ export class SessionService {
       sessionId: id,
       filePath: session.filePath,
       retentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
+      claudeProjectsRoot: this.claudeProjectsRoot,
     });
     await this.store.markDeleted(id);
     return { sessionId: id, ...result };
@@ -1018,6 +1020,7 @@ export class SessionService {
   async deleteSessionsBulk(ids: string[]): Promise<{
     deleted: Array<{
       sessionId: string;
+      agent: AgentKind;
       archiveDir: string;
       archivedFiles: string[];
       removedOriginalFiles: string[];
@@ -1034,6 +1037,7 @@ export class SessionService {
       codexHome: this.codexHome,
       sessions: found,
       retentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
+      claudeProjectsRoot: this.claudeProjectsRoot,
     });
     await this.store.markDeletedMany(deleted.map((item) => item.sessionId));
     return { deleted, missingIds };
@@ -1193,6 +1197,7 @@ export class SessionService {
       codexHome: this.codexHome,
       recycleRoot: getRecycleRoot(),
       sessionId,
+      claudeProjectsRoot: this.claudeProjectsRoot,
     });
     await this.store.unmarkDeleted(sessionId);
     return result;

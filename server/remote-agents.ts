@@ -132,18 +132,22 @@ export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: u
   return (await response.json()) as T;
 }
 
-export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
+export async function deleteAgentJson<T>(agent: RemoteAgent, path: string, body: unknown): Promise<T> {
   const response = await fetchWithTimeout(
-    remoteUrl(agent, `/api/sessions/${encodeURIComponent(sessionId)}`),
+    remoteUrl(agent, path),
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: true }),
+      body: JSON.stringify(body),
     }
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
   return (await response.json()) as T;
+}
+
+export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
+  return deleteAgentJson<T>(agent, `/api/sessions/${encodeURIComponent(sessionId)}`, { confirm: true });
 }
 
 export async function deleteAgentSessionsBulk<T>(agent: RemoteAgent, sessionIds: string[]): Promise<T> {

@@ -12,12 +12,13 @@ import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { getCodexHome, getStatePath, isClaudeSessionPath } from './file-ops.js';
+import { getCodexHome, getStatePath, isClaudeSessionPath, type RecycleArchive } from './file-ops.js';
 import { getKnowledgeDbPath, KnowledgeStore } from './knowledge-store.js';
 import { readAnalysisRuns } from './analysis-log.js';
 import { parseSessionHistory } from './session-parser.js';
 import {
   checkRemoteAgent,
+  deleteAgentJson,
   deleteAgentSession,
   deleteAgentSessionsBulk,
   fetchAgentJson,
@@ -144,6 +145,10 @@ const backfillSchema = z.object({
 });
 const bulkDeleteSchema = z.object({ confirm: z.literal(true), ids: z.array(z.string().min(1).max(160)).min(1).max(200) });
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
+const machineRouteQuerySchema = z.object({
+  machineId: z.string().min(1).max(300).optional(),
+  remote: z.enum(['0', '1', 'true', 'false']).optional(),
+});
 const hermesSearchSchema = z.object({
   q: z.string().min(1).transform((value) => value.slice(0, 1000)),
   limit: z.coerce.number().int().min(1).max(20).optional(),
@@ -1177,10 +1182,18 @@ function buildCodexWorkerPrompt(input: {
     .join('\n');
 }
 
-async function deleteSessionById(id: string) {
+async function deleteSessionById(id: string, machineId?: string) {
+  const localMachineId = service.getMeta().machineId;
+  if (machineId && machineId !== localMachineId) {
+    const agent = remoteAgents.find((candidate) => candidate.id === machineId);
+    if (!agent) throw new Error(`Remote machine not configured: ${machineId}`);
+    return deleteAgentSession(agent, id);
+  }
+
   try {
     return await service.deleteSession(id);
   } catch (localError) {
+    if (machineId === localMachineId) throw localError;
     for (const agent of remoteAgents) {
       try {
         return await deleteAgentSession(agent, id);
@@ -1227,6 +1240,120 @@ async function deleteSessionsByIdsBulk(ids: string[], includeRemote: boolean) {
   }
 
   return cleanIds.map((id) => resultsById.get(id) ?? { id, ok: false, error: `Session not found: ${id}` });
+}
+
+interface RoutedRecycleArchive extends RecycleArchive {
+  machineId: string;
+}
+
+async function listRecycleArchivesAggregated(includeRemote: boolean): Promise<{
+  archives: RoutedRecycleArchive[];
+  errors: Array<{ machineId: string; error: string }>;
+}> {
+  const localMachineId = service.getMeta().machineId;
+  const archives: RoutedRecycleArchive[] = (await service.listRecycleBin()).map((archive) => ({
+    ...archive,
+    machineId: localMachineId,
+  }));
+  const errors: Array<{ machineId: string; error: string }> = [];
+
+  if (includeRemote) {
+    const remoteResults = await Promise.all(remoteAgents.map(async (agent) => {
+      try {
+        const payload = await fetchAgentJson<{ archives?: RecycleArchive[] }>(agent, '/api/recycle-bin?remote=0');
+        return {
+          archives: (payload.archives ?? []).map((archive) => ({ ...archive, machineId: agent.id })),
+          error: null,
+        };
+      } catch (error) {
+        return {
+          archives: [] as RoutedRecycleArchive[],
+          error: error instanceof Error ? error.message : 'remote recycle bin unavailable',
+        };
+      }
+    }));
+    for (let index = 0; index < remoteResults.length; index += 1) {
+      const remoteResult = remoteResults[index];
+      archives.push(...remoteResult.archives);
+      if (remoteResult.error) {
+        errors.push({ machineId: remoteAgents[index].id, error: remoteResult.error });
+      }
+    }
+  }
+
+  archives.sort((a, b) => Date.parse(b.deletedAt ?? '') - Date.parse(a.deletedAt ?? ''));
+  return { archives, errors };
+}
+
+async function restoreRecycleArchiveByMachine(sessionId: string, machineId?: string) {
+  const localMachineId = service.getMeta().machineId;
+  if (!machineId || machineId === localMachineId) {
+    try {
+      return await service.restoreRecycleArchive(sessionId);
+    } catch (localError) {
+      if (machineId === localMachineId) throw localError;
+    }
+  }
+
+  const candidates = machineId
+    ? remoteAgents.filter((agent) => agent.id === machineId)
+    : remoteAgents;
+  if (machineId && !candidates.length) throw new Error(`Remote machine not configured: ${machineId}`);
+  let lastError: unknown = null;
+  for (const agent of candidates) {
+    try {
+      return await postAgentJson(agent, `/api/recycle-bin/${encodeURIComponent(sessionId)}/restore?remote=0`, { confirm: true });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Recycle archive not found: ${sessionId}`);
+}
+
+async function purgeRecycleArchiveByMachine(sessionId: string, machineId?: string) {
+  const localMachineId = service.getMeta().machineId;
+  if (!machineId || machineId === localMachineId) {
+    try {
+      return await service.purgeRecycleArchive(sessionId);
+    } catch (localError) {
+      if (machineId === localMachineId) throw localError;
+    }
+  }
+
+  const candidates = machineId
+    ? remoteAgents.filter((agent) => agent.id === machineId)
+    : remoteAgents;
+  if (machineId && !candidates.length) throw new Error(`Remote machine not configured: ${machineId}`);
+  let lastError: unknown = null;
+  for (const agent of candidates) {
+    try {
+      return await deleteAgentJson(agent, `/api/recycle-bin/${encodeURIComponent(sessionId)}?remote=0`, { confirm: true });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Recycle archive not found: ${sessionId}`);
+}
+
+async function pruneAggregatedSessions(
+  includeRemote: boolean,
+  predicate: (session: CodexSession) => boolean
+) {
+  const [localSessions, remoteSessions, panelState] = await Promise.all([
+    getLocalSessionsCached(false, true),
+    includeRemote ? getRemoteSessionsCached() : Promise.resolve([]),
+    store.load(),
+  ]);
+  const targets = [...localSessions, ...remoteSessions]
+    .map((session) => applyPanelSessionState(session, panelState))
+    .filter((session) => !session.kept && predicate(session));
+  const results = await deleteSessionsByIdsBulk(targets.map((session) => session.id), includeRemote);
+  return {
+    matched: targets.length,
+    deleted: results.filter((result) => result.ok).length,
+    failed: results.filter((result) => !result.ok).length,
+    results,
+  };
 }
 
 function clearSessionCaches(): void {
@@ -3100,16 +3227,23 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
   socket.on('error', () => terminal.close());
 });
 
-app.get('/api/recycle-bin', async () => ({
-  meta: service.getMeta(),
-  archives: await service.listRecycleBin(),
-}));
+app.get('/api/recycle-bin', async (request) => {
+  const query = machineRouteQuerySchema.parse(request.query);
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const result = await listRecycleArchivesAggregated(includeRemote);
+  return {
+    meta: service.getMeta(),
+    archives: result.archives,
+    errors: result.errors,
+  };
+});
 
 app.post('/api/recycle-bin/:id/restore', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await service.restoreRecycleArchive(params.id);
+    const result = await restoreRecycleArchiveByMachine(params.id, query.machineId);
     clearSessionCaches();
     return result;
   } catch (error) {
@@ -3119,9 +3253,10 @@ app.post('/api/recycle-bin/:id/restore', async (request, reply) => {
 
 app.delete('/api/recycle-bin/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await service.purgeRecycleArchive(params.id);
+    const result = await purgeRecycleArchiveByMachine(params.id, query.machineId);
     return result;
   } catch (error) {
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Purge failed' });
@@ -3158,9 +3293,10 @@ app.post('/api/sessions/:id/migrate', async (request, reply) => {
 
 app.delete('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await deleteSessionById(params.id);
+    const result = await deleteSessionById(params.id, query.machineId);
     clearSessionCaches();
     return result;
   } catch (error) {
@@ -3169,15 +3305,22 @@ app.delete('/api/sessions/:id', async (request, reply) => {
 });
 
 app.post('/api/sessions/prune', async (request) => {
+  const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
-  const result = await service.pruneRecommended('delete');
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const result = await pruneAggregatedSessions(
+    includeRemote,
+    (session) => session.evaluation.recommendation === 'delete'
+  );
   clearSessionCaches();
   return result;
 });
 
 app.post('/api/sessions/prune-non-kept', async (request) => {
+  const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
-  const result = await service.pruneNonKept();
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  const result = await pruneAggregatedSessions(includeRemote, () => true);
   clearSessionCaches();
   return result;
 });
