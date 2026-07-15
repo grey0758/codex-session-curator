@@ -1,9 +1,8 @@
 import cors from '@fastify/cors';
 import compress from '@fastify/compress';
-import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
-import type { FastifyRequest } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -13,8 +12,7 @@ import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep 
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { getCodexHome, getStatePath, isClaudeSessionPath, type RecycleArchive } from './file-ops.js';
-import { getKnowledgeDbPath, KnowledgeStore } from './knowledge-store.js';
-import { readAnalysisRuns } from './analysis-log.js';
+import type { KnowledgeStore } from './knowledge-store.js';
 import { parseSessionHistory } from './session-parser.js';
 import {
   checkRemoteAgent,
@@ -61,13 +59,16 @@ import {
 } from './codex-jobs.js';
 import { evaluateJobSemantics } from './job-supervisor-ai.js';
 import { buildContextPack, type ContextKnowledgeItem } from './context-pack.js';
+import { searchKnowledgeGateway, type KnowledgeGatewayMatch } from './knowledge-gateway-client.js';
 import {
-  getEvaluatorBaseUrl,
-  getEvaluatorModel,
-  getEvaluatorProvider,
-  getEvaluatorRpmLimit,
-  getRecommendedEvaluationConcurrency,
-} from './evaluator.js';
+  getCanonicalKnowledgeRepoPath,
+  readCanonicalKnowledgeDocument,
+} from './knowledge-documents.js';
+import {
+  getCuratorCapabilities,
+  getCuratorRole,
+  isHubOnlyApiPath,
+} from './runtime-role.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -91,11 +92,22 @@ const app = Fastify({
     },
   },
 });
+const curatorRole = getCuratorRole();
+const curatorCapabilities = getCuratorCapabilities(curatorRole);
 const codexHome = getCodexHome();
 const store = new CuratorStore(getStatePath(codexHome));
-const knowledgeStore = new KnowledgeStore(getKnowledgeDbPath(codexHome));
+const knowledgeStore = await (async (): Promise<KnowledgeStore | null> => {
+  if (curatorRole !== 'hub') return null;
+  const { getKnowledgeDbPath, KnowledgeStore: HubKnowledgeStore } = await import('./knowledge-store.js');
+  return new HubKnowledgeStore(getKnowledgeDbPath(codexHome));
+})();
 const service = new SessionService(store);
-const remoteAgents = getRemoteAgents();
+const remoteAgents = curatorRole === 'hub' ? getRemoteAgents() : [];
+
+function requireKnowledgeStore(): KnowledgeStore {
+  if (!knowledgeStore) throw new Error('Knowledge store is unavailable in worker role');
+  return knowledgeStore;
+}
 
 const sessionCacheTtlMs = Number(process.env.CURATOR_SESSION_CACHE_TTL_MS || 8000);
 const remoteSessionCacheTtlMs = Number(process.env.CURATOR_REMOTE_SESSION_CACHE_TTL_MS || 15000);
@@ -344,6 +356,9 @@ const knowledgeSearchSchema = z.object({
   project: z.string().max(1000).optional(),
   repo: z.string().max(1000).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+const knowledgeDocumentQuerySchema = z.object({
+  path: z.string().min(1).max(2000),
 });
 
 type SessionListItem = Awaited<ReturnType<SessionService['listSessions']>>[number];
@@ -1056,7 +1071,7 @@ function toKnowledgeItem(document: ReturnType<typeof buildHermesSearchDocuments>
 }
 
 async function syncKnowledgeItems(items: Array<ReturnType<typeof toKnowledgeItem>>): Promise<void> {
-  if (!items.length) return;
+  if (!knowledgeStore || !items.length) return;
   for (const item of items) {
     try {
       const existing = await knowledgeStore.getItem(item.id);
@@ -1456,7 +1471,7 @@ async function runAutoBackfill(reason: string): Promise<void> {
 async function getLocalSessionsCached(refreshWorkflow: boolean, fast: boolean) {
   if (refreshWorkflow || sessionCacheTtlMs <= 0) {
     clearSessionCaches();
-    return service.listSessions({ refreshWorkflow, fast: false });
+    return service.listSessions({ refreshWorkflow, fast });
   }
   const now = Date.now();
   if (fast) {
@@ -1797,7 +1812,7 @@ setInterval(
 ).unref();
 
 const autoBackfillIntervalMs = readIntEnv('CURATOR_AUTO_BACKFILL_INTERVAL_MS', 0, 0, 24 * 60 * 60 * 1000);
-if (autoBackfillIntervalMs > 0) {
+if (curatorRole === 'hub' && autoBackfillIntervalMs > 0) {
   const initialDelayMs = readIntEnv('CURATOR_AUTO_BACKFILL_INITIAL_DELAY_MS', 30_000, 5_000, autoBackfillIntervalMs);
   setTimeout(() => void runAutoBackfill('startup'), initialDelayMs).unref();
   setInterval(() => void runAutoBackfill('interval'), autoBackfillIntervalMs).unref();
@@ -1858,7 +1873,10 @@ startCodexSupervisorLoop({
 app.log.info({ intervalMs: readIntEnv('CURATOR_CODEX_SUPERVISOR_INTERVAL_MS', 30_000, 1_000, 3_600_000) }, 'Codex supervisor loop enabled');
 
 const semanticSupervisorIntervalMs = readIntEnv('CURATOR_CODEX_SEMANTIC_SUPERVISOR_INTERVAL_MS', 0, 0, 3_600_000);
-if (semanticSupervisorIntervalMs > 0 || process.env.CURATOR_CODEX_SEMANTIC_SUPERVISOR === '1') {
+if (
+  curatorRole === 'hub' &&
+  (semanticSupervisorIntervalMs > 0 || process.env.CURATOR_CODEX_SEMANTIC_SUPERVISOR === '1')
+) {
   const intervalMs = semanticSupervisorIntervalMs || 120_000;
   setInterval(() => {
     void (async () => {
@@ -1898,6 +1916,12 @@ await app.register(compress, { global: true, encodings: ['br', 'gzip', 'deflate'
 await app.register(websocket);
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_request, body, done) => {
   done(null, body);
+});
+
+app.addHook('onRequest', async (request, reply) => {
+  if (curatorRole === 'worker' && isHubOnlyApiPath(request.url)) {
+    return reply.code(404).send({ error: 'Not found' });
+  }
 });
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -2057,7 +2081,11 @@ app.all('/api/codex/*', async (request, reply) => {
   return reply.code(injected.statusCode).send(injected.body);
 });
 
-app.get('/api/meta', async () => service.getMeta());
+app.get('/api/meta', async () => ({
+  ...service.getMeta(),
+  role: curatorRole,
+  capabilities: curatorCapabilities,
+}));
 
 app.post('/api/commander-actions', async (request, reply) => {
   const body = commanderActionCreateSchema.parse(request.body ?? {});
@@ -2107,35 +2135,129 @@ app.get('/api/commander-actions', async () => ({
 
 app.post('/api/knowledge/items', async (request, reply) => {
   const body = knowledgeItemCreateSchema.parse(request.body ?? {});
-  const item = await knowledgeStore.createItem(body);
+  const item = await requireKnowledgeStore().createItem(body);
   return reply.code(201).send({ item });
 });
 
 app.patch('/api/knowledge/items/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = knowledgeItemUpdateSchema.parse(request.body ?? {});
-  const item = await knowledgeStore.updateItem(params.id, body);
+  const item = await requireKnowledgeStore().updateItem(params.id, body);
   if (!item) return reply.code(404).send({ error: 'Knowledge item not found' });
   return { item };
 });
 
 app.get('/api/knowledge/items/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const item = await knowledgeStore.getItem(params.id);
+  const item = await requireKnowledgeStore().getItem(params.id);
   if (!item) return reply.code(404).send({ error: 'Knowledge item not found' });
   return { item };
 });
 
+function gatewayKnowledgeType(path: string): KnowledgeItemType {
+  if (path.startsWith('knowledge/runbooks/')) return 'runbook';
+  if (path.startsWith('knowledge/decisions/')) return 'decision';
+  if (path.startsWith('knowledge/inventories/')) return 'service';
+  if (path === 'knowledge/INDEX.md') return 'project';
+  return 'note';
+}
+
+function gatewayMatchToKnowledgeItem(match: KnowledgeGatewayMatch): KnowledgeItem {
+  const now = new Date().toISOString();
+  const lineSuffix = match.startLine ? `#L${match.startLine}` : '';
+  const headingSuffix = match.heading && match.heading !== match.title ? ` - ${match.heading}` : '';
+  return {
+    id: `gateway:${match.id}`,
+    type: gatewayKnowledgeType(match.path),
+    scope: 'canonical_markdown_chunk',
+    title: `${match.title}${headingSuffix}`,
+    text: match.text,
+    project: 'agent-knowledge-stack',
+    repo: getCanonicalKnowledgeRepoPath(),
+    cwd: null,
+    machineId: service.getMeta().machineId,
+    tags: [...new Set(['knowledge-gateway', match.kind ?? '', ...match.tags].filter(Boolean))],
+    source: `${match.path}${lineSuffix}`,
+    confidence: Math.max(0, Math.min(1, match.score)),
+    lastVerifiedAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function requestedKnowledgeTypes(query: z.infer<typeof knowledgeSearchSchema>): Set<KnowledgeItemType> {
+  const values = Array.isArray(query.type) ? query.type : query.type ? [query.type] : [];
+  return new Set(values);
+}
+
+async function searchFederatedKnowledge(query: z.infer<typeof knowledgeSearchSchema>) {
+  const limit = query.limit ?? 20;
+  const localResults = await requireKnowledgeStore().search({ ...query, limit: Math.max(limit, Math.min(100, limit * 2)) });
+  const gateway = query.q?.trim()
+    ? await searchKnowledgeGateway({ query: query.q.trim(), limit: Math.max(limit, Math.min(50, limit * 2)), projectCwd: query.repo })
+    : { available: false, queryId: null, retrieval: null, collection: null, matches: [], error: null };
+  const requestedTypes = requestedKnowledgeTypes(query);
+  const gatewayResults = gateway.matches
+    .map((match) => ({ score: match.score, item: gatewayMatchToKnowledgeItem(match) }))
+    .filter((result) => requestedTypes.size === 0 || requestedTypes.has(result.item.type));
+
+  const localEntries = new Map<string, { score: number; item: KnowledgeItem; source: 'sqlite' }>();
+  for (const result of localResults) {
+    localEntries.set(result.item.id, { ...result, source: 'sqlite' });
+  }
+  const gatewayEntries = new Map<string, { score: number; item: KnowledgeItem; source: 'gateway' }>();
+  for (const result of gatewayResults) {
+    const key = `gateway:${result.item.source ?? result.item.id}:${result.item.title}`;
+    const existing = gatewayEntries.get(key);
+    if (!existing || result.score > existing.score) gatewayEntries.set(key, { ...result, source: 'gateway' });
+  }
+  const rankedLocal = [...localEntries.values()].sort(
+    (left, right) => right.score - left.score || right.item.updatedAt.localeCompare(left.item.updatedAt),
+  );
+  const rankedGateway = [...gatewayEntries.values()].sort((left, right) => right.score - left.score);
+  const gatewayQuota = rankedGateway.length ? Math.max(1, Math.floor(limit / 3)) : 0;
+  const results: Array<{ score: number; item: KnowledgeItem; source: 'sqlite' | 'gateway' }> = [
+    ...rankedLocal.slice(0, Math.max(0, limit - gatewayQuota)),
+    ...rankedGateway.slice(0, gatewayQuota),
+  ];
+  if (results.length < limit) {
+    const selectedIds = new Set(results.map((result) => `${result.source}:${result.item.id}`));
+    for (const result of [...rankedLocal, ...rankedGateway]) {
+      const key = `${result.source}:${result.item.id}`;
+      if (selectedIds.has(key)) continue;
+      results.push(result);
+      selectedIds.add(key);
+      if (results.length >= limit) break;
+    }
+  }
+  return {
+    results,
+    sources: {
+      sqlite: { count: results.filter((result) => result.source === 'sqlite').length },
+      gateway: {
+        available: gateway.available,
+        count: results.filter((result) => result.source === 'gateway').length,
+        queryId: gateway.queryId,
+        retrieval: gateway.retrieval,
+        collection: gateway.collection,
+        error: gateway.error,
+      },
+    },
+  };
+}
+
 async function buildKnowledgeSearchResponse(rawQuery: unknown) {
   const query = knowledgeSearchSchema.parse(rawQuery);
-  const results = await knowledgeStore.search(query);
+  const federated = await searchFederatedKnowledge(query);
   return {
     query: query.q ?? '',
-    count: results.length,
-    items: results.map((result) => ({
+    count: federated.results.length,
+    items: federated.results.map((result) => ({
       score: result.score,
+      retrievalSource: result.source,
       ...result.item,
     })),
+    sources: federated.sources,
   };
 }
 
@@ -2146,7 +2268,34 @@ app.get('/api/knowledge/search', async (request) => {
 app.get('/api/hermes/knowledge-search', async (request) => {
   return buildKnowledgeSearchResponse(request.query);
 });
+
+async function knowledgeDocumentResponse(rawQuery: unknown, reply: FastifyReply) {
+  const query = knowledgeDocumentQuerySchema.parse(rawQuery);
+  try {
+    return { document: await readCanonicalKnowledgeDocument(query.path) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Knowledge document unavailable';
+    const invalid = /invalid|only markdown|outside allowed|escapes|size limit/i.test(message);
+    return reply.code(invalid ? 400 : 404).send({ error: message });
+  }
+}
+
+app.get('/api/knowledge/document', async (request, reply) => {
+  return knowledgeDocumentResponse(request.query, reply);
+});
+
+app.get('/api/hermes/knowledge-document', async (request, reply) => {
+  return knowledgeDocumentResponse(request.query, reply);
+});
 app.get('/api/analysis-runs', async () => {
+  const { readAnalysisRuns } = await import('./analysis-log.js');
+  const {
+    getEvaluatorBaseUrl,
+    getEvaluatorModel,
+    getEvaluatorProvider,
+    getEvaluatorRpmLimit,
+    getRecommendedEvaluationConcurrency,
+  } = await import('./evaluator.js');
   const records = await readAnalysisRuns(160);
   const now = Date.now();
   const lastHourRecords = records.filter((record) => now - Date.parse(record.timestamp) <= 60 * 60_000);
@@ -2366,22 +2515,24 @@ async function buildContextPackResponse(rawQuery: unknown) {
   ].slice(0, Math.max(80, limit * 12));
   await syncKnowledgeItems(syncedKnowledgeItems);
   const projectFilter = (query.repo ?? query.cwd)?.replace(/\/+$/, '').split('/').filter(Boolean).at(-1);
-  const storedKnowledge = await knowledgeStore.search({
-    q: searchNeedle || needle,
-    project: projectFilter,
-    repo: query.repo,
+  const federatedKnowledge = await searchFederatedKnowledge({
+    q: needle || projectFilter,
     limit: Math.max(20, limit * 4),
   });
   const projectKnowledge = projectFilter
-    ? await knowledgeStore.search({
+    ? await requireKnowledgeStore().search({
         project: projectFilter,
         repo: query.repo,
         limit: Math.max(20, limit * 4),
       })
     : [];
   const storedKnowledgeItems = new Map<string, KnowledgeItem>();
-  for (const result of [...storedKnowledge, ...projectKnowledge]) {
-    storedKnowledgeItems.set(result.item.id, result.item);
+  for (const result of [...federatedKnowledge.results, ...projectKnowledge]) {
+    const canonicalPath = result.item.source?.startsWith('knowledge/')
+      ? result.item.source.split('#', 1)[0]
+      : null;
+    const key = canonicalPath ? `canonical:${canonicalPath}` : result.item.id;
+    if (!storedKnowledgeItems.has(key)) storedKnowledgeItems.set(key, result.item);
   }
   const knowledgeItems = [
     ...[...storedKnowledgeItems.values()].map(toContextKnowledgeItem),
@@ -3368,7 +3519,8 @@ app.get('/api/evaluations/refresh-jobs/:id', async (request, reply) => {
 });
 
 const distPath = join(__dirname, '..', 'dist');
-if (existsSync(distPath)) {
+if (curatorRole === 'hub' && existsSync(distPath)) {
+  const { default: fastifyStatic } = await import('@fastify/static');
   await app.register(fastifyStatic, {
     root: distPath,
     prefix: '/',
@@ -3393,4 +3545,4 @@ const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 54177);
 
 await app.listen({ host, port });
-app.log.info(`Codex Session Curator listening on http://${host}:${port}`);
+app.log.info({ role: curatorRole, capabilities: curatorCapabilities }, `Codex Session Curator listening on http://${host}:${port}`);

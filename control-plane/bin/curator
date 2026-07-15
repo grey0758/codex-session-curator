@@ -16,6 +16,7 @@ from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:54177"
 DEFAULT_AUTH_FILE = Path.home() / ".config" / "codex-session-curator" / "auth.env"
+DEFAULT_CLIENT_FILE = Path.home() / ".config" / "codex-session-curator" / "client.env"
 
 
 class CuratorError(RuntimeError):
@@ -43,7 +44,14 @@ def get_admin_token() -> str | None:
 
 
 def base_url() -> str:
-    return os.environ.get("CURATOR_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    client_env = read_env_file(DEFAULT_CLIENT_FILE)
+    return (
+        os.environ.get("CURATOR_BASE_URL")
+        or os.environ.get("CURATOR_HUB_BASE_URL")
+        or client_env.get("CURATOR_BASE_URL")
+        or client_env.get("CURATOR_HUB_BASE_URL")
+        or DEFAULT_BASE_URL
+    ).rstrip("/")
 
 
 def with_query(path: str, params: dict[str, Any] | None = None) -> str:
@@ -298,6 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=20)
     add_common_output_flags(p)
 
+    p = sub.add_parser("knowledge-document", help="read a canonical Markdown knowledge document from the Hub")
+    p.add_argument("path", help="repository-relative path such as knowledge/runbooks/example.md")
+    add_common_output_flags(p)
+
     p = sub.add_parser("context-pack", help="build a compact context pack for a task")
     p.add_argument("query")
     p.add_argument("--cwd")
@@ -498,6 +510,9 @@ def main(argv: list[str] | None = None) -> int:
                 "/api/hermes/knowledge-search",
                 {"q": args.query, "type": args.type, "project": args.project, "repo": args.repo, "limit": args.limit},
             )
+            print_json(data)
+        elif args.command == "knowledge-document":
+            data = request_json("GET", "/api/hermes/knowledge-document", {"path": args.path})
             print_json(data)
         elif args.command == "context-pack":
             data = request_json(

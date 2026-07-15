@@ -21,11 +21,10 @@ import {
 } from './file-ops.js';
 import {
   EVALUATOR_WORKFLOW,
-  evaluateSession,
-  getRecommendedEvaluationConcurrency,
   isEvaluationWorkflowCompatible,
   isEvaluationWorkflowComplete,
-} from './evaluator.js';
+} from './evaluation-workflow.js';
+import { getCuratorRole } from './runtime-role.js';
 import { extractSessionId, parseSessionFile, parseSessionHistory, parseSessionMessages } from './session-parser.js';
 import { CuratorStore } from './store.js';
 import type {
@@ -43,8 +42,20 @@ import type {
   UpdateCadence,
 } from './types.js';
 
-function getEvaluationConcurrency(): number {
+async function getEvaluationConcurrency(): Promise<number> {
+  if (getCuratorRole() === 'worker') return 1;
+  const { getRecommendedEvaluationConcurrency } = await import('./evaluator.js');
   return getRecommendedEvaluationConcurrency();
+}
+
+async function evaluateSessionWithModel(input: {
+  messages: ParsedMessage[];
+  userTurns: number;
+  assistantTurns: number;
+  cwd: string | null;
+}): Promise<Evaluation> {
+  const { evaluateSession } = await import('./evaluator.js');
+  return evaluateSession(input);
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -571,7 +582,7 @@ export class SessionService {
       }
     }
 
-    const evaluated = await mapLimit(parseQueue, getEvaluationConcurrency(), async (item) => {
+    const evaluated = await mapLimit(parseQueue, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
       const cached = state.evaluations[parsed.id];
       const updateMeta = classifyUpdate({
@@ -622,7 +633,7 @@ export class SessionService {
               status: cached.status ?? 'fallback',
               error: cached.error ?? null,
             }
-          : options.fast
+          : options.fast || getCuratorRole() === 'worker'
             ? fastEvaluation({
                 id: parsed.id,
                 cwd: parsed.cwd,
@@ -633,7 +644,7 @@ export class SessionService {
                 updateMeta,
               })
             : applyUpdateMeta(
-                await evaluateSession({
+                await evaluateSessionWithModel({
                   messages: parsed.messages,
                   userTurns: parsed.userTurns,
                   assistantTurns: parsed.assistantTurns,
@@ -804,18 +815,28 @@ export class SessionService {
       await this.store.save(state);
     }
     try {
-    const evaluation = applyUpdateMeta(
-      await evaluateSession({
-        messages: parsed.messages,
-        userTurns: parsed.userTurns,
-        assistantTurns: parsed.assistantTurns,
-        cwd: parsed.cwd,
-      }),
-      {
-        ...updateMeta,
-        reviewSignals: [`AI 重算：${reason}`, ...updateMeta.reviewSignals].slice(0, 6),
-      }
-    );
+    const evaluation = getCuratorRole() === 'worker'
+      ? fastEvaluation({
+          id: parsed.id,
+          cwd: parsed.cwd,
+          cached,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          messageCount: parsed.messageCount,
+          updateMeta,
+        })
+      : applyUpdateMeta(
+          await evaluateSessionWithModel({
+            messages: parsed.messages,
+            userTurns: parsed.userTurns,
+            assistantTurns: parsed.assistantTurns,
+            cwd: parsed.cwd,
+          }),
+          {
+            ...updateMeta,
+            reviewSignals: [`AI 重算：${reason}`, ...updateMeta.reviewSignals].slice(0, 6),
+          }
+        );
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const refreshedAt = new Date().toISOString();
     state.evaluations[id] = {
@@ -1124,7 +1145,7 @@ export class SessionService {
     const batch = candidates.slice(0, limit);
     let stateChanged = false;
 
-    const results = await mapLimit(batch, getEvaluationConcurrency(), async (item) => {
+    const results = await mapLimit(batch, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
       const cached = state.evaluations[parsed.id];
       const updateMeta = classifyUpdate({
@@ -1134,15 +1155,25 @@ export class SessionService {
         userTurns: parsed.userTurns,
         messageCount: parsed.messageCount,
       });
-      const evaluation = applyUpdateMeta(
-        await evaluateSession({
-          messages: parsed.messages,
-          userTurns: parsed.userTurns,
-          assistantTurns: parsed.assistantTurns,
-          cwd: parsed.cwd,
-        }),
-        updateMeta
-      );
+      const evaluation = getCuratorRole() === 'worker'
+        ? fastEvaluation({
+            id: parsed.id,
+            cwd: parsed.cwd,
+            cached,
+            userTurns: parsed.userTurns,
+            assistantTurns: parsed.assistantTurns,
+            messageCount: parsed.messageCount,
+            updateMeta,
+          })
+        : applyUpdateMeta(
+            await evaluateSessionWithModel({
+              messages: parsed.messages,
+              userTurns: parsed.userTurns,
+              assistantTurns: parsed.assistantTurns,
+              cwd: parsed.cwd,
+            }),
+            updateMeta
+          );
       const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
       state.evaluations[parsed.id] = {
         ...evaluation,

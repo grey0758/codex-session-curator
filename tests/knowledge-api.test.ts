@@ -83,6 +83,7 @@ test('Knowledge API creates, updates, gets, searches, filters, and redacts items
         CURATOR_RECYCLE_ROOT: join(testRoot, 'recycle'),
         CURATOR_MACHINE_ID: 'knowledge-api-machine',
         CURATOR_REMOTE_AGENTS: '',
+        CURATOR_KNOWLEDGE_GATEWAY_ENABLED: '0',
         CURATOR_AUTH_USER: '',
         CURATOR_AUTH_PASSWORD: '',
         CURATOR_ADMIN_TOKEN: '',

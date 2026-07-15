@@ -1,0 +1,16 @@
+[Unit]
+Description=SSH production tunnel to us002 thin Curator worker and back to gpl001 Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/grey
+Environment=PATH=/home/grey/.local/bin:/home/grey/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/grey/.config/codex-session-curator/onepassword.env
+ExecStart=/home/grey/bin/ssh-1p us002-curator-worker-tunnel
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

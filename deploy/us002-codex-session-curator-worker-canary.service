@@ -1,0 +1,35 @@
+[Unit]
+Description=Codex and Claude Curator thin worker canary on us002
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/grey/data/apps/codex-session-curator-worker/current
+Environment=HOME=/home/grey
+Environment=PATH=/home/grey/.npm-global/bin:/home/grey/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOST=127.0.0.1
+Environment=PORT=55177
+Environment=CODEX_HOME=/home/grey/.codex
+Environment=CLAUDE_CONFIG_DIR=/home/grey/.claude
+Environment=CODEX_CURATOR_STATE=/home/grey/.codex/session-curator-worker-state.json
+Environment=CURATOR_CODEX_JOBS_PATH=/home/grey/.codex/session-curator-worker-jobs.json
+Environment=CURATOR_RECYCLE_ROOT=/home/grey/.codex/session-curator-worker-recycle-bin
+Environment=CODEX_BIN=/home/grey/.npm-global/bin/codex
+Environment=CLAUDE_BIN=/home/grey/.npm-global/bin/claude
+Environment=CURATOR_ROLE=worker
+Environment=CURATOR_MACHINE_ID=us002-canary
+Environment=CURATOR_REMOTE_AGENTS=
+Environment=CURATOR_AUTO_BACKFILL_INTERVAL_MS=0
+Environment=CURATOR_CODEX_SEMANTIC_SUPERVISOR_INTERVAL_MS=0
+Environment=CURATOR_SESSION_CACHE_TTL_MS=8000
+Environment=CURATOR_TERMINAL_TRANSPORT=local
+Environment=CURATOR_TERMINAL_TMUX_SOCKET=codex-curator-canary
+Environment=CURATOR_HUB_BASE_URL=http://127.0.0.1:54176
+EnvironmentFile=-/home/grey/.config/codex-session-curator/auth.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

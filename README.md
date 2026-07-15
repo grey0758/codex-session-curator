@@ -1,18 +1,18 @@
 # Codex Session Curator
 
-Codex Session Curator is a local-first web panel for reviewing, searching, summarizing, resuming, and safely archiving Codex CLI sessions across one or more machines.
+Codex Session Curator is a local-first web panel and agent control plane for reviewing, searching, summarizing, resuming, and safely archiving Codex CLI and Claude Code sessions across one or more machines.
 
 It is designed for people who use Codex heavily and end up with many saved sessions under `~/.codex`. The app helps you find useful project work, identify disposable one-off conversations, keep important sessions, and move stale records into a recoverable recycle bin.
 
 ## What It Does
 
-- Scans local Codex session files under `~/.codex/sessions`.
+- Scans Codex sessions under `~/.codex/sessions` and Claude sessions under `~/.claude/projects`.
 - Extracts session ids, timestamps, working directories, message counts, and shell snapshot counts.
 - Generates Chinese AI summaries, titles, directory hints, tech stack tags, and searchable keywords.
 - Groups sessions by machine, project directory, or activity date.
-- Copies resume commands such as `codex resume <session-id>`.
+- Copies agent-specific resume commands such as `codex resume <session-id>` and `claude --resume <session-id>`.
 - Shows session history on demand instead of loading every transcript into the panel.
-- Opens an xterm.js web terminal backed by `node-pty` for continuing a real Codex session.
+- Opens an xterm.js web terminal backed by `node-pty`, SSH, and tmux for continuing real Codex or Claude sessions.
 - Supports remote agents so each machine manages its own local Codex files.
 - Archives deleted sessions into a recycle bin before removing them from active Codex directories.
 - Supports manual keep labels, bulk delete, restore, and permanent purge.
@@ -180,6 +180,23 @@ CODEX_HOME=/home/you/.codex
 ```
 
 Remote deletion is performed by the remote agent on its own machine, not by the control server directly.
+
+### Thin Worker Role
+
+Set `CURATOR_ROLE=worker` for remote execution machines. Worker role keeps
+sessions, history, messages, jobs, files, recycle bin, resume, and terminal
+APIs, while disabling the panel frontend, knowledge, context packs, evaluation,
+server identity, direct actions, and remote aggregation.
+
+Build the standalone artifact with:
+
+```bash
+npm run build:worker
+```
+
+The artifact contains backend runtime code plus `bin/curator`. It intentionally
+omits React/Vite assets, the full control-plane workspace, the evaluator,
+knowledge storage, and frontend dependencies. See [docs/thin-worker.md](docs/thin-worker.md).
 
 ## Systemd Deployment
 

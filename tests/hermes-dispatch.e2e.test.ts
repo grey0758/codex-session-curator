@@ -180,6 +180,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
         CURATOR_CODEX_JOBS_PATH: jobsPath,
         CURATOR_MACHINE_ID: 'hermes-e2e-machine',
         CURATOR_REMOTE_AGENTS: '',
+        CURATOR_KNOWLEDGE_GATEWAY_ENABLED: '0',
         CURATOR_SESSION_CACHE_TTL_MS: '0',
         CURATOR_REMOTE_SESSION_CACHE_TTL_MS: '0',
         CURATOR_CODEX_JOB_TAIL_BYTES: String(128 * 1024),
