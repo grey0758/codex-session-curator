@@ -492,6 +492,7 @@ def session_context_text(data: dict[str, Any]) -> str:
         f"# {evaluation.get('title') or session.get('title') or '(untitled)'}",
         f"- id: {session.get('id')}",
         f"- machine: {session.get('machineId')}",
+        f"- agent: {session.get('agent') or 'unknown'}",
         f"- cwd: {session.get('cwd') or 'unknown'}",
     ]
     resume_command = session.get("resumeCommand")
@@ -529,28 +530,54 @@ def session_context_text(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def fetch_session_context(session_id: str, history_limit: int) -> dict[str, Any]:
+def fetch_session_context(
+    session_id: str,
+    history_limit: int,
+    machine_id: str | None = None,
+    agent: str | None = None,
+) -> dict[str, Any]:
     quoted_id = urllib.parse.quote(session_id, safe="")
+    identity_params = {"machineId": machine_id, "agent": agent}
     try:
-        return request_json("GET", f"/api/hermes/sessions/{quoted_id}/context", {"historyLimit": history_limit})
+        return request_json(
+            "GET",
+            f"/api/hermes/sessions/{quoted_id}/context",
+            {"historyLimit": history_limit, **identity_params},
+        )
     except CuratorError as error:
         if "HTTP 410" not in str(error):
             raise
+        if agent:
+            raise CuratorError(
+                "legacy context fallback cannot guarantee agent identity; "
+                "use a Curator server with composite session routing"
+            ) from error
 
     context_source = "api-session"
     try:
         if history_limit <= 0:
             raise CuratorError("skipping full session fetch for history-limit 0")
-        session = request_json("GET", f"/api/sessions/{quoted_id}")
+        session = request_json("GET", f"/api/sessions/{quoted_id}", identity_params)
     except CuratorError as error:
         session_error = error
-        index = request_json("GET", "/api/hermes/session-index", {"q": session_id, "limit": 10, "remote": "0"})
-        matches = [item for item in index.get("sessions", []) if item.get("id") == session_id]
+        index = request_json("GET", "/api/hermes/session-index", {"q": session_id, "limit": 10})
+        matches = [
+            item
+            for item in index.get("sessions", [])
+            if item.get("id") == session_id
+            and (not machine_id or item.get("machineId") == machine_id)
+            and (not agent or item.get("agent") == agent)
+        ]
         if not matches:
             raise session_error
+        if len(matches) > 1:
+            raise CuratorError(
+                f"ambiguous session identity for {session_id}; pass both --machine and --agent"
+            )
         item = matches[0]
         session = {
             "id": item.get("id"),
+            "agent": item.get("agent"),
             "machineId": item.get("machineId"),
             "cwd": item.get("cwd"),
             "resumeCommand": item.get("resumeCommand"),
@@ -564,7 +591,11 @@ def fetch_session_context(session_id: str, history_limit: int) -> dict[str, Any]
     data: dict[str, Any] = {"session": session, "contextSource": context_source, "contextText": session_context_text(session)}
     if history_limit > 0:
         try:
-            history = request_json("GET", f"/api/sessions/{quoted_id}/history", {"limit": history_limit})
+            history = request_json(
+                "GET",
+                f"/api/sessions/{quoted_id}/history",
+                {"limit": history_limit, **identity_params},
+            )
             data["history"] = history
             data["contextText"] = session_context_text(data)
         except CuratorError as history_error:
@@ -709,12 +740,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("context", help="read session context")
     p.add_argument("session_id")
     p.add_argument("--history-limit", type=int, default=20)
+    p.add_argument("--machine", dest="machine_id", help="target machine identity")
+    p.add_argument("--agent", choices=["codex", "claude"], help="target session agent")
     add_common_output_flags(p)
 
     p = sub.add_parser("dispatch", help="select a matching session and start a Codex worker")
     p.add_argument("query")
     p.add_argument("--prompt")
     p.add_argument("--session-id")
+    p.add_argument("--machine", dest="machine_id", help="target machine identity")
+    p.add_argument("--agent", choices=["codex", "claude"], help="target session agent")
     p.add_argument("--cwd")
     p.add_argument("--repo")
     p.add_argument("--limit", type=int, default=5)
@@ -732,6 +767,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume", help="start a worker for a specific session")
     p.add_argument("session_id")
     p.add_argument("prompt")
+    p.add_argument("--machine", dest="machine_id", help="target machine identity")
+    p.add_argument("--agent", choices=["codex", "claude"], help="target session agent")
     p.add_argument("--mode", choices=["exec", "pty"], default="exec")
     p.add_argument("--model")
     p.add_argument("--template", choices=["fix", "test", "deploy", "review", "migrate", "investigate"])
@@ -821,6 +858,8 @@ def dispatch_body(args: argparse.Namespace) -> dict[str, Any]:
         "query": args.query,
         "prompt": args.prompt,
         "sessionId": args.session_id,
+        "machineId": args.machine_id,
+        "agent": args.agent,
         "cwd": args.cwd,
         "repo": args.repo,
         "limit": args.limit,
@@ -837,6 +876,8 @@ def dispatch_body(args: argparse.Namespace) -> dict[str, Any]:
 def resume_body(args: argparse.Namespace) -> dict[str, Any]:
     body = {
         "sessionId": args.session_id,
+        "machineId": args.machine_id,
+        "agent": args.agent,
         "prompt": args.prompt,
         "mode": args.mode,
         "model": args.model,
@@ -927,7 +968,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print_json(data)
         elif args.command == "context":
-            data = fetch_session_context(args.session_id, args.history_limit)
+            data = fetch_session_context(args.session_id, args.history_limit, args.machine_id, args.agent)
             print_json(data) if args.json else print(data.get("contextText", ""))
         elif args.command == "dispatch":
             data = request_json("POST", "/api/hermes/dispatch", {"remote": "0" if args.no_remote else None}, dispatch_body(args))

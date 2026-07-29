@@ -184,6 +184,7 @@ export interface JobOutcome {
   jobId: string;
   sessionId: string;
   machineId: string;
+  agent: AgentKind;
   status: 'completed' | 'failed' | 'stopped' | 'running' | string;
   mode: 'exec' | 'pty' | string;
   goal: string;

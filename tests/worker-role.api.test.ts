@@ -162,8 +162,8 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
 
     await assert.rejects(access(knowledgeDb));
     const state = JSON.parse(await readFile(statePath, 'utf8')) as { evaluations: Record<string, JsonRecord> };
-    assert.match(String(state.evaluations[codexSessionId].workflow), /:fast-list$/);
-    assert.match(String(state.evaluations[claudeSessionId].workflow), /:fast-list$/);
+    assert.match(String(state.evaluations[`codex|||${codexSessionId}`].workflow), /:fast-list$/);
+    assert.match(String(state.evaluations[`claude|||${claudeSessionId}`].workflow), /:fast-list$/);
   } finally {
     if (worker) await stopServer(worker);
     await rm(testRoot, { recursive: true, force: true });

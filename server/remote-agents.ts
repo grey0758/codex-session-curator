@@ -15,6 +15,20 @@ export interface RemoteAgentStatus {
   machineId: string | null;
 }
 
+export class RemoteAgentHttpError extends Error {
+  readonly agentId: string;
+  readonly status: number;
+  readonly body: unknown;
+
+  constructor(agentId: string, status: number, body: unknown) {
+    super(`${agentId} HTTP ${status}`);
+    this.name = 'RemoteAgentHttpError';
+    this.agentId = agentId;
+    this.status = status;
+    this.body = body;
+  }
+}
+
 const DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS = 3500;
 const DEFAULT_REMOTE_JSON_TIMEOUT_MS = 8000;
 
@@ -182,7 +196,10 @@ export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: u
       body: JSON.stringify(body),
     }
   );
-  if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
+  if (!response.ok) {
+    const responseBody = await response.json().catch(() => null) as unknown;
+    throw new RemoteAgentHttpError(agent.id, response.status, responseBody);
+  }
   return (await response.json()) as T;
 }
 
@@ -200,8 +217,18 @@ export async function deleteAgentJson<T>(agent: RemoteAgent, path: string, body:
   return (await response.json()) as T;
 }
 
-export async function deleteAgentSession<T>(agent: RemoteAgent, sessionId: string): Promise<T> {
-  return deleteAgentJson<T>(agent, `/api/sessions/${encodeURIComponent(sessionId)}`, { confirm: true });
+export async function deleteAgentSession<T>(
+  agent: RemoteAgent,
+  sessionId: string,
+  sessionAgent?: CodexSession['agent'],
+): Promise<T> {
+  const query = new URLSearchParams({ machineId: agent.id, remote: '0' });
+  if (sessionAgent) query.set('agent', sessionAgent);
+  return deleteAgentJson<T>(
+    agent,
+    `/api/sessions/${encodeURIComponent(sessionId)}?${query.toString()}`,
+    { confirm: true },
+  );
 }
 
 export async function deleteAgentSessionsBulk<T>(agent: RemoteAgent, sessionIds: string[]): Promise<T> {
@@ -211,7 +238,10 @@ export async function deleteAgentSessionsBulk<T>(agent: RemoteAgent, sessionIds:
     {
       method: 'POST',
       headers: remoteHeaders(agent, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ confirm: true, ids: sessionIds }),
+      body: JSON.stringify({
+        confirm: true,
+        sessions: sessionIds.map((id) => ({ id, machineId: agent.id })),
+      }),
     }
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);

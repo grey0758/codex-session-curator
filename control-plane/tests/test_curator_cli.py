@@ -223,6 +223,105 @@ class CuratorCliTests(unittest.TestCase):
             ],
         )
 
+    def test_context_forwards_composite_session_identity(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {"contextText": "remote context"}
+
+        self.cli.request_json = fake_request_json
+        with redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "context",
+                "shared-session",
+                "--history-limit",
+                "7",
+                "--machine",
+                "sgp001",
+                "--agent",
+                "claude",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(
+                "GET",
+                "/api/hermes/sessions/shared-session/context",
+                {"historyLimit": 7, "machineId": "sgp001", "agent": "claude"},
+                None,
+            )],
+        )
+
+    def test_context_legacy_fallback_rejects_agent_identity(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            raise self.cli.CuratorError("HTTP 410: gone")
+
+        self.cli.request_json = fake_request_json
+        with self.assertRaisesRegex(
+            self.cli.CuratorError,
+            "legacy context fallback cannot guarantee agent identity",
+        ):
+            self.cli.fetch_session_context(
+                "shared-session",
+                5,
+                "gpl001",
+                "claude",
+            )
+
+        self.assertEqual(
+            calls,
+            [(
+                "GET",
+                "/api/hermes/sessions/shared-session/context",
+                {"historyLimit": 5, "machineId": "gpl001", "agent": "claude"},
+                None,
+            )],
+        )
+
+    def test_dispatch_payload_includes_composite_session_identity(self) -> None:
+        args = self.cli.build_parser().parse_args([
+            "dispatch",
+            "continue remote work",
+            "--session-id",
+            "shared-session",
+            "--machine",
+            "sgp001",
+            "--agent",
+            "codex",
+        ])
+
+        self.assertEqual(self.cli.dispatch_body(args)["sessionId"], "shared-session")
+        self.assertEqual(self.cli.dispatch_body(args)["machineId"], "sgp001")
+        self.assertEqual(self.cli.dispatch_body(args)["agent"], "codex")
+
+    def test_resume_payload_includes_composite_session_identity(self) -> None:
+        args = self.cli.build_parser().parse_args([
+            "resume",
+            "shared-session",
+            "continue the task",
+            "--machine",
+            "sgp001",
+            "--agent",
+            "claude",
+        ])
+
+        self.assertEqual(
+            {
+                key: self.cli.resume_body(args)[key]
+                for key in ("sessionId", "machineId", "agent")
+            },
+            {
+                "sessionId": "shared-session",
+                "machineId": "sgp001",
+                "agent": "claude",
+            },
+        )
+
     def test_knowledge_search_uses_expected_endpoint_and_params(self) -> None:
         calls = []
 

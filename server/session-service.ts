@@ -38,6 +38,7 @@ import type {
   FailureKnowledgeCard,
   JobOutcome,
   ParsedMessage,
+  PersistedState,
   Recommendation,
   RemoteMachine,
   ReviewPriority,
@@ -199,6 +200,15 @@ function verifyResumeCommand(cwd: string | null, id: string): { ok: boolean; out
     ok: !missing && (result.status === 0 || result.status === 124 || output.length > 0),
     output: output.slice(0, 1200),
   };
+}
+
+export class UnsupportedSessionMigrationError extends Error {
+  readonly code = 'CLAUDE_SESSION_MIGRATION_UNSUPPORTED';
+
+  constructor(sessionId: string) {
+    super(`Claude session migration is unsupported; resume the existing session in place: ${sessionId}`);
+    this.name = 'UnsupportedSessionMigrationError';
+  }
 }
 
 function cleanRemoteMachines(machines: RemoteMachine[] | undefined): RemoteMachine[] {
@@ -514,12 +524,32 @@ function enrichSession(base: Omit<CodexSession, 'agent' | 'resumeCommand' | 'mac
   };
 }
 
+export function sessionStateKey(sessionId: string, agent: AgentKind): string {
+  return `${agent}|||${sessionId}`;
+}
+
+export function parseSessionStateKey(
+  stateKey: string,
+): { sessionId: string; agent: AgentKind } | null {
+  const separatorIndex = stateKey.indexOf('|||');
+  if (separatorIndex <= 0) return null;
+  const agent = stateKey.slice(0, separatorIndex);
+  const sessionId = stateKey.slice(separatorIndex + 3);
+  if ((agent !== 'codex' && agent !== 'claude') || !sessionId) return null;
+  return { sessionId, agent };
+}
+
+function sessionAgentForFile(filePath: string): AgentKind {
+  return isClaudeSessionPath(filePath) ? 'claude' : 'codex';
+}
+
 export class SessionService {
   private codexHome = getCodexHome();
   private sessionsRoot = getSessionsRoot(this.codexHome);
   private claudeProjectsRoot = getClaudeProjectsRoot();
   private store: CuratorStore;
   private lastAuditFindingFingerprints = new Map<string, string>();
+  private legacyStateMigrationPromise: Promise<PersistedState> | null = null;
 
   constructor(store: CuratorStore) {
     this.store = store;
@@ -552,29 +582,68 @@ export class SessionService {
     return [...codexFiles, ...primaryClaudeFiles];
   }
 
-  private async findSessionFilesByIds(ids: string[]): Promise<{
-    found: Array<{ sessionId: string; filePath: string }>;
-    missingIds: string[];
+  private sessionStateIdentities(files: string[]): Array<{
+    id: string;
+    stateKey: string;
+    agent: AgentKind;
+    filePath: string;
   }> {
-    const targetIds = new Set(ids.filter(Boolean));
-    const foundById = new Map<string, string>();
-    if (!targetIds.size) return { found: [], missingIds: [] };
-
-    const files = await this.discoverSessionFiles();
-    for (const filePath of files) {
+    return files.map((filePath) => {
       const id = extractSessionId(filePath);
-      if (targetIds.has(id) && !foundById.has(id)) foundById.set(id, filePath);
-    }
+      const agent = sessionAgentForFile(filePath);
+      return {
+        id,
+        stateKey: sessionStateKey(id, agent),
+        agent,
+        filePath,
+      };
+    });
+  }
 
-    const found = [...foundById.entries()].map(([sessionId, filePath]) => ({ sessionId, filePath }));
-    const missingIds = [...targetIds].filter((id) => !foundById.has(id));
-    return { found, missingIds };
+  private async migrateLegacyStateForFiles(
+    files: string[],
+    force = false,
+  ): Promise<PersistedState> {
+    const migrate = () => this.store.migrateLegacySessionKeys(this.sessionStateIdentities(files));
+    if (force) return migrate();
+    if (!this.legacyStateMigrationPromise) {
+      this.legacyStateMigrationPromise = migrate();
+      return this.legacyStateMigrationPromise;
+    }
+    await this.legacyStateMigrationPromise;
+    return this.store.load();
+  }
+
+  async ensureLegacyStateMigrated(): Promise<PersistedState> {
+    if (this.legacyStateMigrationPromise) {
+      await this.legacyStateMigrationPromise;
+      return this.store.load();
+    }
+    return this.migrateLegacyStateForFiles(await this.discoverSessionFiles());
+  }
+
+  private async findSessionFileByIdentity(
+    sessionId: string,
+    agent?: AgentKind | null,
+  ): Promise<{ sessionId: string; filePath: string; agent: AgentKind } | null> {
+    const matches = (await this.discoverSessionFiles())
+      .filter((filePath) => extractSessionId(filePath) === sessionId)
+      .map((filePath) => ({
+        sessionId,
+        filePath,
+        agent: sessionAgentForFile(filePath),
+      }))
+      .filter((match) => !agent || match.agent === agent);
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous session identity: ${sessionId}; agent is required`);
+    }
+    return matches[0] ?? null;
   }
 
   async listSessions(options: { refreshWorkflow?: boolean; fast?: boolean } = {}): Promise<CodexSession[]> {
     const curatorRole = getCuratorRole();
-    const state = await this.store.load();
     const files = await this.discoverSessionFiles();
+    const state = await this.migrateLegacyStateForFiles(files);
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const sessions: CodexSession[] = [];
     const parseQueue: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number }> = [];
@@ -584,8 +653,12 @@ export class SessionService {
       try {
         const fileStat = await stat(filePath);
         const id = extractSessionId(filePath);
-        const cached = state.evaluations[id];
-        const shellSnapshotCount = shellSnapshotCounts.get(id) ?? 0;
+        const agent = sessionAgentForFile(filePath);
+        const stateKey = sessionStateKey(id, agent);
+        const cached = state.evaluations[stateKey];
+        const shellSnapshotCount = agent === 'codex' ? (shellSnapshotCounts.get(id) ?? 0) : 0;
+        const customTitle = state.titles[stateKey];
+        const kept = state.keptIds.includes(stateKey);
 
         const canUseCache =
           cached &&
@@ -611,15 +684,15 @@ export class SessionService {
             lastUserMessage: cached.lastUserMessage,
             lastAssistantMessage: cached.lastAssistantMessage,
             shellSnapshotCount,
-            title: state.titles[id] || cached.title || cached.summary.slice(0, 42) || id,
-            customTitle: state.titles[id] ?? null,
-            kept: state.keptIds.includes(id),
+            title: customTitle || cached.title || cached.summary.slice(0, 42) || id,
+            customTitle: customTitle ?? null,
+            kept,
             deleted: false,
             evaluation: publicEvaluation(cached),
           }));
           if (cached.shellSnapshotCount !== shellSnapshotCount) {
             cached.shellSnapshotCount = shellSnapshotCount;
-            state.evaluations[id] = cached;
+            state.evaluations[stateKey] = cached;
             stateChanged = true;
           }
         } else {
@@ -633,6 +706,7 @@ export class SessionService {
 
     const evaluated = await mapLimit(parseQueue, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
+      const stateKey = sessionStateKey(parsed.id, parsed.source);
       const transcriptHash = hashTranscript(parsed.messages);
       const runId = randomUUID();
       await recordSessionAuditEvent({
@@ -653,7 +727,7 @@ export class SessionService {
         error: null,
         details: {},
       }).catch(() => undefined);
-      const cached = state.evaluations[parsed.id];
+      const cached = state.evaluations[stateKey];
       const updateMeta = classifyUpdate({
         cached,
         bytes: parsed.bytes,
@@ -813,7 +887,7 @@ export class SessionService {
         !sameCachedMessage(cached.lastAssistantMessage, parsed.lastAssistantMessage)
       ) {
         const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
-        state.evaluations[parsed.id] = {
+        state.evaluations[stateKey] = {
           ...evaluation,
           filePath: parsed.filePath,
           mtimeMs: parsed.mtimeMs,
@@ -867,7 +941,12 @@ export class SessionService {
     if (stateChanged) await this.store.save(state);
 
     for (const { parsed, evaluation } of evaluated) {
-      const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
+      const shellSnapshotCount = parsed.source === 'codex'
+        ? (shellSnapshotCounts.get(parsed.id) ?? 0)
+        : 0;
+      const stateKey = sessionStateKey(parsed.id, parsed.source);
+      const customTitle = state.titles[stateKey];
+      const kept = state.keptIds.includes(stateKey);
       sessions.push(enrichSession({
         id: parsed.id,
         filePath: parsed.filePath,
@@ -881,9 +960,9 @@ export class SessionService {
         lastUserMessage: parsed.lastUserMessage,
         lastAssistantMessage: parsed.lastAssistantMessage,
         shellSnapshotCount,
-        title: state.titles[parsed.id] || evaluation.title || evaluation.summary.slice(0, 42) || parsed.id,
-        customTitle: state.titles[parsed.id] ?? null,
-        kept: state.keptIds.includes(parsed.id),
+        title: customTitle || evaluation.title || evaluation.summary.slice(0, 42) || parsed.id,
+        customTitle: customTitle ?? null,
+        kept,
         deleted: false,
         evaluation: publicEvaluation(evaluation),
       }));
@@ -892,18 +971,25 @@ export class SessionService {
     return sessions.sort((a, b) => Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? ''));
   }
 
-  async getSession(id: string): Promise<CodexSession | null> {
+  async getSession(id: string, agent?: AgentKind | null): Promise<CodexSession | null> {
     const sessions = await this.listSessions();
-    return sessions.find((session) => session.id === id) ?? null;
+    const matches = sessions.filter((session) => session.id === id && (!agent || session.agent === agent));
+    if (matches.length > 1) throw new Error(`Ambiguous session identity: ${id}; agent is required`);
+    return matches[0] ?? null;
   }
 
-  async getSessionFast(id: string): Promise<CodexSession | null> {
+  async getSessionFast(id: string, agent?: AgentKind | null): Promise<CodexSession | null> {
     const sessions = await this.listSessions({ fast: true });
-    return sessions.find((session) => session.id === id) ?? null;
+    const matches = sessions.filter((session) => session.id === id && (!agent || session.agent === agent));
+    if (matches.length > 1) throw new Error(`Ambiguous session identity: ${id}; agent is required`);
+    return matches[0] ?? null;
   }
 
-  async getSessionHistory(id: string, options: { limit?: number; beforeIndex?: number | null } = {}) {
-    const session = await this.getSessionFast(id);
+  async getSessionHistory(
+    id: string,
+    options: { limit?: number; beforeIndex?: number | null; agent?: AgentKind | null } = {},
+  ) {
+    const session = await this.getSessionFast(id, options.agent);
     if (!session) throw new Error(`Session not found: ${id}`);
     return parseSessionHistory({
       filePath: session.filePath,
@@ -920,12 +1006,13 @@ export class SessionService {
       afterIndex?: number | null;
       full?: boolean;
       preserveWhitespace?: boolean;
+      agent?: AgentKind | null;
     } = {}
   ) {
-    const { found, missingIds } = await this.findSessionFilesByIds([id]);
-    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
+    const found = await this.findSessionFileByIdentity(id, options.agent);
+    if (!found) throw new Error(`Session not found: ${id}`);
     return parseSessionMessages({
-      filePath: found[0].filePath,
+      filePath: found.filePath,
       limit: options.limit ?? null,
       beforeIndex: options.beforeIndex ?? null,
       afterIndex: options.afterIndex ?? null,
@@ -934,10 +1021,10 @@ export class SessionService {
     });
   }
 
-  async getRemoteEvaluationInput(id: string): Promise<RemoteEvaluationInput> {
-    const { found, missingIds } = await this.findSessionFilesByIds([id]);
-    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
-    const parsed = await parseSessionFile(found[0].filePath);
+  async getRemoteEvaluationInput(id: string, agent?: AgentKind | null): Promise<RemoteEvaluationInput> {
+    const found = await this.findSessionFileByIdentity(id, agent);
+    if (!found) throw new Error(`Session not found: ${id}`);
+    const parsed = await parseSessionFile(found.filePath);
     const transcriptHash = hashTranscript(parsed.messages);
     await recordSessionAuditEvent({
       event: 'history-read',
@@ -975,15 +1062,16 @@ export class SessionService {
 
   async applyHubEvaluation(input: {
     sessionId: string;
+    agent: AgentKind;
     hubMachineId: string;
     runId: string;
     transcriptHash: string;
     reason: string;
     evaluation: Evaluation;
   }) {
-    const { found, missingIds } = await this.findSessionFilesByIds([input.sessionId]);
-    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${input.sessionId}`);
-    const parsed = await parseSessionFile(found[0].filePath);
+    const found = await this.findSessionFileByIdentity(input.sessionId, input.agent);
+    if (!found) throw new Error(`Session not found: ${input.sessionId}`);
+    const parsed = await parseSessionFile(found.filePath);
     const currentTranscriptHash = hashTranscript(parsed.messages);
     if (currentTranscriptHash !== input.transcriptHash) {
       await recordSessionAuditEvent({
@@ -1007,8 +1095,9 @@ export class SessionService {
       throw new Error('Transcript changed while Hub evaluation was running');
     }
 
-    const state = await this.store.load();
-    const cached = state.evaluations[parsed.id];
+    const state = await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(parsed.id, parsed.source);
+    const cached = state.evaluations[stateKey];
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const evaluation: Evaluation = {
       ...input.evaluation,
@@ -1023,7 +1112,7 @@ export class SessionService {
       hermesRefreshError: input.evaluation.error ?? null,
       reviewSignals: [`Hub 中央评估：${input.reason}`, ...(input.evaluation.reviewSignals ?? [])].slice(0, 6),
     };
-    await this.store.setEvaluation(parsed.id, {
+    await this.store.setEvaluation(stateKey, {
       ...evaluation,
       filePath: parsed.filePath,
       mtimeMs: parsed.mtimeMs,
@@ -1036,7 +1125,9 @@ export class SessionService {
       assistantTurns: parsed.assistantTurns,
       lastUserMessage: parsed.lastUserMessage,
       lastAssistantMessage: parsed.lastAssistantMessage,
-      shellSnapshotCount: shellSnapshotCounts.get(parsed.id) ?? 0,
+      shellSnapshotCount: parsed.source === 'codex'
+        ? (shellSnapshotCounts.get(parsed.id) ?? 0)
+        : 0,
       searchText: buildEvaluationSearchText({
         id: parsed.id,
         cwd: parsed.cwd,
@@ -1080,7 +1171,7 @@ export class SessionService {
     const quietMs = evaluationQuietMs();
     const pendingGraceMs = Math.max(quietMs, auditPendingGraceMs());
     const files = await this.discoverSessionFiles();
-    const state = await this.store.load();
+    const state = await this.migrateLegacyStateForFiles(files);
     const parsedResults = await mapLimit(files, 4, async (filePath) => {
       try {
         return { parsed: await parseSessionFile(filePath), filePath, error: null };
@@ -1096,7 +1187,9 @@ export class SessionService {
     const unreadableFiles = parsedResults
       .filter((item) => !item.parsed)
       .map((item) => ({ filePath: item.filePath, error: item.error ?? 'Unreadable session file' }));
-    const parsedIds = new Set(parsedSessions.map((parsed) => parsed.id));
+    const parsedStateKeys = new Set(
+      parsedSessions.map((parsed) => sessionStateKey(parsed.id, parsed.source)),
+    );
     const issues: SessionCompletenessIssue[] = [];
     const pending: SessionCompletenessIssue[] = [];
     const skipped: SessionCompletenessIssue[] = [];
@@ -1117,7 +1210,8 @@ export class SessionService {
     let staleIndex = 0;
 
     for (const parsed of parsedSessions) {
-      const cached = state.evaluations[parsed.id];
+      const stateKey = sessionStateKey(parsed.id, parsed.source);
+      const cached = state.evaluations[stateKey];
       const transcriptHash = hashTranscript(parsed.messages);
       const ageMs = Math.max(0, nowMs - parsed.mtimeMs);
       const metadataOnly = parsed.messageCount <= 0;
@@ -1160,7 +1254,7 @@ export class SessionService {
           cached.transcriptHash = transcriptHash;
           cached.evaluationOrigin = cached.workflow.endsWith(':fast-list') ? 'worker-fast' : 'local-llm';
           cached.evaluatedByMachineId = cached.evaluatedByMachineId ?? machineId;
-          state.evaluations[parsed.id] = cached;
+          state.evaluations[stateKey] = cached;
           stateChanged = true;
         }
         if (cached.transcriptHash === transcriptHash) transcriptVerified += 1;
@@ -1229,12 +1323,13 @@ export class SessionService {
     }
 
     if (stateChanged) await this.store.save(state);
-    const orphanedEvaluationIds = Object.keys(state.evaluations).filter((id) => !parsedIds.has(id));
+    const orphanedEvaluationIds = Object.keys(state.evaluations)
+      .filter((stateKey) => parseSessionStateKey(stateKey) && !parsedStateKeys.has(stateKey));
     const report: SessionCompletenessReport = {
       generatedAt,
       machineId,
       role: getCuratorRole(),
-      sessionIds: [...parsedIds].sort(),
+      sessionIds: [...parsedStateKeys].sort(),
       counts: {
         discoveredFiles: files.length,
         parsedSessions: parsedSessions.length,
@@ -1295,8 +1390,11 @@ export class SessionService {
     const currentFingerprints = new Map<string, string>();
     for (const finding of [...issues, ...pending, ...skipped]) {
       const fingerprint = `${finding.classification}:${finding.reasons.slice().sort().join(',')}`;
-      currentFingerprints.set(finding.sessionId, fingerprint);
-      if (this.lastAuditFindingFingerprints.get(finding.sessionId) === fingerprint) continue;
+      const findingKey = finding.agent
+        ? sessionStateKey(finding.sessionId, finding.agent)
+        : `unknown|||${finding.sessionId}`;
+      currentFingerprints.set(findingKey, fingerprint);
+      if (this.lastAuditFindingFingerprints.get(findingKey) === fingerprint) continue;
       await recordSessionAuditEvent({
         event: finding.classification === 'actionable'
           ? 'completeness-issue'
@@ -1324,13 +1422,15 @@ export class SessionService {
         },
       }).catch(() => undefined);
     }
-    for (const sessionId of this.lastAuditFindingFingerprints.keys()) {
-      if (currentFingerprints.has(sessionId)) continue;
+    for (const stateKey of this.lastAuditFindingFingerprints.keys()) {
+      if (currentFingerprints.has(stateKey)) continue;
+      const identity = parseSessionStateKey(stateKey);
+      if (!identity) continue;
       await recordSessionAuditEvent({
         event: 'completeness-recovered',
-        sessionId,
+        sessionId: identity.sessionId,
         machineId,
-        agent: null,
+        agent: identity.agent,
         runId: null,
         evaluationOrigin: null,
         transcriptHash: null,
@@ -1349,43 +1449,52 @@ export class SessionService {
     return report;
   }
 
-  async markHermesSessionUsed(id: string, jobId: string | null): Promise<void> {
-    const state = await this.store.load();
-    const cached = state.evaluations[id];
-    if (!cached) return;
-    state.evaluations[id] = {
+  async markHermesSessionUsed(
+    id: string,
+    agent: AgentKind,
+    jobId: string | null,
+  ): Promise<void> {
+    await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(id, agent);
+    await this.store.updateEvaluation(stateKey, (cached) => cached ? {
       ...cached,
       hermesLastUsedAt: new Date().toISOString(),
       hermesLastJobId: jobId,
       hermesNeedsRefresh: true,
       hermesRefreshStatus: 'pending',
       hermesRefreshError: null,
-    };
-    await this.store.save(state);
+    } : null);
   }
 
-  async markSessionEvaluationRefreshQueued(id: string, reason = 'manual'): Promise<void> {
-    const state = await this.store.load();
-    const cached = state.evaluations[id];
-    if (!cached) return;
-    state.evaluations[id] = {
+  async markSessionEvaluationRefreshQueued(
+    id: string,
+    agent: AgentKind,
+    reason = 'manual',
+  ): Promise<void> {
+    await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(id, agent);
+    await this.store.updateEvaluation(stateKey, (cached) => cached ? {
       ...cached,
       hermesNeedsRefresh: true,
       hermesRefreshStatus: 'pending',
       hermesRefreshError: null,
       reviewSignals: [`已加入 AI 重算队列：${reason}`, ...(cached.reviewSignals ?? [])].slice(0, 6),
-    };
-    await this.store.save(state);
+    } : null);
   }
 
-  async refreshSessionEvaluation(id: string, reason = 'manual') {
-    const { found, missingIds } = await this.findSessionFilesByIds([id]);
-    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
-    const parsed = await parseSessionFile(found[0].filePath);
+  async refreshSessionEvaluation(
+    id: string,
+    reason = 'manual',
+    agent?: AgentKind | null,
+  ) {
+    const found = await this.findSessionFileByIdentity(id, agent);
+    if (!found) throw new Error(`Session not found: ${id}`);
+    const parsed = await parseSessionFile(found.filePath);
     const transcriptHash = hashTranscript(parsed.messages);
     const runId = randomUUID();
-    const state = await this.store.load();
-    const cached = state.evaluations[id];
+    const state = await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(id, parsed.source);
+    const cached = state.evaluations[stateKey];
     const updateMeta = classifyUpdate({
       cached,
       bytes: parsed.bytes,
@@ -1394,13 +1503,12 @@ export class SessionService {
       messageCount: parsed.messageCount,
     });
     if (cached) {
-      state.evaluations[id] = {
-        ...cached,
+      await this.store.updateEvaluation(stateKey, (latest) => latest ? {
+        ...latest,
         hermesNeedsRefresh: true,
         hermesRefreshStatus: 'running',
         hermesRefreshError: null,
-      };
-      await this.store.save(state);
+      } : null);
     }
     await recordSessionAuditEvent({
       event: 'evaluation-started',
@@ -1453,7 +1561,7 @@ export class SessionService {
         );
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const refreshedAt = new Date().toISOString();
-    state.evaluations[id] = {
+    const refreshedEvaluation: StoredEvaluation = {
       ...evaluation,
       hermesLastUsedAt: cached?.hermesLastUsedAt ?? null,
       hermesLastJobId: cached?.hermesLastJobId ?? null,
@@ -1472,7 +1580,9 @@ export class SessionService {
       assistantTurns: parsed.assistantTurns,
       lastUserMessage: parsed.lastUserMessage,
       lastAssistantMessage: parsed.lastAssistantMessage,
-      shellSnapshotCount: shellSnapshotCounts.get(parsed.id) ?? 0,
+      shellSnapshotCount: parsed.source === 'codex'
+        ? (shellSnapshotCounts.get(parsed.id) ?? 0)
+        : 0,
       searchText: buildEvaluationSearchText({
         id: parsed.id,
         cwd: parsed.cwd,
@@ -1481,7 +1591,13 @@ export class SessionService {
         evaluation,
       }),
     };
-    await this.store.save(state);
+    await this.store.updateEvaluation(stateKey, (latest) => ({
+      ...refreshedEvaluation,
+      hermesLastUsedAt: latest?.hermesLastUsedAt ?? refreshedEvaluation.hermesLastUsedAt,
+      hermesLastJobId: latest?.hermesLastJobId ?? refreshedEvaluation.hermesLastJobId,
+      failureCards: latest?.failureCards ?? refreshedEvaluation.failureCards,
+      jobOutcomes: latest?.jobOutcomes ?? refreshedEvaluation.jobOutcomes,
+    }));
     await recordSessionAuditEvent({
       event: evaluation.status === 'failed' ? 'evaluation-failed' : 'evaluation-completed',
       sessionId: parsed.id,
@@ -1512,17 +1628,15 @@ export class SessionService {
       evaluationOrigin: evaluation.evaluationOrigin,
     };
     } catch (error) {
-      const failedState = await this.store.load();
-      const latest = failedState.evaluations[id] ?? cached;
-      if (latest) {
-        failedState.evaluations[id] = {
-          ...latest,
+      await this.store.updateEvaluation(stateKey, (latest) => {
+        const current = latest ?? cached;
+        return current ? {
+          ...current,
           hermesNeedsRefresh: true,
           hermesRefreshStatus: 'failed',
           hermesRefreshError: error instanceof Error ? error.message.slice(0, 240) : 'AI 重算失败',
-        };
-        await this.store.save(failedState);
-      }
+        } : null;
+      });
       await recordSessionAuditEvent({
         event: 'evaluation-failed',
         sessionId: parsed.id,
@@ -1547,14 +1661,14 @@ export class SessionService {
 
   async appendFailureKnowledgeCard(input: {
     sessionId: string;
+    agent: AgentKind;
     jobId: string;
     outputTail?: string | null;
     error?: string | null;
     policyViolations?: Array<{ reason?: string; pattern?: string; severity?: string }>;
   }): Promise<void> {
-    const state = await this.store.load();
-    const cached = state.evaluations[input.sessionId];
-    if (!cached) return;
+    await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(input.sessionId, input.agent);
     const evidence = [input.error, ...(input.policyViolations ?? []).map((item) => item.reason), input.outputTail]
       .filter(Boolean)
       .join('\n')
@@ -1598,50 +1712,69 @@ export class SessionService {
       summary: `job ${input.jobId} 失败或被停止，分类为：${titleByCategory[category] ?? titleByCategory.unknown}`,
       evidence: evidence.replace(/\b(sk|nvapi)-[A-Za-z0-9_-]{12,}\b/g, '$1-[redacted]').slice(0, 1200),
     };
-    const failureCards = [card, ...(cached.failureCards ?? []).filter((item) => item.jobId !== input.jobId)].slice(0, 20);
-    state.evaluations[input.sessionId] = {
-      ...cached,
-      failureCards,
-      keywords: [...new Set([...(cached.keywords ?? []), card.category, card.title])].slice(0, 40),
-      reviewSignals: [`失败知识卡片：${card.title}`, ...(cached.reviewSignals ?? [])].slice(0, 8),
-      searchText: buildEvaluationSearchText({ id: input.sessionId, cwd: cached.cwd, evaluation: { ...cached, failureCards } }),
-    };
-    await this.store.save(state);
+    await this.store.updateEvaluation(stateKey, (cached) => {
+      if (!cached) return null;
+      const failureCards = [
+        card,
+        ...(cached.failureCards ?? []).filter((item) => item.jobId !== input.jobId),
+      ].slice(0, 20);
+      return {
+        ...cached,
+        failureCards,
+        keywords: [...new Set([...(cached.keywords ?? []), card.category, card.title])].slice(0, 40),
+        reviewSignals: [`失败知识卡片：${card.title}`, ...(cached.reviewSignals ?? [])].slice(0, 8),
+        searchText: buildEvaluationSearchText({
+          id: input.sessionId,
+          cwd: cached.cwd,
+          evaluation: { ...cached, failureCards },
+        }),
+      };
+    });
   }
 
   async appendJobOutcome(input: JobOutcome): Promise<void> {
-    const state = await this.store.load();
-    const cached = state.evaluations[input.sessionId];
-    if (!cached) return;
-    const jobOutcomes = [input, ...(cached.jobOutcomes ?? []).filter((item) => item.jobId !== input.jobId)].slice(0, 30);
-    const outcomeKeywords = [
-      input.status,
-      input.mode,
-      input.cwd ?? '',
-      ...input.changedFiles,
-      ...input.tests,
-      input.needsReview ? 'needs-review' : '',
-    ].filter(Boolean);
-    state.evaluations[input.sessionId] = {
-      ...cached,
-      jobOutcomes,
-      keywords: [...new Set([...(cached.keywords ?? []), ...outcomeKeywords])].slice(0, 50),
-      reviewSignals: [
-        `最近 Codex worker：${input.status}${input.needsReview ? '，需要复核' : ''}`,
-        ...(cached.reviewSignals ?? []),
-      ].slice(0, 8),
-      searchText: buildEvaluationSearchText({ id: input.sessionId, cwd: cached.cwd, evaluation: { ...cached, jobOutcomes } }),
-    };
-    await this.store.save(state);
+    await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(input.sessionId, input.agent);
+    await this.store.updateEvaluation(stateKey, (cached) => {
+      if (!cached) return null;
+      const jobOutcomes = [
+        input,
+        ...(cached.jobOutcomes ?? []).filter((item) => item.jobId !== input.jobId),
+      ].slice(0, 30);
+      const outcomeKeywords = [
+        input.status,
+        input.mode,
+        input.cwd ?? '',
+        ...input.changedFiles,
+        ...input.tests,
+        input.needsReview ? 'needs-review' : '',
+      ].filter(Boolean);
+      return {
+        ...cached,
+        jobOutcomes,
+        keywords: [...new Set([...(cached.keywords ?? []), ...outcomeKeywords])].slice(0, 50),
+        reviewSignals: [
+          `最近 Codex worker：${input.status}${input.needsReview ? '，需要复核' : ''}`,
+          ...(cached.reviewSignals ?? []),
+        ].slice(0, 8),
+        searchText: buildEvaluationSearchText({
+          id: input.sessionId,
+          cwd: cached.cwd,
+          evaluation: { ...cached, jobOutcomes },
+        }),
+      };
+    });
   }
 
-  async getSessionOutcome(id: string) {
-    const state = await this.store.load();
-    const cached = state.evaluations[id];
+  async getSessionOutcome(id: string, agent: AgentKind) {
+    const state = await this.ensureLegacyStateMigrated();
+    const stateKey = sessionStateKey(id, agent);
+    const cached = state.evaluations[stateKey];
     if (!cached) return null;
     return {
       sessionId: id,
-      title: state.titles[id] || cached.title || cached.summary || id,
+      agent,
+      title: state.titles[stateKey] || cached.title || cached.summary || id,
       hermesLastJobId: cached.hermesLastJobId ?? null,
       jobOutcomes: cached.jobOutcomes ?? [],
       failureCards: cached.failureCards ?? [],
@@ -1652,13 +1785,19 @@ export class SessionService {
   }
 
   async findJobOutcome(jobId: string) {
-    const state = await this.store.load();
-    for (const [sessionId, evaluation] of Object.entries(state.evaluations)) {
+    const state = await this.ensureLegacyStateMigrated();
+    for (const [stateKey, evaluation] of Object.entries(state.evaluations)) {
+      const identity = parseSessionStateKey(stateKey);
+      if (!identity) continue;
       const outcome = (evaluation.jobOutcomes ?? []).find((item) => item.jobId === jobId);
       if (outcome) {
         return {
-          sessionId,
-          title: state.titles[sessionId] || evaluation.title || evaluation.summary || sessionId,
+          sessionId: identity.sessionId,
+          agent: identity.agent,
+          title: state.titles[stateKey] ||
+            evaluation.title ||
+            evaluation.summary ||
+            identity.sessionId,
           outcome,
           failureCards: (evaluation.failureCards ?? []).filter((card) => card.jobId === jobId),
         };
@@ -1667,15 +1806,15 @@ export class SessionService {
     return null;
   }
 
-  async setKept(id: string, kept: boolean): Promise<void> {
-    await this.store.setKept(id, kept);
+  async setKept(id: string, kept: boolean, agent: AgentKind): Promise<void> {
+    await this.store.setKept(sessionStateKey(id, agent), kept);
   }
 
-  async setTitle(id: string, title: string): Promise<void> {
-    await this.store.setTitle(id, title);
+  async setTitle(id: string, title: string, agent: AgentKind): Promise<void> {
+    await this.store.setTitle(sessionStateKey(id, agent), title);
   }
 
-  async deleteSession(id: string): Promise<{
+  async deleteSession(id: string, agent?: AgentKind | null): Promise<{
     sessionId: string;
     agent: AgentKind;
     archiveDir: string;
@@ -1684,8 +1823,7 @@ export class SessionService {
     removedHistoryEntries: number;
     expiresAt: string;
   }> {
-    const { found } = await this.findSessionFilesByIds([id]);
-    const session = found[0];
+    const session = await this.findSessionFileByIdentity(id, agent);
     if (!session) throw new Error(`Session not found: ${id}`);
     const result = await archiveSessionFiles({
       codexHome: this.codexHome,
@@ -1694,11 +1832,13 @@ export class SessionService {
       retentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
       claudeProjectsRoot: this.claudeProjectsRoot,
     });
-    await this.store.markDeleted(id);
+    await this.store.markDeleted(sessionStateKey(id, session.agent));
     return { sessionId: id, ...result };
   }
 
-  async deleteSessionsBulk(ids: string[]): Promise<{
+  async deleteSessionsBulk(
+    identities: Array<string | { id: string; agent?: AgentKind | null }>,
+  ): Promise<{
     deleted: Array<{
       sessionId: string;
       agent: AgentKind;
@@ -1710,8 +1850,26 @@ export class SessionService {
     }>;
     missingIds: string[];
   }> {
-    const cleanIds = [...new Set(ids.filter(Boolean))];
-    const { found, missingIds } = await this.findSessionFilesByIds(cleanIds);
+    const cleanIdentities = [
+      ...new Map(
+        identities
+          .map((identity) => typeof identity === 'string'
+            ? { id: identity, agent: null }
+            : { id: identity.id, agent: identity.agent ?? null })
+          .filter((identity) => Boolean(identity.id))
+          .map((identity) => [`${identity.agent ?? ''}|||${identity.id}`, identity]),
+      ).values(),
+    ];
+    const found: Array<{ sessionId: string; filePath: string; agent: AgentKind }> = [];
+    const missingIds: string[] = [];
+
+    // Resolve every identity before archiving any file. Raw ids are accepted
+    // only when they identify exactly one local Agent.
+    for (const identity of cleanIdentities) {
+      const match = await this.findSessionFileByIdentity(identity.id, identity.agent);
+      if (match) found.push(match);
+      else missingIds.push(identity.id);
+    }
     if (!found.length) return { deleted: [], missingIds };
 
     const deleted = await archiveSessionFilesBulk({
@@ -1720,14 +1878,33 @@ export class SessionService {
       retentionDays: Number(process.env.CURATOR_RECYCLE_RETENTION_DAYS || 30),
       claudeProjectsRoot: this.claudeProjectsRoot,
     });
-    await this.store.markDeletedMany(deleted.map((item) => item.sessionId));
+    await this.store.markDeletedMany(
+      deleted.map((item) => sessionStateKey(item.sessionId, item.agent)),
+    );
     return { deleted, missingIds };
   }
 
-  async migrateSessionToProject(id: string, targetProjectDir: string) {
-    const session = await this.getSession(id);
+  async migrateSessionToProject(id: string, targetProjectDir: string, agent?: AgentKind | null) {
+    const session = await this.getSession(id, agent);
     if (!session) throw new Error(`Session not found: ${id}`);
     if (sameResolvedPath(session.cwd, targetProjectDir)) {
+      if (session.agent === 'claude') {
+        return {
+          sourceSessionId: id,
+          sourceSessionFile: session.filePath,
+          targetProjectDir: session.cwd,
+          newSessionId: id,
+          newSessionFile: session.filePath,
+          verified: true,
+          verifiedCwd: session.cwd,
+          resumeCommand: `claude --resume ${id}`,
+          alreadyInTarget: true,
+          verifyResume: {
+            ok: true,
+            output: 'Claude session remains in its original project store; Codex-only resume verification was not run.',
+          },
+        };
+      }
       return {
         sourceSessionId: id,
         sourceSessionFile: session.filePath,
@@ -1740,6 +1917,9 @@ export class SessionService {
         alreadyInTarget: true,
         verifyResume: verifyResumeCommand(session.cwd, id),
       };
+    }
+    if (session.agent === 'claude') {
+      throw new UnsupportedSessionMigrationError(id);
     }
     const result = await copySessionToProject({
       codexHome: this.codexHome,
@@ -1765,8 +1945,8 @@ export class SessionService {
   async backfillEvaluations(options: { limit?: number; includeFailed?: boolean } = {}) {
     const nowMs = Date.now();
     const quietMs = evaluationQuietMs();
-    const state = await this.store.load();
     const files = await this.discoverSessionFiles();
+    const state = await this.migrateLegacyStateForFiles(files);
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; sortTimeMs: number }> = [];
     let deferredActive = 0;
@@ -1775,7 +1955,8 @@ export class SessionService {
       try {
         const fileStat = await stat(filePath);
         const id = extractSessionId(filePath);
-        const cached = state.evaluations[id];
+        const agent = sessionAgentForFile(filePath);
+        const cached = state.evaluations[sessionStateKey(id, agent)];
         const needsBackfill =
           !cached ||
           cached.filePath !== filePath ||
@@ -1814,9 +1995,10 @@ export class SessionService {
 
     const results = await mapLimit(batch, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
+      const stateKey = sessionStateKey(parsed.id, parsed.source);
       const transcriptHash = hashTranscript(parsed.messages);
       const runId = randomUUID();
-      const cached = state.evaluations[parsed.id];
+      const cached = state.evaluations[stateKey];
       const updateMeta = classifyUpdate({
         cached,
         bytes: parsed.bytes,
@@ -1851,8 +2033,10 @@ export class SessionService {
             }),
             updateMeta
           );
-      const shellSnapshotCount = shellSnapshotCounts.get(parsed.id) ?? 0;
-      state.evaluations[parsed.id] = {
+      const shellSnapshotCount = parsed.source === 'codex'
+        ? (shellSnapshotCounts.get(parsed.id) ?? 0)
+        : 0;
+      state.evaluations[stateKey] = {
         ...evaluation,
         filePath: parsed.filePath,
         mtimeMs: parsed.mtimeMs,
@@ -1922,31 +2106,55 @@ export class SessionService {
     return listRecycleArchives({ recycleRoot: getRecycleRoot() });
   }
 
-  async restoreRecycleArchive(sessionId: string) {
+  async restoreRecycleArchive(
+    sessionId: string,
+    selector: { archiveDir?: string; agent?: AgentKind } = {},
+  ) {
     const result = await restoreArchive({
       codexHome: this.codexHome,
       recycleRoot: getRecycleRoot(),
       sessionId,
+      archiveDir: selector.archiveDir,
+      agent: selector.agent,
       claudeProjectsRoot: this.claudeProjectsRoot,
     });
+    const files = await this.discoverSessionFiles();
+    await this.migrateLegacyStateForFiles(files, true);
+    if (result.agent) {
+      await this.store.unmarkDeleted(sessionStateKey(sessionId, result.agent));
+    }
+    // Old releases persisted deletion under a raw session id. It is never safe
+    // to keep that unscoped tombstone after an explicitly selected restore.
     await this.store.unmarkDeleted(sessionId);
     return result;
   }
 
-  async purgeRecycleArchive(sessionId: string) {
-    return permanentlyDeleteArchive({ recycleRoot: getRecycleRoot(), sessionId });
+  async purgeRecycleArchive(
+    sessionId: string,
+    selector: { archiveDir?: string; agent?: AgentKind } = {},
+  ) {
+    return permanentlyDeleteArchive({
+      recycleRoot: getRecycleRoot(),
+      sessionId,
+      archiveDir: selector.archiveDir,
+      agent: selector.agent,
+    });
   }
 
   async pruneRecommended(recommendation: Recommendation = 'delete') {
     const sessions = await this.listSessions();
     const targets = sessions.filter((session) => !session.kept && session.evaluation.recommendation === recommendation);
-    return (await this.deleteSessionsBulk(targets.map((session) => session.id))).deleted;
+    return (await this.deleteSessionsBulk(
+      targets.map((session) => ({ id: session.id, agent: session.agent })),
+    )).deleted;
   }
 
   async pruneNonKept() {
     const sessions = await this.listSessions();
     const targets = sessions.filter((session) => !session.kept);
-    return (await this.deleteSessionsBulk(targets.map((session) => session.id))).deleted;
+    return (await this.deleteSessionsBulk(
+      targets.map((session) => ({ id: session.id, agent: session.agent })),
+    )).deleted;
   }
 
   async countExistingSessionFiles(): Promise<number> {

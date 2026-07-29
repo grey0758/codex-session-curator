@@ -5,20 +5,25 @@ import Fastify from 'fastify';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { constants as fsConstants, createReadStream } from 'node:fs';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { getCodexHome, getStatePath, isClaudeSessionPath, type RecycleArchive } from './file-ops.js';
+import {
+  getCodexHome,
+  getStatePath,
+  sameResolvedPath,
+  type RecycleArchive,
+} from './file-ops.js';
 import type { KnowledgeStore } from './knowledge-store.js';
 import { parseSessionHistory } from './session-parser.js';
 import {
+  RemoteAgentHttpError,
   checkRemoteAgent,
   deleteAgentJson,
   deleteAgentSession,
-  deleteAgentSessionsBulk,
   fetchAgentJson,
   fetchAgentSessions,
   getRemoteAgents,
@@ -26,11 +31,17 @@ import {
   postAgentJson,
   shouldQueueHubRemoteEvaluation,
 } from './remote-agents.js';
-import { SessionService } from './session-service.js';
+import {
+  SessionService,
+  UnsupportedSessionMigrationError,
+  parseSessionStateKey,
+  sessionStateKey,
+} from './session-service.js';
 import { compareSessionVisibility, readSessionAuditEvents, recordSessionAuditEvent } from './session-audit.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
 import type {
+  AgentKind,
   CodexSession,
   CommanderAction,
   Evaluation,
@@ -186,6 +197,7 @@ interface EvaluationRefreshJob {
   id: string;
   sessionId: string;
   machineId: string;
+  agent: AgentKind | null;
   reason: string;
   status: EvaluationRefreshJobStatus;
   createdAt: string;
@@ -209,10 +221,22 @@ const evaluationRefreshJobs = new Map<string, EvaluationRefreshJob>();
 const evaluationRefreshQueue: string[] = [];
 let runningEvaluationRefreshJobs = 0;
 
-const keepSchema = z.object({ kept: z.boolean() });
-const titleSchema = z.object({ title: z.string().max(120) });
+const keepSchema = z.object({
+  kept: z.boolean(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+});
+const titleSchema = z.object({
+  title: z.string().max(120),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+});
 const loginSchema = z.object({ username: z.string().min(1).max(120), password: z.string().min(1).max(300) });
-const migrateSchema = z.object({ targetProjectDir: z.string().min(1).max(1000) });
+const migrateSchema = z.object({
+  targetProjectDir: z.string().min(1).max(1000),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+});
 const confirmSchema = z.object({ confirm: z.literal(true) });
 const backfillSchema = z.object({
   limit: z.number().int().min(1).max(200).optional(),
@@ -220,6 +244,7 @@ const backfillSchema = z.object({
 });
 const evaluationRefreshSchema = z.object({
   machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
 });
 const importedEvaluationSchema = z.custom<Evaluation>((value) => {
   if (!value || typeof value !== 'object') return false;
@@ -236,6 +261,7 @@ const importedEvaluationSchema = z.custom<Evaluation>((value) => {
 }, 'Invalid evaluation payload');
 const hubEvaluationImportSchema = z.object({
   hubMachineId: z.string().min(1).max(300),
+  agent: z.enum(['codex', 'claude']),
   runId: z.string().min(1).max(160),
   transcriptHash: z.string().regex(/^[0-9a-f]{64}$/),
   reason: z.string().min(1).max(500),
@@ -244,6 +270,7 @@ const hubEvaluationImportSchema = z.object({
 const auditQuerySchema = z.object({
   sessionId: z.string().min(1).max(160).optional(),
   machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
   limit: z.coerce.number().int().min(1).max(5000).optional(),
 });
 const fleetAuditQuerySchema = z.object({
@@ -252,6 +279,7 @@ const fleetAuditQuerySchema = z.object({
 const bulkDeleteRouteSchema = z.object({
   id: z.string().min(1).max(160),
   machineId: z.string().min(1).max(300),
+  agent: z.enum(['codex', 'claude']).optional(),
 });
 const bulkDeleteSchema = z
   .object({
@@ -265,7 +293,11 @@ const bulkDeleteSchema = z
 const sessionIdSchema = z.object({ id: z.string().min(1).max(160) });
 const machineRouteQuerySchema = z.object({
   machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
   remote: z.enum(['0', '1', 'true', 'false']).optional(),
+});
+const recycleArchiveRouteQuerySchema = machineRouteQuerySchema.extend({
+  archiveDir: z.string().min(1).max(4096).optional(),
 });
 const hermesSearchSchema = z.object({
   q: z.string().min(1).transform((value) => value.slice(0, 1000)),
@@ -294,6 +326,8 @@ const supervisorStrategySchema = z
   .passthrough();
 const resumeJobSchema = z.object({
   sessionId: z.string().min(1).max(160),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
   prompt: z.string().min(1).max(20_000),
   model: z.string().min(1).max(120).optional(),
   extraArgs: z.array(z.string().min(1).max(300)).max(20).optional(),
@@ -307,6 +341,8 @@ const hermesDispatchSchema = z.object({
   query: z.string().min(1).max(2000),
   prompt: z.string().min(1).max(20_000).optional(),
   sessionId: z.string().min(1).max(160).optional(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
   cwd: z.string().min(1).max(1000).optional(),
   repo: z.string().min(1).max(1000).optional(),
   model: z.string().min(1).max(120).optional(),
@@ -342,14 +378,24 @@ const jobSupervisorSchema = z.object({
 });
 const sessionContextSchema = z.object({
   historyLimit: z.coerce.number().int().min(0).max(80).optional(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+});
+const sessionIdentityQuerySchema = z.object({
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
 });
 const sessionFilesQuerySchema = z.object({
   path: z.string().max(2000).optional().default(''),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
 });
 const sessionFileUploadQuerySchema = z.object({
   path: z.string().max(2000).optional().default(''),
   name: z.string().min(1).max(255),
   overwrite: z.enum(['0', '1', 'true', 'false']).optional(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
 });
 const remoteControlSchema = z.object({
   remote: z.enum(['0', '1', 'true', 'false']).optional(),
@@ -526,12 +572,14 @@ function toSessionSummary(session: SessionListItem) {
 }
 
 function applyPanelSessionState<T extends CodexSession>(session: T, state: PersistedState): T {
-  const customTitle = state.titles[session.id] ?? session.customTitle ?? null;
+  if (session.machineId !== service.getMeta().machineId) return session;
+  const stateKey = sessionStateKey(session.id, session.agent);
+  const customTitle = state.titles[stateKey] ?? session.customTitle ?? null;
   return {
     ...session,
     title: customTitle || session.title,
     customTitle,
-    kept: state.keptIds.includes(session.id),
+    kept: state.keptIds.includes(stateKey) || session.kept,
   };
 }
 
@@ -782,11 +830,16 @@ name = safe_name(sys.argv[3] if len(sys.argv) > 3 else "")
 overwrite = (sys.argv[4] if len(sys.argv) > 4 else "0") in ("1", "true")
 if not os.path.isdir(target):
     fail("Upload path is not a directory")
-dest = os.path.realpath(os.path.join(target, name))
+dest_candidate = os.path.join(target, name)
+if os.path.islink(dest_candidate):
+    fail("Upload target must not be a symlink")
+dest = os.path.realpath(dest_candidate)
 if not inside(base, dest):
     fail("Upload target escapes session cwd")
-mode = "wb" if overwrite else "xb"
-with open(dest, mode) as handle:
+flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+flags |= os.O_TRUNC if overwrite else os.O_EXCL
+fd = os.open(dest, flags, 0o644)
+with os.fdopen(fd, "wb") as handle:
     shutil.copyfileobj(sys.stdin.buffer, handle)
 st = os.stat(dest)
 entry_path = (rel + "/" + name) if rel else name
@@ -1208,14 +1261,15 @@ function stateSessionActivity(updatedAt: string | null | undefined): {
 }
 
 async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
-  const state = await store.load();
+  const state = await service.ensureLegacyStateMigrated();
   const machineId = service.getMeta().machineId;
   return Object.entries(state.evaluations)
-    .filter(([id]) => !state.deletedIds.includes(id))
-    .map(([id, evaluation]) => {
+    .flatMap(([stateKey, evaluation]) => {
+      const identity = parseSessionStateKey(stateKey);
+      if (!identity || state.deletedIds.includes(stateKey)) return [];
+      const { sessionId: id, agent } = identity;
       const activity = stateSessionActivity(evaluation.updatedAt ?? evaluation.evaluatedAt);
-      const agent = isClaudeSessionPath(evaluation.filePath) ? 'claude' : 'codex';
-      return {
+      return [{
         id,
         agent,
         filePath: evaluation.filePath,
@@ -1229,15 +1283,15 @@ async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
         lastUserMessage: evaluation.lastUserMessage ?? null,
         lastAssistantMessage: evaluation.lastAssistantMessage ?? null,
         shellSnapshotCount: evaluation.shellSnapshotCount ?? 0,
-        title: state.titles[id] || evaluation.title || evaluation.summary || id,
-        customTitle: state.titles[id] ?? null,
+        title: state.titles[stateKey] || evaluation.title || evaluation.summary || id,
+        customTitle: state.titles[stateKey] ?? null,
         resumeCommand: agent === 'claude' ? `claude --resume ${id}` : `codex resume ${id}`,
         machineId,
-        kept: state.keptIds.includes(id),
+        kept: state.keptIds.includes(stateKey),
         deleted: false,
         evaluation,
         ...activity,
-      };
+      }];
     });
 }
 
@@ -1266,16 +1320,26 @@ function buildHermesMemoryContext(sessions: ReturnType<typeof toHermesSession>[]
   return lines.filter(Boolean).join('\n');
 }
 
+function hermesKnowledgeIdentity(machineId: string, agent: AgentKind, sessionId: string): string {
+  return [machineId, agent, sessionId].map((part) => encodeURIComponent(part)).join(':');
+}
+
 function buildHermesSearchDocuments(session: SessionListItem) {
   const base = toHermesSession(session);
+  const identity = hermesKnowledgeIdentity(base.machineId, base.agent, base.id);
   const docs = [
     {
-      id: `${base.id}:session-index`,
+      id: `${identity}:session-index`,
+      legacyIds: [`${base.id}:session-index`],
       kind: 'session_index',
       sessionId: base.id,
       machineId: base.machineId,
+      agent: base.agent,
       title: `Session index: ${base.title}`,
       text: [
+        `machineId: ${base.machineId}`,
+        `agent: ${base.agent}`,
+        `sessionId: ${base.id}`,
         base.id,
         base.title,
         base.resumeCommand,
@@ -1290,12 +1354,17 @@ function buildHermesSearchDocuments(session: SessionListItem) {
       updatedAt: base.updatedAt,
     },
     {
-      id: `${base.id}:session`,
+      id: `${identity}:session`,
+      legacyIds: [`${base.id}:session`],
       kind: 'session',
       sessionId: base.id,
       machineId: base.machineId,
+      agent: base.agent,
       title: base.title,
       text: [
+        `machineId: ${base.machineId}`,
+        `agent: ${base.agent}`,
+        `sessionId: ${base.id}`,
         base.summary,
         base.detailedSummary,
         base.lastUserMessage?.text,
@@ -1307,23 +1376,38 @@ function buildHermesSearchDocuments(session: SessionListItem) {
       updatedAt: base.updatedAt,
     },
     ...base.jobOutcomes.map((outcome) => ({
-      id: `${base.id}:job:${outcome.jobId}`,
+      id: `${identity}:job:${outcome.jobId}`,
+      legacyIds: [`${base.id}:job:${outcome.jobId}`],
       kind: 'job_outcome',
       sessionId: base.id,
       jobId: outcome.jobId,
       machineId: outcome.machineId || base.machineId,
-      title: `Codex worker ${outcome.status}: ${base.title}`,
-      text: outcome.summary,
+      agent: base.agent,
+      title: `${base.agent} worker ${outcome.status}: ${base.title}`,
+      text: [
+        `machineId: ${base.machineId}`,
+        `agent: ${base.agent}`,
+        `sessionId: ${base.id}`,
+        outcome.summary,
+      ].join('\n'),
       updatedAt: outcome.at,
     })),
     ...base.failureCards.map((card) => ({
-      id: `${base.id}:failure:${card.jobId}:${card.category}`,
+      id: `${identity}:failure:${card.jobId}:${card.category}`,
+      legacyIds: [`${base.id}:failure:${card.jobId}:${card.category}`],
       kind: 'failure_card',
       sessionId: base.id,
       jobId: card.jobId,
       machineId: base.machineId,
+      agent: base.agent,
       title: card.title,
-      text: [card.summary, card.evidence].filter(Boolean).join('\n'),
+      text: [
+        `machineId: ${base.machineId}`,
+        `agent: ${base.agent}`,
+        `sessionId: ${base.id}`,
+        card.summary,
+        card.evidence,
+      ].filter(Boolean).join('\n'),
       updatedAt: card.at,
     })),
   ];
@@ -1370,9 +1454,15 @@ function knowledgeTypeForDocument(kind: string): KnowledgeItemType {
   return 'note';
 }
 
-function toKnowledgeItem(document: ReturnType<typeof buildHermesSearchDocuments>[number] | ReturnType<typeof buildCommanderActionSearchDocument>): Omit<KnowledgeItem, 'createdAt' | 'updatedAt'> & { updatedAt: string | null } {
+type KnowledgeSyncItem = Omit<KnowledgeItem, 'createdAt' | 'updatedAt'> & {
+  updatedAt: string | null;
+  legacyIds?: string[];
+};
+
+function toKnowledgeItem(document: ReturnType<typeof buildHermesSearchDocuments>[number] | ReturnType<typeof buildCommanderActionSearchDocument>): KnowledgeSyncItem {
   const cwd = 'cwd' in document && typeof document.cwd === 'string' ? document.cwd : null;
   const sessionId = 'sessionId' in document && typeof document.sessionId === 'string' ? document.sessionId : null;
+  const agent = 'agent' in document && typeof document.agent === 'string' ? document.agent : null;
   return {
     id: document.id,
     type: knowledgeTypeForDocument(document.kind),
@@ -1384,17 +1474,26 @@ function toKnowledgeItem(document: ReturnType<typeof buildHermesSearchDocuments>
     cwd,
     machineId: 'machineId' in document ? document.machineId ?? null : service.getMeta().machineId,
     updatedAt: document.updatedAt ?? null,
-    tags: [document.kind, sessionId ?? '', 'machineId' in document ? document.machineId ?? '' : ''].filter(Boolean),
+    tags: [document.kind, sessionId ?? '', agent ?? '', 'machineId' in document ? document.machineId ?? '' : ''].filter(Boolean),
     source: 'curator:auto-sync',
     confidence: 0.75,
     lastVerifiedAt: document.updatedAt ?? null,
+    ...('legacyIds' in document ? { legacyIds: document.legacyIds } : {}),
   };
 }
 
-async function syncKnowledgeItems(items: Array<ReturnType<typeof toKnowledgeItem>>): Promise<void> {
+async function syncKnowledgeItems(items: KnowledgeSyncItem[]): Promise<void> {
   if (!knowledgeStore || !items.length) return;
-  for (const item of items) {
+  for (const syncItem of items) {
+    const { legacyIds = [], ...item } = syncItem;
     try {
+      for (const legacyId of legacyIds) {
+        if (legacyId === item.id) continue;
+        const legacy = await knowledgeStore.getItem(legacyId);
+        if (legacy?.source === 'curator:auto-sync') {
+          await knowledgeStore.deleteItem(legacyId);
+        }
+      }
       const existing = await knowledgeStore.getItem(item.id);
       if (existing) {
         await knowledgeStore.updateItem(item.id, {
@@ -1518,75 +1617,121 @@ function buildCodexWorkerPrompt(input: {
     .join('\n');
 }
 
-async function deleteSessionById(id: string, machineId?: string) {
-  const localMachineId = service.getMeta().machineId;
-  if (machineId && machineId !== localMachineId) {
-    const agent = remoteAgents.find((candidate) => candidate.id === machineId);
-    if (!agent) throw new Error(`Remote machine not configured: ${machineId}`);
-    return deleteAgentSession(agent, id);
-  }
+async function deleteSessionById(
+  id: string,
+  machineId?: string,
+  sessionAgent?: AgentKind,
+  includeRemote = true,
+) {
+  const routed = await findRoutableSession(id, machineId, sessionAgent, includeRemote);
+  if (!routed) throw new Error(`Session not found: ${id}`);
+  return deleteResolvedSession(routed);
+}
 
-  try {
-    return await service.deleteSession(id);
-  } catch (localError) {
-    if (machineId === localMachineId) throw localError;
-    for (const agent of remoteAgents) {
-      try {
-        return await deleteAgentSession(agent, id);
-      } catch {
-        // Try the next remote agent.
-      }
-    }
-    throw localError;
+async function deleteResolvedSession(
+  routed: NonNullable<Awaited<ReturnType<typeof findRoutableSession>>>,
+) {
+  if (routed.kind === 'local') {
+    return service.deleteSession(routed.session.id, routed.session.agent);
   }
+  const remoteAgent = remoteAgents.find((candidate) => candidate.id === routed.session.machineId);
+  if (!remoteAgent) throw new Error(`Remote machine not configured: ${routed.session.machineId}`);
+  return deleteAgentSession(remoteAgent, routed.session.id, routed.session.agent);
 }
 
 async function deleteSessionsByIdsBulk(ids: string[], includeRemote: boolean) {
-  const cleanIds = [...new Set(ids)];
-  const resultsById = new Map<string, { id: string; ok: boolean; result?: unknown; error?: string }>();
-  const local = await service.deleteSessionsBulk(cleanIds);
+  const cleanIds = [...new Set(ids.filter(Boolean))];
+  const resolved: Array<{
+    id: string;
+    route: NonNullable<Awaited<ReturnType<typeof findRoutableSession>>> | null;
+  }> = [];
 
-  for (const item of local.deleted) {
-    resultsById.set(item.sessionId, { id: item.sessionId, ok: true, result: item });
+  // Resolve the complete legacy raw-id batch first. A 409/503 must leave every
+  // session untouched, even if an earlier id happened to be uniquely routable.
+  for (const id of cleanIds) {
+    resolved.push({
+      id,
+      route: await findRoutableSession(id, undefined, undefined, includeRemote),
+    });
   }
 
-  let unresolvedIds = local.missingIds;
-  if (includeRemote) {
-    for (const agent of remoteAgents) {
-      if (!unresolvedIds.length) break;
-      try {
-        const payload = await deleteAgentSessionsBulk<{
-          results?: Array<{ id: string; ok: boolean; result?: unknown; error?: string }>;
-        }>(agent, unresolvedIds);
-        const deletedOnAgent = new Set<string>();
-        for (const item of payload.results ?? []) {
-          if (!item.ok) continue;
-          deletedOnAgent.add(item.id);
-          resultsById.set(item.id, { id: item.id, ok: true, result: item.result });
-        }
-        unresolvedIds = unresolvedIds.filter((id) => !deletedOnAgent.has(id));
-      } catch {
-        // Try the next remote agent.
-      }
+  const results: Array<{ id: string; ok: boolean; result?: unknown; error?: string }> = [];
+  for (const { id, route } of resolved) {
+    if (!route) {
+      results.push({ id, ok: false, error: `Session not found: ${id}` });
+      continue;
+    }
+    try {
+      results.push({
+        id,
+        ok: true,
+        result: await deleteResolvedSession(route),
+      });
+    } catch (error) {
+      results.push({
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : `Session not found: ${id}`,
+      });
     }
   }
-
-  for (const id of unresolvedIds) {
-    resultsById.set(id, { id, ok: false, error: `Session not found: ${id}` });
-  }
-
-  return cleanIds.map((id) => resultsById.get(id) ?? { id, ok: false, error: `Session not found: ${id}` });
+  return results;
 }
 
-async function deleteRoutedSessionsBulk(routes: Array<{ id: string; machineId: string }>) {
-  const results: Array<{ id: string; machineId: string; ok: boolean; result?: unknown; error?: string }> = [];
-  for (const { id, machineId } of routes) {
+async function deleteRoutedSessionsBulk(
+  routes: Array<{ id: string; machineId: string; agent?: AgentKind }>,
+) {
+  const resolved: Array<{
+    id: string;
+    machineId: string;
+    agent?: AgentKind;
+    route: NonNullable<Awaited<ReturnType<typeof findRoutableSession>>> | null;
+  }> = [];
+
+  // Explicit composite routes still require an all-or-nothing routing
+  // preflight. In particular, a later unavailable remote must not leave an
+  // earlier local session already archived.
+  for (const { id, machineId, agent } of routes) {
+    resolved.push({
+      id,
+      machineId,
+      agent,
+      route: await findRoutableSession(id, machineId, agent),
+    });
+  }
+
+  const results: Array<{
+    id: string;
+    machineId: string;
+    agent?: AgentKind;
+    ok: boolean;
+    result?: unknown;
+    error?: string;
+  }> = [];
+  for (const { id, machineId, agent, route } of resolved) {
+    if (!route) {
+      results.push({
+        id,
+        machineId,
+        agent,
+        ok: false,
+        error: `Session not found: ${id}`,
+      });
+      continue;
+    }
     try {
-      results.push({ id, machineId, ok: true, result: await deleteSessionById(id, machineId) });
+      results.push({
+        id,
+        machineId,
+        agent,
+        ok: true,
+        result: await deleteResolvedSession(route),
+      });
     } catch (error) {
       results.push({
         id,
         machineId,
+        agent,
         ok: false,
         error: error instanceof Error ? error.message : 'Delete failed',
       });
@@ -1638,24 +1783,95 @@ async function listRecycleArchivesAggregated(includeRemote: boolean): Promise<{
   return { archives, errors };
 }
 
-async function restoreRecycleArchiveByMachine(sessionId: string, machineId?: string) {
+interface RecycleArchiveRoute {
+  machineId?: string;
+  archiveDir?: string;
+  agent?: AgentKind;
+}
+
+function recycleArchiveRemotePath(
+  sessionId: string,
+  action: 'restore' | 'purge',
+  route: RecycleArchiveRoute,
+): string {
+  const query = new URLSearchParams({ remote: '0' });
+  if (route.archiveDir) query.set('archiveDir', route.archiveDir);
+  if (route.agent) query.set('agent', route.agent);
+  const base = `/api/recycle-bin/${encodeURIComponent(sessionId)}`;
+  return `${base}${action === 'restore' ? '/restore' : ''}?${query.toString()}`;
+}
+
+async function resolveRecycleArchiveRoute(
+  sessionId: string,
+  route: RecycleArchiveRoute,
+  includeRemote: boolean,
+): Promise<RecycleArchiveRoute> {
+  if (route.machineId) return route;
+  const { archives, errors } = await listRecycleArchivesAggregated(includeRemote);
+  if (errors.length) {
+    throw new SessionRoutingError(
+      503,
+      'REMOTE_RECYCLE_INVENTORY_UNAVAILABLE',
+      `Remote recycle inventory unavailable: ${errors.map((error) => error.machineId).join(', ')}`,
+      { machineIds: errors.map((error) => error.machineId) },
+    );
+  }
+  const matches = archives.filter((archive) =>
+    archive.sessionId === sessionId &&
+    (!route.archiveDir || sameResolvedPath(archive.archiveDir, route.archiveDir)) &&
+    (!route.agent || archive.agent === route.agent)
+  );
+  if (matches.length > 1) {
+    throw new SessionRoutingError(
+      409,
+      'AMBIGUOUS_RECYCLE_ARCHIVE_IDENTITY',
+      `Multiple recycle archives found for session ${sessionId}; machineId and archiveDir are required`,
+      {
+        candidates: matches.map((archive) => ({
+          machineId: archive.machineId,
+          archiveDir: archive.archiveDir,
+          agent: archive.agent,
+        })),
+      },
+    );
+  }
+  if (!matches.length) throw new Error(`Recycle archive not found: ${sessionId}`);
+  const match = matches[0];
+  return {
+    machineId: match.machineId,
+    archiveDir: match.archiveDir,
+    agent: match.agent ?? undefined,
+  };
+}
+
+async function restoreRecycleArchiveByMachine(
+  sessionId: string,
+  route: RecycleArchiveRoute,
+  allowRemote: boolean,
+) {
+  const resolvedRoute = await resolveRecycleArchiveRoute(sessionId, route, allowRemote);
   const localMachineId = service.getMeta().machineId;
-  if (!machineId || machineId === localMachineId) {
-    try {
-      return await service.restoreRecycleArchive(sessionId);
-    } catch (localError) {
-      if (machineId === localMachineId) throw localError;
-    }
+  if (resolvedRoute.machineId === localMachineId) {
+    return service.restoreRecycleArchive(sessionId, resolvedRoute);
+  }
+  if (!allowRemote) {
+    throw new Error(`Recycle archive not found: ${sessionId}`);
   }
 
-  const candidates = machineId
-    ? remoteAgents.filter((agent) => agent.id === machineId)
+  const candidates = resolvedRoute.machineId
+    ? remoteAgents.filter((agent) => agent.id === resolvedRoute.machineId)
     : remoteAgents;
-  if (machineId && !candidates.length) throw new Error(`Remote machine not configured: ${machineId}`);
+  if (resolvedRoute.machineId && !candidates.length) {
+    throw new Error(`Remote machine not configured: ${resolvedRoute.machineId}`);
+  }
   let lastError: unknown = null;
   for (const agent of candidates) {
     try {
-      return await postAgentJson(agent, `/api/recycle-bin/${encodeURIComponent(sessionId)}/restore?remote=0`, { confirm: true });
+      return await postAgentJson(
+        agent,
+        recycleArchiveRemotePath(sessionId, 'restore', resolvedRoute),
+        { confirm: true },
+      );
     } catch (error) {
       lastError = error;
     }
@@ -1663,24 +1879,34 @@ async function restoreRecycleArchiveByMachine(sessionId: string, machineId?: str
   throw lastError instanceof Error ? lastError : new Error(`Recycle archive not found: ${sessionId}`);
 }
 
-async function purgeRecycleArchiveByMachine(sessionId: string, machineId?: string) {
+async function purgeRecycleArchiveByMachine(
+  sessionId: string,
+  route: RecycleArchiveRoute,
+  allowRemote: boolean,
+) {
+  const resolvedRoute = await resolveRecycleArchiveRoute(sessionId, route, allowRemote);
   const localMachineId = service.getMeta().machineId;
-  if (!machineId || machineId === localMachineId) {
-    try {
-      return await service.purgeRecycleArchive(sessionId);
-    } catch (localError) {
-      if (machineId === localMachineId) throw localError;
-    }
+  if (resolvedRoute.machineId === localMachineId) {
+    return service.purgeRecycleArchive(sessionId, resolvedRoute);
+  }
+  if (!allowRemote) {
+    throw new Error(`Recycle archive not found: ${sessionId}`);
   }
 
-  const candidates = machineId
-    ? remoteAgents.filter((agent) => agent.id === machineId)
+  const candidates = resolvedRoute.machineId
+    ? remoteAgents.filter((agent) => agent.id === resolvedRoute.machineId)
     : remoteAgents;
-  if (machineId && !candidates.length) throw new Error(`Remote machine not configured: ${machineId}`);
+  if (resolvedRoute.machineId && !candidates.length) {
+    throw new Error(`Remote machine not configured: ${resolvedRoute.machineId}`);
+  }
   let lastError: unknown = null;
   for (const agent of candidates) {
     try {
-      return await deleteAgentJson(agent, `/api/recycle-bin/${encodeURIComponent(sessionId)}?remote=0`, { confirm: true });
+      return await deleteAgentJson(
+        agent,
+        recycleArchiveRemotePath(sessionId, 'purge', resolvedRoute),
+        { confirm: true },
+      );
     } catch (error) {
       lastError = error;
     }
@@ -1692,15 +1918,31 @@ async function pruneAggregatedSessions(
   includeRemote: boolean,
   predicate: (session: CodexSession) => boolean
 ) {
-  const [localSessions, remoteSessions, panelState] = await Promise.all([
+  const [localSessions, remoteInventory, panelState] = await Promise.all([
     getLocalSessionsCached(false, true),
-    includeRemote ? getRemoteSessionsCached() : Promise.resolve([]),
-    store.load(),
+    includeRemote
+      ? getRemoteSessionsStrict()
+      : Promise.resolve({ status: 'ok' as const, sessions: [] }),
+    service.ensureLegacyStateMigrated(),
   ]);
-  const targets = [...localSessions, ...remoteSessions]
+  if (remoteInventory.status === 'unavailable') {
+    throw new SessionRoutingError(
+      503,
+      'REMOTE_SESSION_INVENTORY_UNAVAILABLE',
+      `Remote session inventory unavailable: ${remoteInventory.machineIds.join(', ')}`,
+      { machineIds: remoteInventory.machineIds },
+    );
+  }
+  const targets = [...localSessions, ...remoteInventory.sessions]
     .map((session) => applyPanelSessionState(session, panelState))
     .filter((session) => !session.kept && predicate(session));
-  const results = await deleteSessionsByIdsBulk(targets.map((session) => session.id), includeRemote);
+  const results = await deleteRoutedSessionsBulk(
+    targets.map((session) => ({
+      id: session.id,
+      machineId: session.machineId,
+      agent: session.agent,
+    })),
+  );
   return {
     matched: targets.length,
     deleted: results.filter((result) => result.ok).length,
@@ -1743,14 +1985,22 @@ function trimEvaluationRefreshJobs(): void {
 async function refreshRemoteSessionEvaluation(job: EvaluationRefreshJob) {
   const agent = remoteAgents.find((candidate) => candidate.id === job.machineId);
   if (!agent) throw new Error(`Remote machine not configured: ${job.machineId}`);
-  const remote = await findRemoteSession(job.sessionId, job.machineId);
+  const remote = await findRemoteSession(job.sessionId, job.machineId, job.agent);
   if (!remote) throw new Error(`Remote session not found: ${job.machineId}/${job.sessionId}`);
 
+  const inputQuery = new URLSearchParams();
+  if (job.agent) inputQuery.set('agent', job.agent);
   const input = await fetchAgentJson<RemoteEvaluationInput>(
     agent,
-    `/api/worker/evaluation-input/${encodeURIComponent(job.sessionId)}`,
+    `/api/worker/evaluation-input/${encodeURIComponent(job.sessionId)}${
+      inputQuery.size ? `?${inputQuery.toString()}` : ''
+    }`,
   );
-  if (input.sessionId !== job.sessionId || input.machineId !== job.machineId) {
+  if (
+    input.sessionId !== job.sessionId ||
+    input.machineId !== job.machineId ||
+    (job.agent && input.agent !== job.agent)
+  ) {
     throw new Error(`Remote evaluation identity mismatch for ${job.machineId}/${job.sessionId}`);
   }
   await recordSessionAuditEvent({
@@ -1788,6 +2038,7 @@ async function refreshRemoteSessionEvaluation(job: EvaluationRefreshJob) {
     });
     await postAgentJson(agent, `/api/worker/evaluations/${encodeURIComponent(job.sessionId)}`, {
       hubMachineId: service.getMeta().machineId,
+      agent: input.agent,
       runId: job.id,
       transcriptHash: input.transcriptHash,
       reason: job.reason,
@@ -1859,7 +2110,7 @@ function processEvaluationRefreshQueue(): void {
     void (async () => {
       try {
         const result = job.machineId === service.getMeta().machineId
-          ? await service.refreshSessionEvaluation(job.sessionId, job.reason)
+          ? await service.refreshSessionEvaluation(job.sessionId, job.reason, job.agent)
           : await refreshRemoteSessionEvaluation(job);
         job.result = result;
         job.status = result.status === 'failed' ? 'failed' : 'completed';
@@ -1882,9 +2133,14 @@ async function enqueueEvaluationRefresh(
   sessionId: string,
   reason: string,
   machineId = service.getMeta().machineId,
+  agent: AgentKind | null = null,
 ): Promise<EvaluationRefreshJob> {
   const existing = [...evaluationRefreshJobs.values()].find(
-    (job) => job.sessionId === sessionId && job.machineId === machineId && (job.status === 'queued' || job.status === 'running')
+    (job) =>
+      job.sessionId === sessionId &&
+      job.machineId === machineId &&
+      job.agent === agent &&
+      (job.status === 'queued' || job.status === 'running')
   );
   if (existing) return existing;
 
@@ -1892,6 +2148,7 @@ async function enqueueEvaluationRefresh(
     id: randomUUID(),
     sessionId,
     machineId,
+    agent,
     reason,
     status: 'queued',
     createdAt: new Date().toISOString(),
@@ -1903,13 +2160,15 @@ async function enqueueEvaluationRefresh(
   evaluationRefreshJobs.set(job.id, job);
   evaluationRefreshQueue.push(job.id);
   if (machineId === service.getMeta().machineId) {
-    await service.markSessionEvaluationRefreshQueued(sessionId, reason);
+    if (agent) {
+      await service.markSessionEvaluationRefreshQueued(sessionId, agent, reason);
+    }
   } else {
     await recordSessionAuditEvent({
       event: 'evaluation-queued',
       sessionId,
       machineId,
-      agent: null,
+      agent,
       runId: job.id,
       evaluationOrigin: 'hub-remote',
       transcriptHash: null,
@@ -1962,7 +2221,12 @@ async function runRemoteEvaluationBackfill(reason: string): Promise<void> {
       .sort((a, b) => Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? ''));
     const limit = readIntEnv('CURATOR_REMOTE_EVALUATION_LIMIT', 4, 1, 100);
     for (const session of sessions.slice(0, limit)) {
-      await enqueueEvaluationRefresh(session.id, `remote-backfill:${reason}`, session.machineId);
+      await enqueueEvaluationRefresh(
+        session.id,
+        `remote-backfill:${reason}`,
+        session.machineId,
+        session.agent,
+      );
     }
     app.log.info(
       {
@@ -2064,9 +2328,36 @@ async function getLocalSessionsCached(refreshWorkflow: boolean, fast: boolean) {
   return cache.promise;
 }
 
-async function findLocalSessionCached(sessionId: string) {
-  const sessions = await getLocalSessionsCached(false, true);
-  return sessions.find((session) => session.id === sessionId) ?? null;
+class SessionRoutingError extends Error {
+  statusCode: number;
+  code: string;
+  details: Record<string, unknown>;
+
+  constructor(
+    statusCode: number,
+    code: string,
+    message: string,
+    details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = 'SessionRoutingError';
+    this.statusCode = statusCode;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function sendSessionRoutingError(reply: FastifyReply, error: unknown, fallback: string) {
+  if (error instanceof SessionRoutingError) {
+    return reply.code(error.statusCode).send({
+      error: error.message,
+      code: error.code,
+      ...error.details,
+    });
+  }
+  return reply.code(404).send({
+    error: error instanceof Error ? error.message : fallback,
+  });
 }
 
 async function getRemoteSessionsCached() {
@@ -2098,6 +2389,37 @@ async function getRemoteSessionsCached() {
   return (await remoteSessionsCache.promise).flat();
 }
 
+async function getRemoteSessionsStrict(
+  agents: typeof remoteAgents = remoteAgents,
+): Promise<
+  | { status: 'ok'; sessions: CodexSession[] }
+  | { status: 'unavailable'; machineIds: string[] }
+> {
+  const results = await Promise.all(agents.map(async (agent) => {
+    try {
+      const payload = await fetchAgentJson<{ sessions?: CodexSession[] }>(
+        agent,
+        '/api/sessions?detail=0&remote=0',
+      );
+      return {
+        agent,
+        sessions: (payload.sessions ?? []).map((session) => ({
+          ...session,
+          machineId: session.machineId || agent.id,
+        })),
+        unavailable: false,
+      };
+    } catch {
+      return { agent, sessions: [] as CodexSession[], unavailable: true };
+    }
+  }));
+  const machineIds = results
+    .filter((result) => result.unavailable)
+    .map((result) => result.agent.id);
+  if (machineIds.length) return { status: 'unavailable', machineIds };
+  return { status: 'ok', sessions: results.flatMap((result) => result.sessions) };
+}
+
 function orderedRemoteAgents(preferredMachineId?: string | null) {
   const preferred = preferredMachineId?.trim();
   if (!preferred) return remoteAgents;
@@ -2109,12 +2431,16 @@ function orderedRemoteAgents(preferredMachineId?: string | null) {
 
 async function findRemoteSession(
   sessionId: string,
-  preferredMachineId?: string | null
+  preferredMachineId?: string | null,
+  preferredAgent?: AgentKind | null,
 ): Promise<{ agent: (typeof remoteAgents)[number]; session: CodexSession } | null> {
   const sessions = await getRemoteSessionsCached();
   for (const agent of orderedRemoteAgents(preferredMachineId)) {
     const session = sessions.find(
-      (candidate) => candidate.id === sessionId && (!candidate.machineId || candidate.machineId === agent.id)
+      (candidate) =>
+        candidate.id === sessionId &&
+        (!candidate.machineId || candidate.machineId === agent.id) &&
+        (!preferredAgent || candidate.agent === preferredAgent)
     );
     if (!session) continue;
     return { agent, session: { ...session, machineId: session.machineId || agent.id } };
@@ -2124,24 +2450,39 @@ async function findRemoteSession(
 
 async function findRoutableSession(
   sessionId: string,
-  preferredMachineId?: string | null
+  preferredMachineId?: string | null,
+  agent?: AgentKind | null,
+  includeRemote = true,
 ): Promise<{ kind: 'local' | 'remote'; session: CodexSession } | null> {
-  const localMachineId = service.getMeta().machineId;
-  const preferred = preferredMachineId?.trim();
-  if (preferred === localMachineId) {
-    const local = await findLocalSessionCached(sessionId);
-    return local ? { kind: 'local', session: local } : null;
+  const resolution = await resolveHermesSession(
+    {
+      sessionId,
+      machineId: preferredMachineId,
+      agent,
+    },
+    includeRemote,
+  );
+  if (resolution.status === 'missing') return null;
+  if (resolution.status === 'unavailable') {
+    throw new SessionRoutingError(
+      503,
+      'REMOTE_SESSION_INVENTORY_UNAVAILABLE',
+      `Remote session inventory unavailable: ${resolution.machineIds.join(', ')}`,
+      { machineIds: resolution.machineIds },
+    );
   }
-  if (preferred) {
-    const remote = await findRemoteSession(sessionId, preferred);
-    return remote?.agent.id === preferred ? { kind: 'remote', session: remote.session } : null;
+  if (resolution.status === 'ambiguous') {
+    throw new SessionRoutingError(
+      409,
+      'AMBIGUOUS_SESSION_IDENTITY',
+      `Ambiguous session identity: ${sessionId}`,
+      { candidates: resolution.candidates },
+    );
   }
-
-  const local = await findLocalSessionCached(sessionId);
-  if (local && (!local.cwd || existsSync(local.cwd))) return { kind: 'local', session: local };
-  const remote = await findRemoteSession(sessionId);
-  if (remote) return { kind: 'remote', session: remote.session };
-  return local ? { kind: 'local', session: local } : null;
+  return {
+    kind: resolution.session.machineId === service.getMeta().machineId ? 'local' : 'remote',
+    session: resolution.session,
+  };
 }
 
 async function buildFleetAuditReport(refreshRemoteCache = false) {
@@ -2151,15 +2492,19 @@ async function buildFleetAuditReport(refreshRemoteCache = false) {
     getLocalSessionsCached(false, true),
     getRemoteSessionsCached(),
   ]);
-  const localVisibleIds = new Set(localSessions.map((session) => session.id));
+  const localVisibleIds = new Set(localSessions.map((session) => sessionStateKey(session.id, session.agent)));
   const localVisibility = compareSessionVisibility(localReport.sessionIds, localVisibleIds);
   const remotes = await Promise.all(remoteAgents.map(async (agent) => {
     try {
       const direct = await fetchAgentJson<{ sessions?: CodexSession[] }>(agent, '/api/sessions?detail=0&remote=0');
       const report = await fetchAgentJson<SessionCompletenessReport>(agent, '/api/audit/completeness');
-      const directIds = new Set((direct.sessions ?? []).map((session) => session.id));
+      const directIds = new Set(
+        (direct.sessions ?? []).map((session) => sessionStateKey(session.id, session.agent)),
+      );
       const panelIds = new Set(
-        aggregatedRemoteSessions.filter((session) => session.machineId === agent.id).map((session) => session.id),
+        aggregatedRemoteSessions
+          .filter((session) => session.machineId === agent.id)
+          .map((session) => sessionStateKey(session.id, session.agent)),
       );
       const directVisibility = compareSessionVisibility(report.sessionIds, directIds);
       const panelVisibility = compareSessionVisibility(report.sessionIds, panelIds);
@@ -2434,6 +2779,7 @@ async function recordJobFailureCard(job: CodexResumeJob, reason: string): Promis
   if (job.status === 'completed') return;
   await service.appendFailureKnowledgeCard({
     sessionId: job.sessionId,
+    agent: job.agent,
     jobId: job.id,
     error: job.error ?? reason,
     outputTail: job.outputTail,
@@ -2459,6 +2805,7 @@ function jobOutcomeFromJob(job: CodexResumeJob, goal: string) {
     jobId: job.id,
     sessionId: job.sessionId,
     machineId: job.machineId,
+    agent: job.agent,
     status: job.status,
     mode: job.mode,
     goal: goal.slice(0, 1200),
@@ -2481,19 +2828,26 @@ function jobOutcomeFromJob(job: CodexResumeJob, goal: string) {
 async function recordJobOutcome(job: CodexResumeJob, goal: string): Promise<void> {
   const outcome = jobOutcomeFromJob(job, goal);
   await service.appendJobOutcome(outcome);
+  const identity = hermesKnowledgeIdentity(outcome.machineId, outcome.agent, outcome.sessionId);
   await syncKnowledgeItems([
     {
-      id: `${outcome.sessionId}:job:${outcome.jobId}`,
+      id: `${identity}:job:${outcome.jobId}`,
+      legacyIds: [`${outcome.sessionId}:job:${outcome.jobId}`],
       type: 'job',
       scope: 'job_outcome',
-      title: `Codex worker ${outcome.status}: ${outcome.goal.slice(0, 120)}`,
-      text: outcome.summary,
+      title: `${outcome.agent} worker ${outcome.status}: ${outcome.goal.slice(0, 120)}`,
+      text: [
+        `machineId: ${outcome.machineId}`,
+        `agent: ${outcome.agent}`,
+        `sessionId: ${outcome.sessionId}`,
+        outcome.summary,
+      ].join('\n'),
       project: outcome.cwd?.split('/').filter(Boolean).at(-1) ?? null,
       repo: null,
       cwd: outcome.cwd,
       machineId: outcome.machineId,
       updatedAt: outcome.at,
-      tags: ['job_outcome', outcome.status, outcome.machineId].filter(Boolean),
+      tags: ['job_outcome', outcome.status, outcome.machineId, outcome.agent, outcome.sessionId].filter(Boolean),
       source: 'curator:auto-sync',
       confidence: 0.8,
       lastVerifiedAt: outcome.at,
@@ -2503,6 +2857,10 @@ async function recordJobOutcome(job: CodexResumeJob, goal: string): Promise<void
 }
 
 async function finalizeJobFacts(job: CodexResumeJob, goal: string, reason: string): Promise<void> {
+  if (!job.agentVerified) {
+    app.log.warn({ jobId: job.id, sessionId: job.sessionId }, 'Skipping job fact write because Agent identity is unverified');
+    return;
+  }
   await Promise.all([
     recordJobOutcome(job, goal),
     recordJobFailureCard(job, reason),
@@ -2572,7 +2930,15 @@ startCodexSupervisorLoop({
   autoRetry: process.env.CURATOR_CODEX_SUPERVISOR_AUTO_RETRY === '1',
   maxRetries: readIntEnv('CURATOR_CODEX_SUPERVISOR_MAX_RETRIES', 1, 0, 10),
   restart: (previousJob, prompt) => {
-    const session = supervisorSessionCache.find((item) => item.id === previousJob.sessionId);
+    if (!previousJob.agentVerified) {
+      throw new Error(`Supervisor retry refused for unverified Agent identity: ${previousJob.id}`);
+    }
+    const session = supervisorSessionCache.find(
+      (item) =>
+        item.id === previousJob.sessionId &&
+        item.machineId === previousJob.machineId &&
+        item.agent === previousJob.agent,
+    );
     if (!session) throw new Error(`Supervisor retry session not found: ${previousJob.sessionId}`);
     return startCodexResumeJob({
       session,
@@ -2590,7 +2956,12 @@ startCodexSupervisorLoop({
         void finalizeJobFacts(completedJob, prompt, 'supervisor loop job finished').catch((error) => {
           app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Job fact write failed');
         });
-        void enqueueEvaluationRefresh(completedJob.sessionId, `supervisor-loop:${completedJob.id}:${completedJob.status}`).catch((error) => {
+        void enqueueEvaluationRefresh(
+          completedJob.sessionId,
+          `supervisor-loop:${completedJob.id}:${completedJob.status}`,
+          session.machineId,
+          session.agent,
+        ).catch((error) => {
           app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Supervisor loop evaluation refresh enqueue failed');
         });
       },
@@ -3111,6 +3482,7 @@ app.get('/api/audit/events', async (request) => {
     if (!agent) return { events: [], error: `Remote machine not configured: ${query.machineId}` };
     const params = new URLSearchParams();
     if (query.sessionId) params.set('sessionId', query.sessionId);
+    if (query.agent) params.set('agent', query.agent);
     if (query.limit) params.set('limit', String(query.limit));
     return fetchAgentJson(agent, `/api/audit/events?${params.toString()}`);
   }
@@ -3119,6 +3491,7 @@ app.get('/api/audit/events', async (request) => {
       limit: query.limit,
       sessionId: query.sessionId,
       machineId: query.machineId,
+      agent: query.agent,
     }),
   };
 });
@@ -3316,12 +3689,17 @@ app.get('/api/hermes/search-documents', async (request) => {
   };
 });
 
-async function buildContextPackResponse(rawQuery: unknown) {
+async function buildContextPackResponse(
+  rawQuery: unknown,
+  strictRemoteSessions?: CodexSession[],
+) {
   const query = contextPackSchema.parse(rawQuery);
   const includeRemote = query.remote !== '0' && query.remote !== 'false';
   const limit = query.limit ?? 8;
   const localSessions = await getStateSessionsForHermes();
-  const remoteSessions = includeRemote ? await getRemoteSessionsCached() : [];
+  const remoteSessions = includeRemote
+    ? (strictRemoteSessions ?? await getRemoteSessionsCached())
+    : [];
   const needle = query.q?.trim() ?? '';
   const projectNeedle = [query.cwd, query.repo].filter(Boolean).join(' ');
   const searchNeedle = [needle, projectNeedle].filter(Boolean).join(' ');
@@ -3400,25 +3778,143 @@ app.get('/api/hermes/context-pack', async (request) => {
   return buildContextPackResponse(request.query);
 });
 
+interface HermesSessionIdentity {
+  sessionId: string;
+  machineId?: string | null;
+  agent?: AgentKind | null;
+}
+
+type HermesSessionResolution =
+  | { status: 'found'; session: SessionListItem }
+  | { status: 'missing' }
+  | { status: 'ambiguous'; candidates: Array<{ sessionId: string; machineId: string; agent: AgentKind }> }
+  | { status: 'unavailable'; machineIds: string[] };
+
+function hermesSessionIdentityKey(
+  session: Pick<SessionListItem, 'id' | 'machineId' | 'agent'>
+): string {
+  return `${session.machineId}|||${session.agent}|||${session.id}`;
+}
+
+function matchesHermesSessionIdentity(
+  session: Pick<SessionListItem, 'id' | 'machineId' | 'agent'>,
+  identity: HermesSessionIdentity
+): boolean {
+  return session.id === identity.sessionId &&
+    (!identity.machineId || session.machineId === identity.machineId) &&
+    (!identity.agent || session.agent === identity.agent);
+}
+
+function resolveHermesSessionFromCandidates(
+  sessions: SessionListItem[],
+  identity: HermesSessionIdentity
+): HermesSessionResolution {
+  const matches = sessions.filter((session) => matchesHermesSessionIdentity(session, identity));
+  if (!matches.length) return { status: 'missing' };
+  if (matches.length === 1) return { status: 'found', session: matches[0] };
+  return {
+    status: 'ambiguous',
+    candidates: matches.map((session) => ({
+      sessionId: session.id,
+      machineId: session.machineId,
+      agent: session.agent,
+    })),
+  };
+}
+
+async function resolveHermesSession(
+  identity: HermesSessionIdentity,
+  includeRemote: boolean
+): Promise<HermesSessionResolution> {
+  const localMachineId = service.getMeta().machineId;
+  const localSessions = identity.machineId && identity.machineId !== localMachineId
+    ? []
+    : await getLocalSessionsCached(false, true);
+  if (!includeRemote || identity.machineId === localMachineId || !remoteAgents.length) {
+    return resolveHermesSessionFromCandidates(localSessions, identity);
+  }
+
+  const candidates = identity.machineId
+    ? remoteAgents.filter((agent) => agent.id === identity.machineId)
+    : remoteAgents;
+  if (identity.machineId && !candidates.length) {
+    return { status: 'missing' };
+  }
+
+  const remoteInventory = await getRemoteSessionsStrict(candidates);
+  if (remoteInventory.status === 'unavailable') return remoteInventory;
+  return resolveHermesSessionFromCandidates(
+    [...localSessions, ...remoteInventory.sessions],
+    identity,
+  );
+}
+
+function sendHermesSessionResolutionError(
+  reply: FastifyReply,
+  identity: HermesSessionIdentity,
+  resolution: Exclude<HermesSessionResolution, { status: 'found' }>
+) {
+  if (resolution.status === 'unavailable') {
+    return reply.code(503).send({
+      error: `Remote session inventory unavailable: ${resolution.machineIds.join(', ')}`,
+      code: 'REMOTE_SESSION_INVENTORY_UNAVAILABLE',
+      sessionId: identity.sessionId,
+      machineIds: resolution.machineIds,
+    });
+  }
+  if (resolution.status === 'ambiguous') {
+    return reply.code(409).send({
+      error: `Ambiguous session identity: ${identity.sessionId}`,
+      code: 'AMBIGUOUS_SESSION_IDENTITY',
+      sessionId: identity.sessionId,
+      candidates: resolution.candidates,
+    });
+  }
+  return reply.code(404).send({
+    error: `Session not found: ${identity.sessionId}`,
+    code: 'SESSION_NOT_FOUND',
+    sessionId: identity.sessionId,
+  });
+}
+
 app.get('/api/hermes/sessions/:id/context', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionContextSchema.parse(request.query);
   const historyLimit = query.historyLimit ?? 20;
-  const localSession = (await getStateSessionsForHermes()).find((session) => session.id === params.id) ?? null;
-  if (!localSession) {
-    for (const agent of remoteAgents) {
-      try {
-        return await fetchAgentJson(
-          agent,
-          `/api/codex/sessions/${encodeURIComponent(params.id)}/context?historyLimit=${historyLimit}`
-        );
-      } catch {
-        // Try the next remote agent.
-      }
-    }
-    return reply.code(404).send({ error: 'Session not found' });
+  const identity = {
+    sessionId: params.id,
+    machineId: query.machineId,
+    agent: query.agent,
+  };
+  const resolution = await resolveHermesSession(identity, true);
+  if (resolution.status !== 'found') {
+    return sendHermesSessionResolutionError(reply, identity, resolution);
   }
 
+  const localMachineId = service.getMeta().machineId;
+  if (resolution.session.machineId !== localMachineId) {
+    const remoteAgent = remoteAgents.find((agent) => agent.id === resolution.session.machineId);
+    if (!remoteAgent) {
+      return reply.code(404).send({ error: `Remote machine not configured: ${resolution.session.machineId}` });
+    }
+    const remoteQuery = new URLSearchParams({
+      historyLimit: String(historyLimit),
+      machineId: resolution.session.machineId,
+      agent: resolution.session.agent,
+    });
+    try {
+      return await fetchAgentJson(
+        remoteAgent,
+        `/api/hermes/sessions/${encodeURIComponent(params.id)}/context?${remoteQuery.toString()}`
+      );
+    } catch (error) {
+      return reply.code(502).send({
+        error: error instanceof Error ? error.message : `Remote context unavailable: ${resolution.session.machineId}`,
+      });
+    }
+  }
+
+  const localSession = resolution.session;
   const history = historyLimit > 0
     ? await parseSessionHistory({ filePath: localSession.filePath, limit: historyLimit })
     : { messages: [], nextBefore: null, hasMore: false };
@@ -3427,6 +3923,7 @@ app.get('/api/hermes/sessions/:id/context', async (request, reply) => {
     `# ${session.title}`,
     `- id: ${session.id}`,
     `- machine: ${session.machineId}`,
+    `- agent: ${session.agent}`,
     `- cwd: ${session.cwd ?? 'unknown'}`,
     `- resume: ${session.resumeCommand}`,
     `- recommendation: ${session.recommendation}`,
@@ -3446,21 +3943,39 @@ app.post('/api/hermes/jobs/resume', async (request, reply) => {
   const body = resumeJobSchema.parse(request.body ?? {});
   const query = remoteControlSchema.parse(request.query);
   const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const foundSession = (await getStateSessionsForHermes()).find((item) => item.id === body.sessionId) ?? null;
-  const session = foundSession ? withEffectiveJobCwd(foundSession) : null;
-  if (!session) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await postAgentJson(agent, '/api/hermes/jobs/resume?remote=0', body);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Session not found' });
+  const identity = {
+    sessionId: body.sessionId,
+    machineId: body.machineId,
+    agent: body.agent,
+  };
+  const resolution = await resolveHermesSession(identity, allowRemote);
+  if (resolution.status !== 'found') {
+    return sendHermesSessionResolutionError(reply, identity, resolution);
   }
 
+  const localMachineId = service.getMeta().machineId;
+  if (resolution.session.machineId !== localMachineId) {
+    if (!allowRemote) {
+      return reply.code(404).send({ error: 'Selected session is remote and remote resume is disabled' });
+    }
+    const remoteAgent = remoteAgents.find((agent) => agent.id === resolution.session.machineId);
+    if (!remoteAgent) {
+      return reply.code(404).send({ error: `Remote machine not configured: ${resolution.session.machineId}` });
+    }
+    try {
+      return await postAgentJson(remoteAgent, '/api/hermes/jobs/resume?remote=0', {
+        ...body,
+        machineId: resolution.session.machineId,
+        agent: resolution.session.agent,
+      });
+    } catch (error) {
+      return reply.code(502).send({
+        error: error instanceof Error ? error.message : `Remote resume failed: ${resolution.session.machineId}`,
+      });
+    }
+  }
+
+  const session = withEffectiveJobCwd(resolution.session);
   const resumePrompt = buildCodexWorkerPrompt({
     query: body.prompt,
     prompt: body.prompt,
@@ -3481,13 +3996,18 @@ app.post('/api/hermes/jobs/resume', async (request, reply) => {
       void finalizeJobFacts(completedJob, body.prompt, 'resume job finished').catch((error) => {
         app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Job fact write failed');
       });
-      void enqueueEvaluationRefresh(completedJob.sessionId, `job:${completedJob.id}:${completedJob.status}`).catch((error) => {
+      void enqueueEvaluationRefresh(
+        completedJob.sessionId,
+        `job:${completedJob.id}:${completedJob.status}`,
+        session.machineId,
+        session.agent,
+      ).catch((error) => {
         app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Hermes job evaluation refresh enqueue failed');
       });
     },
   };
   const job = startCodexResumeJob(startInput);
-  await service.markHermesSessionUsed(session.id, job.id);
+  await service.markHermesSessionUsed(session.id, session.agent, job.id);
   expireSessionCaches();
   return { job };
 });
@@ -3496,32 +4016,99 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
   const body = hermesDispatchSchema.parse(request.body ?? {});
   const query = remoteControlSchema.parse(request.query);
   const allowRemote = query.remote !== '0' && query.remote !== 'false';
+  const localMachineId = service.getMeta().machineId;
   const limit = body.limit ?? 5;
   const threshold = body.requireConfirmationBelowScore ?? 10;
+  let strictRemoteSessions: CodexSession[] | undefined;
+  if (allowRemote && !body.sessionId) {
+    const candidates = body.machineId && body.machineId !== localMachineId
+      ? remoteAgents.filter((agent) => agent.id === body.machineId)
+      : body.machineId === localMachineId
+        ? []
+        : remoteAgents;
+    if (body.machineId && body.machineId !== localMachineId && !candidates.length) {
+      return reply.code(404).send({
+        error: `Remote machine not configured: ${body.machineId}`,
+        code: 'SESSION_MACHINE_NOT_CONFIGURED',
+      });
+    }
+    const inventory = await getRemoteSessionsStrict(candidates);
+    if (inventory.status === 'unavailable') {
+      return reply.code(503).send({
+        error: `Remote session inventory unavailable: ${inventory.machineIds.join(', ')}`,
+        code: 'REMOTE_SESSION_INVENTORY_UNAVAILABLE',
+        machineIds: inventory.machineIds,
+      });
+    }
+    strictRemoteSessions = inventory.sessions;
+  }
   const contextPack = await buildContextPackResponse({
     q: body.query,
     cwd: body.cwd,
     repo: body.repo,
     limit,
     remote: allowRemote ? undefined : '0',
-  });
-  const recommendedSessionId = body.sessionId ?? contextPack.recommendedResume?.sessionId ?? null;
-  const localSessions = await getStateSessionsForHermes();
-  const remoteSessions = allowRemote ? await getRemoteSessionsCached() : [];
-  const localIds = new Set(localSessions.map((session) => session.id));
+  }, strictRemoteSessions);
+  const localSessions = await getLocalSessionsCached(false, true);
+  const remoteSessions = allowRemote
+    ? (strictRemoteSessions ?? await getRemoteSessionsCached())
+    : [];
   const allSessions = [...localSessions, ...remoteSessions];
+  const identityFilteredSessions = allSessions.filter(
+    (session) =>
+      (!body.machineId || session.machineId === body.machineId) &&
+      (!body.agent || session.agent === body.agent)
+  );
 
-  const scored = allSessions
+  let explicitSession: SessionListItem | null = null;
+  if (body.sessionId) {
+    const explicitIdentity = {
+      sessionId: body.sessionId,
+      machineId: body.machineId,
+      agent: body.agent,
+    };
+    const resolution = await resolveHermesSession(explicitIdentity, allowRemote);
+    if (resolution.status === 'ambiguous' || resolution.status === 'unavailable') {
+      return sendHermesSessionResolutionError(reply, explicitIdentity, resolution);
+    }
+    if (resolution.status === 'missing') {
+      return {
+        status: 'needs_selection',
+        reason: `Session not found: ${body.sessionId}`,
+        query: body.query,
+        contextPack,
+        candidates: [],
+      };
+    }
+    if (resolution.status === 'found') explicitSession = resolution.session;
+  }
+
+  const recommendedResume = !body.sessionId &&
+    contextPack.recommendedResume &&
+    (!body.machineId || contextPack.recommendedResume.machineId === body.machineId) &&
+    (!body.agent || contextPack.recommendedResume.agent === body.agent)
+      ? contextPack.recommendedResume
+      : null;
+  const recommendedIdentityKey = recommendedResume
+    ? `${recommendedResume.machineId}|||${recommendedResume.agent}|||${recommendedResume.sessionId}`
+    : null;
+  const selectionPool = explicitSession ? [explicitSession] : identityFilteredSessions;
+  const scored = selectionPool
     .map((session) => ({
       session,
-      score: recommendedSessionId === session.id ? 10_000 : scoreHermesMatch(session, body.query),
+      score: recommendedIdentityKey === hermesSessionIdentityKey(session)
+        ? 10_000
+        : scoreHermesMatch(session, body.query),
     }))
-    .filter((item) => (recommendedSessionId ? item.session.id === recommendedSessionId : item.score > 0))
+    .filter((item) => explicitSession || recommendedIdentityKey
+      ? explicitSession === item.session || recommendedIdentityKey === hermesSessionIdentityKey(item.session)
+      : item.score > 0)
     .sort((a, b) => b.score - a.score || Date.parse(b.session.updatedAt ?? '') - Date.parse(a.session.updatedAt ?? ''));
   const candidates = scored.slice(0, limit).map((item) => toHermesSession(item.session, body.query));
   const selected = candidates[0] ?? null;
+  const selectedSession = scored[0]?.session ?? null;
 
-  if (!selected) {
+  if (!selected || !selectedSession) {
     return {
       status: 'needs_selection',
       reason: body.sessionId
@@ -3533,7 +4120,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     };
   }
 
-  if (!body.sessionId && !contextPack.recommendedResume && selected.score < threshold) {
+  if (!body.sessionId && !recommendedResume && selected.score < threshold) {
     return {
       status: 'needs_selection',
       reason: `Best match score ${selected.score} is below confirmation threshold ${threshold}.`,
@@ -3554,46 +4141,50 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     contextPackText: contextPack.workerPromptContext,
   });
 
-  if (!localIds.has(selected.id)) {
+  if (selectedSession.machineId !== localMachineId) {
     if (!allowRemote) {
       return reply.code(404).send({ error: 'Selected session is not local and remote dispatch is disabled' });
     }
-    const matchingAgents = [
-      ...remoteAgents.filter((agent) => agent.id === selected.machineId),
-      ...remoteAgents.filter((agent) => agent.id !== selected.machineId),
-    ];
-    for (const agent of matchingAgents) {
-      try {
-        const remotePayload = await postAgentJson<{
-          job?: unknown;
-        }>(agent, '/api/hermes/jobs/resume?remote=0', {
-          sessionId: selected.id,
-          prompt: body.prompt ?? body.query,
-          mode: hermesJobMode(body.mode),
-          supervisor: body.supervisor === false ? false : supervisorStrategy(body.supervisor),
-          policy: mergeJobPolicy(body.policyProfile, body.policy, selectedForJob.cwd),
-        });
-        return {
-          status: 'started',
-          ...remotePayload,
-          routedTo: agent.id,
-          query: body.query,
-          selectedSession: selected,
-          contextPack,
-          candidates,
-          nextAction: remotePayload.job && typeof remotePayload.job === 'object' && 'id' in remotePayload.job
-            ? `Poll /api/hermes/jobs/${String((remotePayload.job as { id?: unknown }).id)} until status is completed, failed, or stopped.`
-            : 'Poll the remote job registry for completion.',
-        };
-      } catch {
-        // Try the next remote agent.
-      }
+    const remoteAgent = remoteAgents.find((agent) => agent.id === selectedSession.machineId);
+    if (!remoteAgent) {
+      return reply.code(404).send({ error: `Remote machine not configured: ${selectedSession.machineId}` });
     }
-    return reply.code(502).send({ error: `Failed to dispatch session ${selected.id} to remote agent` });
+    try {
+      const remotePayload = await postAgentJson<{
+        job?: unknown;
+      }>(remoteAgent, '/api/hermes/jobs/resume?remote=0', {
+        sessionId: selectedSession.id,
+        machineId: selectedSession.machineId,
+        agent: selectedSession.agent,
+        prompt: body.prompt ?? body.query,
+        model: body.model,
+        extraArgs: body.extraArgs,
+        mode: hermesJobMode(body.mode),
+        supervisor: body.supervisor === false ? false : supervisorStrategy(body.supervisor),
+        policy: mergeJobPolicy(body.policyProfile, body.policy, selectedForJob.cwd),
+        policyProfile: body.policyProfile,
+        template: body.template,
+      });
+      return {
+        status: 'started',
+        ...remotePayload,
+        routedTo: remoteAgent.id,
+        query: body.query,
+        selectedSession: selected,
+        contextPack,
+        candidates,
+        nextAction: remotePayload.job && typeof remotePayload.job === 'object' && 'id' in remotePayload.job
+          ? `Poll /api/hermes/jobs/${String((remotePayload.job as { id?: unknown }).id)} until status is completed, failed, or stopped.`
+          : 'Poll the remote job registry for completion.',
+      };
+    } catch (error) {
+      return reply.code(502).send({
+        error: error instanceof Error ? error.message : `Failed to dispatch session ${selected.id} to ${remoteAgent.id}`,
+      });
+    }
   }
 
-  const localSession = localSessions.find((session) => session.id === selected.id);
-  if (!localSession) return reply.code(404).send({ error: 'Selected local session not found' });
+  const localSession = selectedSession;
   const jobSession = withEffectiveJobCwd(localSession);
   const startInput = {
     session: jobSession,
@@ -3608,13 +4199,18 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
       void finalizeJobFacts(completedJob, body.prompt ?? body.query, 'dispatch job finished').catch((error) => {
         app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Job fact write failed');
       });
-      void enqueueEvaluationRefresh(completedJob.sessionId, `dispatch:${completedJob.id}:${completedJob.status}`).catch((error) => {
+      void enqueueEvaluationRefresh(
+        completedJob.sessionId,
+        `dispatch:${completedJob.id}:${completedJob.status}`,
+        localSession.machineId,
+        localSession.agent,
+      ).catch((error) => {
         app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Hermes dispatch evaluation refresh enqueue failed');
       });
     },
   };
   const job = startCodexResumeJob(startInput);
-  await service.markHermesSessionUsed(localSession.id, job.id);
+  await service.markHermesSessionUsed(localSession.id, localSession.agent, job.id);
   expireSessionCaches();
 
   return {
@@ -3663,13 +4259,17 @@ app.get('/api/hermes/job-registry', async (request) => {
 
 app.get('/api/hermes/jobs/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = remoteControlSchema.parse(request.query);
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const job = getCodexResumeJob(params.id);
   if (!job) {
-    for (const agent of remoteAgents) {
-      try {
-        return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}`);
-      } catch {
-        // Try the next remote agent.
+    if (allowRemote) {
+      for (const agent of remoteAgents) {
+        try {
+          return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}?remote=0`);
+        } catch {
+          // Try the next remote agent.
+        }
       }
     }
     return reply.code(404).send({ error: 'Job not found' });
@@ -3679,6 +4279,8 @@ app.get('/api/hermes/jobs/:id', async (request, reply) => {
 
 app.get('/api/hermes/jobs/:id/outcome', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = remoteControlSchema.parse(request.query);
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const liveJob = getCodexResumeJob(params.id);
   if (liveJob) {
     return {
@@ -3690,11 +4292,13 @@ app.get('/api/hermes/jobs/:id/outcome', async (request, reply) => {
   }
   const stored = await service.findJobOutcome(params.id);
   if (!stored) {
-    for (const agent of remoteAgents) {
-      try {
-        return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/outcome`);
-      } catch {
-        // Try the next remote agent.
+    if (allowRemote) {
+      for (const agent of remoteAgents) {
+        try {
+          return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/outcome?remote=0`);
+        } catch {
+          // Try the next remote agent.
+        }
       }
     }
     return reply.code(404).send({ error: 'Job outcome not found' });
@@ -3704,18 +4308,52 @@ app.get('/api/hermes/jobs/:id/outcome', async (request, reply) => {
 
 app.get('/api/sessions/:id/outcome', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const outcome = await service.getSessionOutcome(params.id);
-  if (!outcome) {
-    for (const agent of remoteAgents) {
-      try {
-        return await fetchAgentJson(agent, `/api/sessions/${encodeURIComponent(params.id)}/outcome`);
-      } catch {
-        // Try the next remote agent.
-      }
-    }
-    return reply.code(404).send({ error: 'Session outcome not found' });
+  const query = sessionIdentityQuerySchema.parse(request.query);
+  const identity = {
+    sessionId: params.id,
+    machineId: query.machineId,
+    agent: query.agent,
+  };
+  const resolution = await resolveHermesSession(identity, true);
+  if (resolution.status !== 'found') {
+    return sendHermesSessionResolutionError(reply, identity, resolution);
   }
-  return outcome;
+
+  const localMachineId = service.getMeta().machineId;
+  if (resolution.session.machineId !== localMachineId) {
+    const remoteAgent = remoteAgents.find((agent) => agent.id === resolution.session.machineId);
+    if (!remoteAgent) {
+      return reply.code(404).send({ error: `Remote machine not configured: ${resolution.session.machineId}` });
+    }
+    const remoteQuery = new URLSearchParams({
+      machineId: resolution.session.machineId,
+      agent: resolution.session.agent,
+    });
+    try {
+      return await fetchAgentJson(
+        remoteAgent,
+        `/api/sessions/${encodeURIComponent(params.id)}/outcome?${remoteQuery.toString()}`
+      );
+    } catch (error) {
+      return reply.code(502).send({
+        error: error instanceof Error ? error.message : `Remote outcome unavailable: ${resolution.session.machineId}`,
+      });
+    }
+  }
+
+  const evaluation = resolution.session.evaluation;
+  return {
+    sessionId: resolution.session.id,
+    machineId: resolution.session.machineId,
+    agent: resolution.session.agent,
+    title: resolution.session.title,
+    hermesLastJobId: evaluation.hermesLastJobId ?? null,
+    jobOutcomes: evaluation.jobOutcomes ?? [],
+    failureCards: evaluation.failureCards ?? [],
+    summary: evaluation.summary,
+    detailedSummary: evaluation.detailedSummary,
+    searchText: evaluation.searchText,
+  };
 });
 
 app.get('/api/hermes/jobs/:id/events', async (request, reply) => {
@@ -3792,13 +4430,17 @@ app.get('/api/hermes/jobs/:id/events/stream', async (request, reply) => {
 
 app.post('/api/hermes/jobs/:id/stop', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
+  const query = remoteControlSchema.parse(request.query);
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const job = stopCodexResumeJob(params.id);
   if (!job) {
-    for (const agent of remoteAgents) {
-      try {
-        return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/stop`, {});
-      } catch {
-        // Try the next remote agent.
+    if (allowRemote) {
+      for (const agent of remoteAgents) {
+        try {
+          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/stop?remote=0`, {});
+        } catch {
+          // Try the next remote agent.
+        }
       }
     }
     return reply.code(404).send({ error: 'Job not found' });
@@ -3857,13 +4499,17 @@ app.post('/api/hermes/jobs/:id/protocol', async (request, reply) => {
 app.post('/api/hermes/jobs/:id/guidance', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = jobGuidanceSchema.parse(request.body ?? {});
+  const query = remoteControlSchema.parse(request.query);
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const job = sendCodexJobGuidance(params.id, body.text, body.source ?? 'hermes');
   if (!job) {
-    for (const agent of remoteAgents) {
-      try {
-        return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/guidance`, body);
-      } catch {
-        // Try the next remote agent.
+    if (allowRemote) {
+      for (const agent of remoteAgents) {
+        try {
+          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/guidance?remote=0`, body);
+        } catch {
+          // Try the next remote agent.
+        }
       }
     }
     return reply.code(404).send({ error: 'Job not found' });
@@ -3879,6 +4525,8 @@ app.post('/api/hermes/jobs/:id/guidance', async (request, reply) => {
 app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = jobSupervisorSchema.parse(request.body ?? {});
+  const query = remoteControlSchema.parse(request.query);
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
   const localSessions = body.autoRetry ? await getStateSessionsForHermes() : [];
   const superviseInput = {
     id: params.id,
@@ -3888,7 +4536,15 @@ app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
     checkIntervalMs: body.checkIntervalMs,
     staleOutputMs: body.staleOutputMs,
     restart: (previousJob: CodexResumeJob, prompt: string) => {
-      const session = localSessions.find((item) => item.id === previousJob.sessionId);
+      if (!previousJob.agentVerified) {
+        throw new Error(`Supervisor retry refused for unverified Agent identity: ${previousJob.id}`);
+      }
+      const session = localSessions.find(
+        (item) =>
+          item.id === previousJob.sessionId &&
+          item.machineId === previousJob.machineId &&
+          item.agent === previousJob.agent,
+      );
       if (!session) throw new Error(`Session not found for retry: ${previousJob.sessionId}`);
       return startCodexResumeJob({
         session,
@@ -3900,7 +4556,12 @@ app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
           void finalizeJobFacts(completedJob, prompt, 'supervisor retry job finished').catch((error) => {
             app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Job fact write failed');
           });
-          void enqueueEvaluationRefresh(completedJob.sessionId, `supervisor:${completedJob.id}:${completedJob.status}`).catch((error) => {
+          void enqueueEvaluationRefresh(
+            completedJob.sessionId,
+            `supervisor:${completedJob.id}:${completedJob.status}`,
+            session.machineId,
+            session.agent,
+          ).catch((error) => {
             app.log.warn({ jobId: completedJob.id, sessionId: completedJob.sessionId, error }, 'Supervisor retry evaluation refresh enqueue failed');
           });
         },
@@ -3909,11 +4570,13 @@ app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
   };
   const result = superviseCodexResumeJob(superviseInput);
   if (!result) {
-    for (const agent of remoteAgents) {
-      try {
-        return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/supervise`, body);
-      } catch {
-        // Try the next remote agent.
+    if (allowRemote) {
+      for (const agent of remoteAgents) {
+        try {
+          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/supervise?remote=0`, body);
+        } catch {
+          // Try the next remote agent.
+        }
       }
     }
     return reply.code(404).send({ error: 'Job not found' });
@@ -3957,7 +4620,7 @@ app.post('/api/sessions/ai-search', async (request) => {
   const [localSessions, remoteSessions, panelState] = await Promise.all([
     getLocalSessionsCached(false, true),
     getRemoteSessionsCached(),
-    store.load(),
+    service.ensureLegacyStateMigrated(),
   ]);
   const sessions = [...localSessions, ...remoteSessions]
     .map((session) => applyPanelSessionState(session, panelState))
@@ -4164,7 +4827,7 @@ app.get('/api/sessions', async (request) => {
   const remoteSessions = refreshWorkflow || !includeRemote
     ? []
     : await getRemoteSessionsCached();
-  const panelState = await store.load();
+  const panelState = await service.ensureLegacyStateMigrated();
   const sessions = [...localSessions, ...remoteSessions].map((session) => applyPanelSessionState(session, panelState));
   const filtered = sessions.filter((session) => {
     const matchesRecommendation =
@@ -4197,42 +4860,56 @@ app.get('/api/remote-agents', async () => ({
 app.get('/api/sessions/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = machineRouteQuerySchema.parse(request.query);
-  const panelState = await store.load();
-  const routed = await findRoutableSession(params.id, query.machineId);
-  if (routed) return applyPanelSessionState(routed.session, panelState);
-  return reply.code(404).send({ error: 'Session not found' });
+  try {
+    const panelState = await service.ensureLegacyStateMigrated();
+    const routed = await findRoutableSession(params.id, query.machineId, query.agent);
+    if (routed) return applyPanelSessionState(routed.session, panelState);
+    return reply.code(404).send({ error: 'Session not found' });
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Session lookup failed');
+  }
 });
 
 app.get('/api/sessions/:id/files', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionFilesQuerySchema.parse(request.query);
-  const session = await findLocalSessionCached(params.id);
-  if (session) {
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Session lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+
+  if (routed.kind === 'local') {
     try {
-      return await listSessionWorkdir(session, query.path);
+      return await listSessionWorkdir(routed.session, query.path);
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list session cwd' });
     }
   }
 
-  const remote = await findRemoteSession(params.id);
-  if (remote) {
-    try {
-      return await listRemoteSessionWorkdir(remote.session, query.path);
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list remote session cwd' });
-    }
+  try {
+    return await listRemoteSessionWorkdir(routed.session, query.path);
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to list remote session cwd' });
   }
-  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.get('/api/sessions/:id/files/download', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = sessionFilesQuerySchema.parse(request.query);
-  const session = await findLocalSessionCached(params.id);
-  if (session) {
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Session lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+
+  if (routed.kind === 'local') {
     try {
-      const { targetReal } = await resolveSessionWorkdirPath(session, query.path);
+      const { targetReal } = await resolveSessionWorkdirPath(routed.session, query.path);
       const targetStat = await stat(targetReal);
       if (!targetStat.isFile()) return reply.code(400).send({ error: 'Path is not a file' });
       reply.header('Content-Type', 'application/octet-stream');
@@ -4244,22 +4921,18 @@ app.get('/api/sessions/:id/files/download', async (request, reply) => {
     }
   }
 
-  const remote = await findRemoteSession(params.id);
-  if (remote) {
-    try {
-      const file = await statRemoteSessionFile(remote.session, query.path);
-      const child = spawnRemoteFileDownload(file.target, remote.session, query.path);
-      child.stderr.on('data', (chunk: Buffer) => app.log.warn({ sessionId: params.id, error: chunk.toString('utf8') }, 'Remote file download stderr'));
-      request.raw.on('close', () => child.kill());
-      reply.header('Content-Type', 'application/octet-stream');
-      reply.header('Content-Length', String(file.size));
-      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
-      return reply.send(child.stdout);
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to download remote file' });
-    }
+  try {
+    const file = await statRemoteSessionFile(routed.session, query.path);
+    const child = spawnRemoteFileDownload(file.target, routed.session, query.path);
+    child.stderr.on('data', (chunk: Buffer) => app.log.warn({ sessionId: params.id, error: chunk.toString('utf8') }, 'Remote file download stderr'));
+    request.raw.on('close', () => child.kill());
+    reply.header('Content-Type', 'application/octet-stream');
+    reply.header('Content-Length', String(file.size));
+    reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+    return reply.send(child.stdout);
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to download remote file' });
   }
-  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, async (request, reply) => {
@@ -4267,13 +4940,29 @@ app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, asy
   const query = sessionFileUploadQuerySchema.parse(request.query);
   const body = request.body;
   if (!Buffer.isBuffer(body)) return reply.code(400).send({ error: 'Expected application/octet-stream upload body' });
-  const session = await findLocalSessionCached(params.id);
-  if (session) {
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Session lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+  const overwrite = query.overwrite === '1' || query.overwrite === 'true';
+
+  if (routed.kind === 'local') {
     try {
-      const overwrite = query.overwrite === '1' || query.overwrite === 'true';
-      const { target, directoryReal, relativePath } = await resolveSessionUploadPath(session, query.path, query.name);
+      const { target, directoryReal, relativePath } = await resolveSessionUploadPath(routed.session, query.path, query.name);
       await mkdir(directoryReal, { recursive: true });
-      await writeFile(target, body, { flag: overwrite ? 'w' : 'wx' });
+      const flags = fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_NOFOLLOW |
+        (overwrite ? fsConstants.O_TRUNC : fsConstants.O_EXCL);
+      const handle = await open(target, flags, 0o644);
+      try {
+        await handle.writeFile(body);
+      } finally {
+        await handle.close();
+      }
       const uploaded = await stat(target);
       return {
         ok: true,
@@ -4290,16 +4979,11 @@ app.post('/api/sessions/:id/files/upload', { bodyLimit: 100 * 1024 * 1024 }, asy
     }
   }
 
-  const remote = await findRemoteSession(params.id);
-  if (remote) {
-    try {
-      const overwrite = query.overwrite === '1' || query.overwrite === 'true';
-      return await uploadRemoteSessionFile(remote.session, query.path, query.name, overwrite, body);
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to upload remote file' });
-    }
+  try {
+    return await uploadRemoteSessionFile(routed.session, query.path, query.name, overwrite, body);
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : 'Unable to upload remote file' });
   }
-  return reply.code(404).send({ error: 'Session not found' });
 });
 
 app.get('/api/sessions/:id/history', async (request, reply) => {
@@ -4309,38 +4993,44 @@ app.get('/api/sessions/:id/history', async (request, reply) => {
       limit: z.coerce.number().int().min(1).max(200).optional(),
       before: z.coerce.number().int().min(0).optional(),
       machineId: z.string().min(1).max(300).optional(),
+      agent: z.enum(['codex', 'claude']).optional(),
     })
     .parse(request.query);
-  const localMachineId = service.getMeta().machineId;
-  let localError: unknown = null;
-  if (!query.machineId || query.machineId === localMachineId) {
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'History lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+  if (routed.kind === 'local') {
     try {
-      return await service.getSessionHistory(params.id, { limit: query.limit, beforeIndex: query.before ?? null });
+      return await service.getSessionHistory(params.id, {
+        limit: query.limit,
+        beforeIndex: query.before ?? null,
+        agent: routed.session.agent,
+      });
     } catch (error) {
-      localError = error;
-      if (query.machineId === localMachineId) {
-        return reply.code(404).send({ error: error instanceof Error ? error.message : 'History failed' });
-      }
+      return reply.code(404).send({ error: error instanceof Error ? error.message : 'History failed' });
     }
   }
-  const candidates = orderedRemoteAgents(query.machineId);
-  if (query.machineId && !candidates.some((agent) => agent.id === query.machineId)) {
-    return reply.code(404).send({ error: `Remote machine not configured: ${query.machineId}` });
-  }
-  for (const agent of candidates) {
-    if (query.machineId && agent.id !== query.machineId) continue;
-    try {
-      const path = `/api/sessions/${encodeURIComponent(params.id)}/history?limit=${query.limit ?? 80}${
-        query.before === undefined ? '' : `&before=${query.before}`
-      }`;
-      return await fetchAgentJson(agent, path);
-    } catch {
-      // Try the next eligible agent.
-    }
-  }
-  return reply.code(404).send({
-    error: localError instanceof Error ? localError.message : 'History failed',
+  const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+  if (!remoteAgent) return reply.code(404).send({ error: `Remote machine not configured: ${routed.session.machineId}` });
+  const remoteQuery = new URLSearchParams({
+    limit: String(query.limit ?? 80),
+    machineId: routed.session.machineId,
+    agent: routed.session.agent,
+    remote: '0',
   });
+  if (query.before !== undefined) remoteQuery.set('before', String(query.before));
+  try {
+    return await fetchAgentJson(
+      remoteAgent,
+      `/api/sessions/${encodeURIComponent(params.id)}/history?${remoteQuery.toString()}`,
+    );
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : 'History failed' });
+  }
 });
 
 app.get('/api/sessions/:id/messages', async (request, reply) => {
@@ -4353,13 +5043,19 @@ app.get('/api/sessions/:id/messages', async (request, reply) => {
       full: z.enum(['0', '1', 'true', 'false']).optional(),
       preserve: z.enum(['0', '1', 'true', 'false']).optional(),
       machineId: z.string().min(1).max(300).optional(),
+      agent: z.enum(['codex', 'claude']).optional(),
     })
     .parse(request.query);
   const full = query.full === '1' || query.full === 'true';
   const preserveWhitespace = query.preserve === '1' || query.preserve === 'true';
-  const localMachineId = service.getMeta().machineId;
-  let localError: unknown = null;
-  if (!query.machineId || query.machineId === localMachineId) {
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Messages lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+  if (routed.kind === 'local') {
     try {
       return await service.getSessionMessages(params.id, {
         limit: query.limit,
@@ -4367,36 +5063,32 @@ app.get('/api/sessions/:id/messages', async (request, reply) => {
         afterIndex: query.after ?? null,
         full,
         preserveWhitespace,
+        agent: routed.session.agent,
       });
     } catch (error) {
-      localError = error;
-      if (query.machineId === localMachineId) {
-        return reply.code(404).send({ error: error instanceof Error ? error.message : 'Messages failed' });
-      }
+      return reply.code(404).send({ error: error instanceof Error ? error.message : 'Messages failed' });
     }
   }
-  const candidates = orderedRemoteAgents(query.machineId);
-  if (query.machineId && !candidates.some((agent) => agent.id === query.machineId)) {
-    return reply.code(404).send({ error: `Remote machine not configured: ${query.machineId}` });
-  }
-  for (const agent of candidates) {
-    if (query.machineId && agent.id !== query.machineId) continue;
-    try {
-      const searchParams = new URLSearchParams();
-      if (query.limit !== undefined) searchParams.set('limit', String(query.limit));
-      if (query.before !== undefined) searchParams.set('before', String(query.before));
-      if (query.after !== undefined) searchParams.set('after', String(query.after));
-      if (query.full !== undefined) searchParams.set('full', query.full);
-      if (query.preserve !== undefined) searchParams.set('preserve', query.preserve);
-      const suffix = searchParams.size ? `?${searchParams.toString()}` : '';
-      return await fetchAgentJson(agent, `/api/sessions/${encodeURIComponent(params.id)}/messages${suffix}`);
-    } catch {
-      // Try the next eligible agent.
-    }
-  }
-  return reply.code(404).send({
-    error: localError instanceof Error ? localError.message : 'Messages failed',
+  const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+  if (!remoteAgent) return reply.code(404).send({ error: `Remote machine not configured: ${routed.session.machineId}` });
+  const remoteQuery = new URLSearchParams({
+    machineId: routed.session.machineId,
+    agent: routed.session.agent,
+    remote: '0',
   });
+  if (query.limit !== undefined) remoteQuery.set('limit', String(query.limit));
+  if (query.before !== undefined) remoteQuery.set('before', String(query.before));
+  if (query.after !== undefined) remoteQuery.set('after', String(query.after));
+  if (query.full !== undefined) remoteQuery.set('full', query.full);
+  if (query.preserve !== undefined) remoteQuery.set('preserve', query.preserve);
+  try {
+    return await fetchAgentJson(
+      remoteAgent,
+      `/api/sessions/${encodeURIComponent(params.id)}/messages?${remoteQuery.toString()}`,
+    );
+  } catch (error) {
+    return reply.code(404).send({ error: error instanceof Error ? error.message : 'Messages failed' });
+  }
 });
 
 app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, request) => {
@@ -4406,9 +5098,20 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
       cols: z.coerce.number().int().min(40).max(500).optional(),
       rows: z.coerce.number().int().min(12).max(160).optional(),
       machineId: z.string().min(1).max(300).optional(),
+      agent: z.enum(['codex', 'claude']).optional(),
     })
     .parse(request.query);
-  const routed = await findRoutableSession(params.id, query.machineId);
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    routed = await findRoutableSession(params.id, query.machineId, query.agent);
+  } catch (error) {
+    socket.send(JSON.stringify({
+      type: 'error',
+      data: error instanceof Error ? error.message : 'Session lookup failed',
+    }));
+    socket.close();
+    return;
+  }
   if (!routed) {
     socket.send(JSON.stringify({ type: 'error', data: 'Session not found' }));
     socket.close();
@@ -4443,53 +5146,155 @@ app.get('/api/recycle-bin', async (request) => {
 
 app.post('/api/recycle-bin/:id/restore', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const query = machineRouteQuerySchema.parse(request.query);
+  const query = recycleArchiveRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await restoreRecycleArchiveByMachine(params.id, query.machineId);
+    const allowRemote = query.remote !== '0' && query.remote !== 'false';
+    const result = await restoreRecycleArchiveByMachine(params.id, query, allowRemote);
     clearSessionCaches();
     return result;
   } catch (error) {
+    if (error instanceof SessionRoutingError) {
+      return sendSessionRoutingError(reply, error, 'Restore failed');
+    }
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Restore failed' });
   }
 });
 
 app.delete('/api/recycle-bin/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const query = machineRouteQuerySchema.parse(request.query);
+  const query = recycleArchiveRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await purgeRecycleArchiveByMachine(params.id, query.machineId);
+    const allowRemote = query.remote !== '0' && query.remote !== 'false';
+    const result = await purgeRecycleArchiveByMachine(params.id, query, allowRemote);
     return result;
   } catch (error) {
+    if (error instanceof SessionRoutingError) {
+      return sendSessionRoutingError(reply, error, 'Purge failed');
+    }
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Purge failed' });
   }
 });
 
-app.post('/api/sessions/:id/keep', async (request) => {
+app.post('/api/sessions/:id/keep', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = keepSchema.parse(request.body);
-  await service.setKept(params.id, body.kept);
-  expireSessionCaches();
-  return { id: params.id, kept: body.kept };
+  try {
+    const routed = await findRoutableSession(params.id, body.machineId, body.agent);
+    if (!routed) return reply.code(404).send({ error: 'Session not found' });
+    if (routed.kind === 'remote') {
+      const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+      if (!remoteAgent) throw new Error(`Remote machine not configured: ${routed.session.machineId}`);
+      const result = await postAgentJson(
+        remoteAgent,
+        `/api/sessions/${encodeURIComponent(params.id)}/keep`,
+        {
+          kept: body.kept,
+          machineId: routed.session.machineId,
+          agent: routed.session.agent,
+        },
+      );
+      clearSessionCaches();
+      return result;
+    }
+    await service.setKept(params.id, body.kept, routed.session.agent);
+    clearSessionCaches();
+    return {
+      id: params.id,
+      machineId: routed.session.machineId,
+      agent: routed.session.agent,
+      kept: body.kept,
+    };
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Keep failed');
+  }
 });
 
-app.post('/api/sessions/:id/title', async (request) => {
+app.post('/api/sessions/:id/title', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = titleSchema.parse(request.body);
-  await service.setTitle(params.id, body.title);
-  expireSessionCaches();
-  return { id: params.id, title: body.title.trim().slice(0, 120) };
+  try {
+    const routed = await findRoutableSession(params.id, body.machineId, body.agent);
+    if (!routed) return reply.code(404).send({ error: 'Session not found' });
+    if (routed.kind === 'remote') {
+      const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+      if (!remoteAgent) throw new Error(`Remote machine not configured: ${routed.session.machineId}`);
+      const result = await postAgentJson(
+        remoteAgent,
+        `/api/sessions/${encodeURIComponent(params.id)}/title`,
+        {
+          title: body.title,
+          machineId: routed.session.machineId,
+          agent: routed.session.agent,
+        },
+      );
+      clearSessionCaches();
+      return result;
+    }
+    await service.setTitle(params.id, body.title, routed.session.agent);
+    clearSessionCaches();
+    return {
+      id: params.id,
+      machineId: routed.session.machineId,
+      agent: routed.session.agent,
+      title: body.title.trim().slice(0, 120),
+    };
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Title failed');
+  }
 });
 
 app.post('/api/sessions/:id/migrate', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = migrateSchema.parse(request.body);
   try {
-    const result = await service.migrateSessionToProject(params.id, body.targetProjectDir);
+    const routed = await findRoutableSession(params.id, body.machineId, body.agent);
+    if (!routed) return reply.code(404).send({ error: 'Session not found' });
+    if (routed.kind === 'remote') {
+      const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+      if (!remoteAgent) throw new Error(`Remote machine not configured: ${routed.session.machineId}`);
+      const result = await postAgentJson(
+        remoteAgent,
+        `/api/sessions/${encodeURIComponent(params.id)}/migrate`,
+        {
+          targetProjectDir: body.targetProjectDir,
+          machineId: routed.session.machineId,
+          agent: routed.session.agent,
+        },
+      );
+      clearSessionCaches();
+      return result;
+    }
+    const result = await service.migrateSessionToProject(
+      params.id,
+      body.targetProjectDir,
+      routed.session.agent,
+    );
     clearSessionCaches();
-    return result;
+    return {
+      ...result,
+      machineId: routed.session.machineId,
+      agent: routed.session.agent,
+    };
   } catch (error) {
+    if (error instanceof SessionRoutingError) {
+      return sendSessionRoutingError(reply, error, 'Migrate failed');
+    }
+    if (error instanceof UnsupportedSessionMigrationError) {
+      return reply.code(422).send({ error: error.message, code: error.code });
+    }
+    if (error instanceof RemoteAgentHttpError && error.status === 422) {
+      const remoteBody = error.body && typeof error.body === 'object'
+        ? error.body as { error?: unknown; code?: unknown }
+        : {};
+      if (remoteBody.code === 'CLAUDE_SESSION_MIGRATION_UNSUPPORTED') {
+        return reply.code(422).send({
+          error: typeof remoteBody.error === 'string' ? remoteBody.error : error.message,
+          code: remoteBody.code,
+        });
+      }
+    }
     return reply.code(400).send({ error: error instanceof Error ? error.message : 'Migrate failed' });
   }
 });
@@ -4499,54 +5304,70 @@ app.delete('/api/sessions/:id', async (request, reply) => {
   const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   try {
-    const result = await deleteSessionById(params.id, query.machineId);
+    const includeRemote = query.remote !== '0' && query.remote !== 'false';
+    const result = await deleteSessionById(params.id, query.machineId, query.agent, includeRemote);
     clearSessionCaches();
     return result;
   } catch (error) {
-    return reply.code(404).send({ error: error instanceof Error ? error.message : 'Delete failed' });
+    return sendSessionRoutingError(reply, error, 'Delete failed');
   }
 });
 
-app.post('/api/sessions/prune', async (request) => {
+app.post('/api/sessions/prune', async (request, reply) => {
   const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   const includeRemote = query.remote !== '0' && query.remote !== 'false';
-  const result = await pruneAggregatedSessions(
-    includeRemote,
-    (session) => session.evaluation.recommendation === 'delete'
-  );
-  clearSessionCaches();
-  return result;
+  try {
+    const result = await pruneAggregatedSessions(
+      includeRemote,
+      (session) => session.evaluation.recommendation === 'delete'
+    );
+    clearSessionCaches();
+    return result;
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Prune failed');
+  }
 });
 
-app.post('/api/sessions/prune-non-kept', async (request) => {
+app.post('/api/sessions/prune-non-kept', async (request, reply) => {
   const query = machineRouteQuerySchema.parse(request.query);
   confirmSchema.parse(request.body);
   const includeRemote = query.remote !== '0' && query.remote !== 'false';
-  const result = await pruneAggregatedSessions(includeRemote, () => true);
-  clearSessionCaches();
-  return result;
+  try {
+    const result = await pruneAggregatedSessions(includeRemote, () => true);
+    clearSessionCaches();
+    return result;
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Prune failed');
+  }
 });
 
-app.post('/api/sessions/bulk-delete', async (request) => {
+app.post('/api/sessions/bulk-delete', async (request, reply) => {
   const body = bulkDeleteSchema.parse(request.body);
   const query = request.query as { remote?: string };
-  const results = body.sessions
-    ? await deleteRoutedSessionsBulk(body.sessions)
-    : await deleteSessionsByIdsBulk(body.ids ?? [], query.remote !== '0');
-  clearSessionCaches();
-  return {
-    deleted: results.filter((result) => result.ok).length,
-    failed: results.filter((result) => !result.ok).length,
-    results,
-  };
+  try {
+    const results = body.sessions
+      ? await deleteRoutedSessionsBulk(body.sessions)
+      : await deleteSessionsByIdsBulk(body.ids ?? [], query.remote !== '0');
+    clearSessionCaches();
+    return {
+      deleted: results.filter((result) => result.ok).length,
+      failed: results.filter((result) => !result.ok).length,
+      results,
+    };
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Bulk delete failed');
+  }
 });
 
 app.get('/api/worker/evaluation-input/:id', async (request, reply) => {
   if (curatorRole !== 'worker') return reply.code(404).send({ error: 'Not found' });
   const params = sessionIdSchema.parse(request.params);
+  const query = z.object({
+    agent: z.enum(['codex', 'claude']).optional(),
+  }).parse(request.query);
   try {
-    return await service.getRemoteEvaluationInput(params.id);
+    return await service.getRemoteEvaluationInput(params.id, query.agent);
   } catch (error) {
     return reply.code(404).send({ error: error instanceof Error ? error.message : 'Session not found' });
   }
@@ -4581,17 +5402,17 @@ app.post('/api/evaluations/:id/refresh', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = evaluationRefreshSchema.parse(request.body ?? {});
   try {
-    let machineId = body.machineId;
-    if (!machineId) {
-      const local = await findLocalSessionCached(params.id);
-      if (local) machineId = service.getMeta().machineId;
-      else machineId = (await findRemoteSession(params.id))?.agent.id;
-    }
-    if (!machineId) return reply.code(404).send({ error: 'Session not found' });
-    const job = await enqueueEvaluationRefresh(params.id, 'manual-api', machineId);
+    const routed = await findRoutableSession(params.id, body.machineId, body.agent);
+    if (!routed) return reply.code(404).send({ error: 'Session not found' });
+    const job = await enqueueEvaluationRefresh(
+      params.id,
+      'manual-api',
+      routed.session.machineId,
+      routed.session.agent,
+    );
     return reply.code(202).send({ job: publicEvaluationRefreshJob(job) });
   } catch (error) {
-    return reply.code(404).send({ error: error instanceof Error ? error.message : 'Refresh failed' });
+    return sendSessionRoutingError(reply, error, 'Refresh failed');
   }
 });
 

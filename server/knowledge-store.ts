@@ -286,6 +286,22 @@ export class KnowledgeStore {
     return row ? rowToItem(row) : null;
   }
 
+  async deleteItem(id: string): Promise<boolean> {
+    const cleanId = cleanRequiredString(id, 'id');
+    this.db.exec('BEGIN');
+    try {
+      if (this.ftsAvailable) {
+        this.db.prepare('DELETE FROM knowledge_items_fts WHERE id = ?').run(cleanId);
+      }
+      const result = this.db.prepare('DELETE FROM knowledge_items WHERE id = ?').run(cleanId);
+      this.db.exec('COMMIT');
+      return Number(result.changes) > 0;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   async search(input: KnowledgeSearchInput): Promise<KnowledgeSearchResult[]> {
     const limit = input.limit ?? 20;
     const query = input.q?.trim() ?? '';

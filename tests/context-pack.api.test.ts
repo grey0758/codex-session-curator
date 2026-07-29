@@ -211,6 +211,8 @@ test('context pack recommends resumable matched session and explains new-session
     assert.equal(matched.query, 'context pack resume');
     assert.equal(matched.matchedProject.name, 'context-pack-project');
     assert.equal(matched.recommendedResume.sessionId, sessionId);
+    assert.equal(matched.recommendedResume.machineId, 'context-pack-machine');
+    assert.equal(matched.recommendedResume.agent, 'codex');
     assert.match(String(matched.recommendedResume.resumeCommand), new RegExp(sessionId));
     assert.equal(matched.sessions[0].id, sessionId);
     assert.ok(matched.preferences.some((item) => String(item.text).includes('scoped changes')));
@@ -227,13 +229,17 @@ test('context pack recommends resumable matched session and explains new-session
       `/api/hermes/context-pack?q=context%20pack%20resume&cwd=${encodeURIComponent(projectDir)}&limit=5&remote=0`,
     );
     assert.equal(aliasMatched.recommendedResume.sessionId, sessionId);
+    assert.equal(aliasMatched.recommendedResume.machineId, 'context-pack-machine');
+    assert.equal(aliasMatched.recommendedResume.agent, 'codex');
     assert.match(aliasMatched.workerPromptContext, /Recommended resume/);
 
     const synced = await requestJson<{ items: JsonRecord[] }>(
       baseUrl,
       '/api/knowledge/search?q=context-pack%20session%20index&type=session&limit=10',
     );
-    assert.ok(synced.items.some((item) => item.id === `${sessionId}:session-index`));
+    assert.ok(synced.items.some(
+      (item) => item.id === `context-pack-machine:codex:${sessionId}:session-index`,
+    ));
 
     const unmatched = await requestJson<{
       recommendedResume: null;

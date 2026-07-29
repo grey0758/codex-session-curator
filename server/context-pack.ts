@@ -109,6 +109,8 @@ function knowledgeByType(items: ContextKnowledgeItem[], types: string[], limit: 
 export function recommendResume(input: ContextPackInput): {
   confidence: number;
   sessionId: string;
+  machineId: string;
+  agent: AgentKind;
   resumeCommand: string;
   reason: string;
 } | null {
@@ -132,6 +134,8 @@ export function recommendResume(input: ContextPackInput): {
   return {
     confidence,
     sessionId: best.session.id,
+    machineId: best.session.machineId,
+    agent: best.session.agent,
     resumeCommand: best.session.resumeCommand,
     reason: reasonParts.join('; '),
   };
@@ -150,7 +154,7 @@ export function buildWorkerPromptContext(input: ContextPackInput & {
     '- Historical sessions, commander actions, job outcomes, and knowledge items are only location/reference context.',
     '- Prefer resuming an indexed matching session when recommendedResume is present and confidence is sufficient.',
     input.recommendedResume
-      ? `- Recommended resume: ${input.recommendedResume.resumeCommand} (${input.recommendedResume.reason})`
+      ? `- Recommended resume [${input.recommendedResume.machineId}/${input.recommendedResume.agent}/${input.recommendedResume.sessionId}]: ${input.recommendedResume.resumeCommand} (${input.recommendedResume.reason})`
       : `- No matching resumable session found; a new child session may be created. ${input.newSessionReason ?? ''}`.trim(),
     input.preferences.length
       ? `- Personal preferences: ${input.preferences.map((item) => item.text || item.title).slice(0, 5).join(' | ')}`
@@ -163,7 +167,7 @@ export function buildWorkerPromptContext(input: ContextPackInput & {
       : '- Runbooks: none found in matched knowledge.',
     input.sessions.length ? '- Relevant sessions:' : '- Relevant sessions: none.',
     ...input.sessions.slice(0, input.limit).map((session, index) =>
-      `  ${index + 1}. ${session.title} [${session.agent}:${session.id}] cwd=${session.cwd ?? 'unknown'} resume=${session.resumeCommand} tech=${shortList(session.techStack, 8)}`
+      `  ${index + 1}. ${session.title} [${session.machineId}/${session.agent}/${session.id}] cwd=${session.cwd ?? 'unknown'} resume=${session.resumeCommand} tech=${shortList(session.techStack, 8)}`
     ),
     input.commanderActions.length ? '- Relevant commander actions:' : '- Relevant commander actions: none.',
     ...input.commanderActions.slice(0, Math.min(input.limit, 8)).map((action, index) =>

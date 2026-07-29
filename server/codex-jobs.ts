@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { spawn as spawnPty, type IPty } from 'node-pty';
 import type { CodexSession } from './types.js';
@@ -110,6 +110,8 @@ export interface CodexResumeJob {
   id: string;
   sessionId: string;
   machineId: string;
+  agent: CodexSession['agent'];
+  agentVerified: boolean;
   mode: CodexJobMode;
   cwd: string;
   command: string;
@@ -657,6 +659,8 @@ function baseJob(input: {
     id: input.id ?? randomUUID(),
     sessionId: input.session.id,
     machineId: input.session.machineId,
+    agent: input.session.agent,
+    agentVerified: true,
     mode: input.mode,
     cwd: input.cwd,
     command: input.command,
@@ -1074,7 +1078,11 @@ export function superviseCodexResumeJob(input: {
   if ((decision === 'failed' || decision === 'retry' || decision === 'stop') && autoStop && job.status === 'running') {
     stopRuntimeJob(job, `Supervisor stopped job: ${reason}`);
   }
-  const retryBlockedReason = autoRetry ? autoRetryBlockedReason(job, decision, reason) : null;
+  const retryBlockedReason = autoRetry
+    ? !job.agentVerified
+      ? '旧 job 缺少可验证的 Agent 身份，拒绝自动重派'
+      : autoRetryBlockedReason(job, decision, reason)
+    : null;
   if (retryBlockedReason) {
     recordJobEvent(job, 'supervisor', retryBlockedReason, {
       decision,
@@ -1147,15 +1155,100 @@ export function startCodexSupervisorLoop(options: CodexSupervisorLoopOptions = {
   };
 }
 
+function parseShellWords(command: string): string[] | null {
+  const words: string[] = [];
+  let word = '';
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let started = false;
+  for (const char of command) {
+    if (escaped) {
+      word += char;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      else word += char;
+      started = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') quote = null;
+      else if (char === '\\') escaped = true;
+      else word += char;
+      started = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (char === '\\') {
+      escaped = true;
+      started = true;
+    } else if (/\s/.test(char)) {
+      if (started) {
+        words.push(word);
+        word = '';
+        started = false;
+      }
+    } else {
+      word += char;
+      started = true;
+    }
+  }
+  if (quote || escaped) return null;
+  if (started) words.push(word);
+  return words;
+}
+
+export function inferPersistedJobAgent(
+  command: string | undefined,
+  sessionId?: string,
+): CodexSession['agent'] | null {
+  const clean = command?.trim() ?? '';
+  const words = parseShellWords(clean);
+  if (!words?.length) return null;
+  const executable = basename(words[0]).toLowerCase();
+  if (/^claude(?:[-_].*)?$/.test(executable)) return 'claude';
+  if (/^codex(?:[-_].*)?$/.test(executable)) return 'codex';
+  if (!sessionId) return null;
+  if (words[1] === '--print' && words[2] === '--resume' && words[3] === sessionId) {
+    return 'claude';
+  }
+  if (
+    words[1] === '-C' &&
+    words[3] === 'exec' &&
+    words[4] === 'resume' &&
+    words.at(-2) === sessionId
+  ) {
+    return 'codex';
+  }
+  if (
+    words[1] === 'resume' &&
+    words.includes('--include-non-interactive') &&
+    words.includes('--no-alt-screen') &&
+    words.at(-1) === sessionId
+  ) {
+    return 'codex';
+  }
+  return null;
+}
+
 function normalizePersistedJob(item: Partial<CodexResumeJob>): CodexJobRuntime {
   const supervisor = {
     ...defaultSupervisor(item.supervisor?.enabled ?? false),
     ...(item.supervisor ?? {}),
   };
+  const inferredAgent = inferPersistedJobAgent(item.command, item.sessionId);
   const job: CodexJobRuntime = {
     id: item.id ?? randomUUID(),
     sessionId: item.sessionId ?? '',
     machineId: item.machineId ?? '',
+    agent: item.agent ?? inferredAgent ?? 'codex',
+    agentVerified: item.agentVerified
+      ?? Boolean(inferredAgent && (!item.agent || item.agent === inferredAgent)),
     mode: item.mode ?? 'exec',
     cwd: item.cwd ?? process.cwd(),
     command: item.command ?? '',

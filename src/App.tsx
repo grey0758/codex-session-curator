@@ -31,6 +31,16 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './App.css';
+import {
+  filesPageUrl,
+  readFilesPageRoute,
+  readTerminalPageRoute,
+  sessionFileDownloadUrl,
+  sessionFilesDetailUrl,
+  sessionFilesListUrl,
+  sessionFileUploadUrl,
+  terminalPageUrl,
+} from './session-files-routing';
 
 type Recommendation = 'keep' | 'review' | 'delete';
 type ActivityStatus = 'active' | 'inactive';
@@ -405,6 +415,8 @@ interface CodexWorkerStructuredReport {
 interface CodexWorkerJob {
   id: string;
   sessionId?: string | null;
+  agent?: AgentKind | null;
+  agentVerified?: boolean;
   status?: CodexWorkerJobStatus | null;
   mode?: CodexWorkerMode | null;
   machineId?: string | null;
@@ -513,7 +525,14 @@ interface ContextPack {
   runbooks: ContextPackKnowledgeItem[];
   sessions: ContextPackSession[];
   commanderActions: CommanderAction[];
-  recommendedResume: { confidence: number; sessionId: string; resumeCommand: string; reason: string } | null;
+  recommendedResume: {
+    confidence: number;
+    sessionId: string;
+    machineId: string;
+    agent: AgentKind;
+    resumeCommand: string;
+    reason: string;
+  } | null;
   newSessionReason: string | null;
   workerPromptContext: string;
 }
@@ -578,7 +597,7 @@ type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-runni
 
 interface TerminalSessionTarget {
   id: string;
-  agent?: AgentKind;
+  agent: AgentKind;
   machineId: string;
   cwd: string | null;
   title?: string;
@@ -609,6 +628,7 @@ interface SessionFileEntry {
 interface SessionFilesPayload {
   sessionId: string;
   machineId: string;
+  agent?: AgentKind;
   cwd: string;
   root: string;
   path: string;
@@ -651,57 +671,6 @@ function readStoredAgentFilter(): AgentFilter {
   } catch {
     return 'all';
   }
-}
-
-function readTerminalSessionId(): string | null {
-  try {
-    return new URL(window.location.href).searchParams.get('terminal');
-  } catch {
-    return null;
-  }
-}
-
-function readTerminalMachineId(): string | null {
-  try {
-    return new URL(window.location.href).searchParams.get('machine');
-  } catch {
-    return null;
-  }
-}
-
-function readFilesSessionId(): string | null {
-  try {
-    return new URL(window.location.href).searchParams.get('files');
-  } catch {
-    return null;
-  }
-}
-
-function terminalPageUrl(sessionId: string, machineId: string): string {
-  const url = new URL(window.location.href);
-  url.search = '';
-  url.hash = '';
-  url.searchParams.set('terminal', sessionId);
-  url.searchParams.set('machine', machineId);
-  return url.toString();
-}
-
-function filesPageUrl(sessionId: string): string {
-  const url = new URL(window.location.href);
-  url.search = '';
-  url.hash = '';
-  url.searchParams.set('files', sessionId);
-  return url.toString();
-}
-
-function terminalPlaceholderSession(sessionId: string, machineId: string | null): TerminalSessionTarget {
-  return {
-    id: sessionId,
-    agent: 'codex',
-    machineId: machineId || 'unknown',
-    cwd: null,
-    title: `SSH 终端 ${sessionId}`,
-  };
 }
 
 function terminalCellFromMouseEvent(terminal: XTerm, container: HTMLDivElement, event: MouseEvent): TerminalCellPoint | null {
@@ -982,6 +951,15 @@ function commanderActionTime(action: CommanderAction): number {
 
 function isWorkerJobRunning(job: CodexWorkerJob): boolean {
   return job.status === 'running';
+}
+
+function normalizeWorkerJob(job: CodexWorkerJob): CodexWorkerJob {
+  const agent = job.agent === 'codex' || job.agent === 'claude' ? job.agent : null;
+  return {
+    ...job,
+    agent,
+    agentVerified: agent !== null && job.agentVerified === true,
+  };
 }
 
 function sortWorkerJobs(jobs: CodexWorkerJob[]): CodexWorkerJob[] {
@@ -1290,8 +1268,9 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
     const terminalParams = new URLSearchParams({
       cols: String(terminal.cols || 120),
       rows: String(terminal.rows || 40),
+      machineId: session.machineId,
+      agent: session.agent,
     });
-    if (session.machineId && session.machineId !== 'unknown') terminalParams.set('machineId', session.machineId);
     const socket = new WebSocket(
       `${protocol}://${window.location.host}/api/sessions/${encodeURIComponent(session.id)}/terminal?${terminalParams.toString()}`
     );
@@ -1545,7 +1524,17 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   );
 }
 
-function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; onUnauthorized: () => void }) {
+function SessionFileBrowser({
+  sessionId,
+  machineId,
+  agent,
+  onUnauthorized,
+}: {
+  sessionId: string;
+  machineId: string;
+  agent: AgentKind;
+  onUnauthorized: () => void;
+}) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [currentPath, setCurrentPath] = useState('');
   const [payload, setPayload] = useState<SessionFilesPayload | null>(null);
@@ -1558,15 +1547,22 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
     setLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams();
-      if (path) params.set('path', path);
-      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files?${params.toString()}`);
+      const response = await fetch(
+        sessionFilesListUrl(sessionId, machineId, agent, path)
+      );
       if (response.status === 401) {
         onUnauthorized();
         return;
       }
       const nextPayload = (await response.json()) as SessionFilesPayload & { error?: string };
       if (!response.ok) throw new Error(nextPayload.error || `HTTP ${response.status}`);
+      if (
+        nextPayload.sessionId !== sessionId ||
+        nextPayload.machineId !== machineId ||
+        (nextPayload.agent && nextPayload.agent !== agent)
+      ) {
+        throw new Error('文件目录会话身份不匹配');
+      }
       setPayload(nextPayload);
       setCurrentPath(nextPayload.path || '');
     } catch (err) {
@@ -1574,7 +1570,7 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
     } finally {
       setLoading(false);
     }
-  }, [onUnauthorized, sessionId]);
+  }, [agent, machineId, onUnauthorized, sessionId]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => void loadFiles(''), 0);
@@ -1586,12 +1582,13 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
     setError(null);
     setNotice(null);
     try {
-      const params = new URLSearchParams({
-        path: currentPath,
-        name: file.name,
-        overwrite: '1',
-      });
-      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/upload?${params.toString()}`, {
+      const response = await fetch(sessionFileUploadUrl(
+        sessionId,
+        machineId,
+        agent,
+        currentPath,
+        file.name
+      ), {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,
@@ -1610,11 +1607,10 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
       setUploading(false);
       if (inputRef.current) inputRef.current.value = '';
     }
-  }, [currentPath, loadFiles, onUnauthorized, sessionId]);
+  }, [agent, currentPath, loadFiles, machineId, onUnauthorized, sessionId]);
 
   const downloadUrl = (entry: SessionFileEntry) => {
-    const params = new URLSearchParams({ path: entry.path });
-    return `/api/sessions/${encodeURIComponent(sessionId)}/files/download?${params.toString()}`;
+    return sessionFileDownloadUrl(sessionId, machineId, agent, entry.path);
   };
 
   return (
@@ -1691,16 +1687,34 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
 }
 
 function App() {
-  const [terminalOnlySessionId] = useState(readTerminalSessionId);
-  const [terminalOnlyMachineId] = useState(readTerminalMachineId);
-  const [filesOnlySessionId] = useState(readFilesSessionId);
+  const [terminalOnlyRoute] = useState(readTerminalPageRoute);
+  const terminalOnlySessionId = terminalOnlyRoute.sessionId;
+  const terminalOnlyMachineId = terminalOnlyRoute.machineId;
+  const terminalOnlyAgent = terminalOnlyRoute.agent;
+  const [filesOnlyRoute] = useState(readFilesPageRoute);
+  const filesOnlySessionId = filesOnlyRoute.sessionId;
+  const filesOnlyMachineId = filesOnlyRoute.machineId;
+  const filesOnlyAgent = filesOnlyRoute.agent;
   const isTerminalOnlyPage = Boolean(terminalOnlySessionId);
   const isFilesOnlyPage = Boolean(filesOnlySessionId);
-  const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(() =>
-    terminalOnlySessionId ? terminalPlaceholderSession(terminalOnlySessionId, terminalOnlyMachineId) : null
+  const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(null);
+  const [terminalOnlyLoading, setTerminalOnlyLoading] = useState(
+    Boolean(terminalOnlySessionId && terminalOnlyMachineId && terminalOnlyAgent)
   );
-  const [terminalOnlyLoading, setTerminalOnlyLoading] = useState(Boolean(terminalOnlySessionId));
-  const [terminalOnlyError, setTerminalOnlyError] = useState<string | null>(null);
+  const [terminalOnlyError, setTerminalOnlyError] = useState<string | null>(
+    terminalOnlySessionId && (!terminalOnlyMachineId || !terminalOnlyAgent)
+      ? '缺少机器或 Agent 标识，请返回面板重新打开终端'
+      : null
+  );
+  const [filesOnlySession, setFilesOnlySession] = useState<CodexSession | null>(null);
+  const [filesOnlyLoading, setFilesOnlyLoading] = useState(
+    Boolean(filesOnlySessionId && filesOnlyMachineId && filesOnlyAgent)
+  );
+  const [filesOnlyError, setFilesOnlyError] = useState<string | null>(
+    filesOnlySessionId && (!filesOnlyMachineId || !filesOnlyAgent)
+      ? '缺少机器或 Agent 标识，请返回面板重新打开会话文件页'
+      : null
+  );
   const [allSessions, setAllSessions] = useState<CodexSession[]>([]);
   const [sessionDetails, setSessionDetails] = useState<Record<string, CodexSession>>({});
   const [recycleArchives, setRecycleArchives] = useState<RecycleArchive[]>([]);
@@ -1723,14 +1737,14 @@ function App() {
   const [migrationTargets, setMigrationTargets] = useState<Record<string, string>>({});
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
-  const [copiedResumeId, setCopiedResumeId] = useState<string | null>(null);
+  const [copiedResumeKey, setCopiedResumeKey] = useState<string | null>(null);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<string[]>([]);
-  const [openedTerminalIds, setOpenedTerminalIds] = useState<string[]>([]);
+  const [openedTerminalKeys, setOpenedTerminalKeys] = useState<string[]>([]);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
+  const [historyLoadedSessionKey, setHistoryLoadedSessionKey] = useState<string | null>(null);
   const [recentUserMessages, setRecentUserMessages] = useState<RecentUserMessagesState>({
     sessionKey: null,
     messages: [],
@@ -1794,6 +1808,7 @@ function App() {
       const params = new URLSearchParams({
         sessionId: session.id,
         machineId: session.machineId,
+        agent: session.agent,
         limit: '80',
       });
       const response = await fetch(`/api/audit/events?${params.toString()}`);
@@ -1956,37 +1971,87 @@ function App() {
   }, [agentFilter, aiSearchLoading, aiSearchQuery, machineFilter]);
 
   const loadTerminalOnlySession = useCallback(async () => {
-    if (!terminalOnlySessionId) return;
+    if (!terminalOnlySessionId || !terminalOnlyMachineId || !terminalOnlyAgent) return;
     setTerminalOnlyLoading(true);
     setTerminalOnlyError(null);
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 8000);
     try {
-      const params = new URLSearchParams();
-      if (terminalOnlyMachineId) params.set('machineId', terminalOnlyMachineId);
-      const suffix = params.size ? `?${params.toString()}` : '';
-      const response = await fetch(`/api/sessions/${encodeURIComponent(terminalOnlySessionId)}${suffix}`, { signal: controller.signal });
+      const params = new URLSearchParams({
+        machineId: terminalOnlyMachineId,
+        agent: terminalOnlyAgent,
+      });
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(terminalOnlySessionId)}?${params.toString()}`,
+        { signal: controller.signal }
+      );
       if (response.status === 401) {
         setAuthRequired(true);
         return;
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const session = normalizeSession(await response.json());
+      if (
+        session.machineId !== terminalOnlyMachineId ||
+        session.agent !== terminalOnlyAgent
+      ) {
+        throw new Error('终端会话身份不匹配');
+      }
       setTerminalOnlySession(session);
       setAuthRequired(false);
       setAuthMessage(null);
     } catch (err) {
       setTerminalOnlyError(err instanceof DOMException && err.name === 'AbortError'
-        ? null
+        ? '终端会话加载超时'
         : err instanceof Error ? err.message : '终端会话加载失败');
     } finally {
       window.clearTimeout(timeout);
       setTerminalOnlyLoading(false);
     }
-  }, [terminalOnlyMachineId, terminalOnlySessionId]);
+  }, [terminalOnlyAgent, terminalOnlyMachineId, terminalOnlySessionId]);
+
+  const loadFilesOnlySession = useCallback(async () => {
+    if (!filesOnlySessionId || !filesOnlyMachineId || !filesOnlyAgent) return;
+    setFilesOnlyLoading(true);
+    setFilesOnlyError(null);
+    try {
+      const response = await fetch(
+        sessionFilesDetailUrl(
+          filesOnlySessionId,
+          filesOnlyMachineId,
+          filesOnlyAgent
+        )
+      );
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const session = normalizeSession(await response.json());
+      if (
+        session.machineId !== filesOnlyMachineId ||
+        session.agent !== filesOnlyAgent
+      ) {
+        throw new Error('文件页会话身份不匹配');
+      }
+      setFilesOnlySession(session);
+      setAuthRequired(false);
+      setAuthMessage(null);
+    } catch (err) {
+      setFilesOnlyError(
+        err instanceof Error ? err.message : '文件页会话加载失败'
+      );
+    } finally {
+      setFilesOnlyLoading(false);
+    }
+  }, [filesOnlyAgent, filesOnlyMachineId, filesOnlySessionId]);
 
   const upsertWorkerJob = useCallback((job: CodexWorkerJob) => {
-    setWorkerJobs((current) => sortWorkerJobs([job, ...current.filter((item) => item.id !== job.id)]));
+    const normalizedJob = normalizeWorkerJob(job);
+    setWorkerJobs((current) => sortWorkerJobs([
+      normalizedJob,
+      ...current.filter((item) => item.id !== normalizedJob.id),
+    ]));
   }, []);
 
   const loadWorkerJobs = useCallback(async () => {
@@ -2007,7 +2072,7 @@ function App() {
       setWorkerJobs(sortWorkerJobs(
         (Array.isArray(payload.jobs) ? payload.jobs : [])
           .filter((entry) => entry.job)
-          .map((entry) => ({
+          .map((entry) => normalizeWorkerJob({
             ...entry.job,
             machineId: entry.job?.machineId ?? entry.machineId ?? null,
             machine: entry.job?.machine ?? entry.machineId ?? undefined,
@@ -2185,8 +2250,12 @@ function App() {
         return;
       }
       setAuthRequired(false);
-      if (terminalOnlySessionId || filesOnlySessionId) {
+      if (terminalOnlySessionId) {
         await loadTerminalOnlySession();
+        return;
+      }
+      if (filesOnlySessionId) {
+        await loadFilesOnlySession();
         return;
       }
       await loadSessions();
@@ -2227,10 +2296,38 @@ function App() {
   }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadFleetAudit, loadSessions]);
 
   useEffect(() => {
-    if (!terminalOnlySessionId || authRequired) return;
+    if (
+      !terminalOnlySessionId ||
+      !terminalOnlyMachineId ||
+      !terminalOnlyAgent ||
+      authRequired
+    ) return;
     const handle = window.setTimeout(() => void loadTerminalOnlySession(), 0);
     return () => window.clearTimeout(handle);
-  }, [authRequired, loadTerminalOnlySession, terminalOnlySessionId]);
+  }, [
+    authRequired,
+    loadTerminalOnlySession,
+    terminalOnlyAgent,
+    terminalOnlyMachineId,
+    terminalOnlySessionId,
+  ]);
+
+  useEffect(() => {
+    if (
+      !filesOnlySessionId ||
+      !filesOnlyMachineId ||
+      !filesOnlyAgent ||
+      authRequired
+    ) return;
+    const handle = window.setTimeout(() => void loadFilesOnlySession(), 0);
+    return () => window.clearTimeout(handle);
+  }, [
+    authRequired,
+    filesOnlyAgent,
+    filesOnlyMachineId,
+    filesOnlySessionId,
+    loadFilesOnlySession,
+  ]);
 
   const machineOptions = useMemo(() => ['all', ...Array.from(new Set(allSessions.map((session) => session.machineId))).sort()], [allSessions]);
 
@@ -2332,6 +2429,7 @@ function App() {
     [selectedSessionKey, visibleSessions]
   );
   const selected = selectedSummary ? (sessionDetails[sessionKey(selectedSummary)] ?? selectedSummary) : null;
+  const selectedIdentityKey = selected ? sessionKey(selected) : null;
   const visibleSessionKeys = useMemo(() => visibleSessions.map(sessionKey), [visibleSessions]);
   const selectedKeySet = useMemo(() => new Set(selectedSessionKeys), [selectedSessionKeys]);
   const selectedVisibleCount = useMemo(
@@ -2341,12 +2439,16 @@ function App() {
   const allVisibleSelected = visibleSessionKeys.length > 0 && selectedVisibleCount === visibleSessionKeys.length;
   const openedTerminalSessions = useMemo(
     () =>
-      openedTerminalIds
-        .map((id) => allSessions.find((session) => session.id === id))
+      openedTerminalKeys
+        .map((key) => allSessions.find((session) => sessionKey(session) === key))
         .filter((session): session is CodexSession => Boolean(session)),
-    [allSessions, openedTerminalIds]
+    [allSessions, openedTerminalKeys]
   );
-  const selectedTerminalSession = openedTerminalSessions.find((session) => session.id === selected?.id) ?? null;
+  const selectedTerminalSession = selected
+    ? openedTerminalSessions.find(
+        (session) => sessionKey(session) === sessionKey(selected)
+      ) ?? null
+    : null;
   const visibleRecycleArchives = useMemo(() => {
     const needle = (recycleQuery || query).trim().toLowerCase();
     if (!needle) return recycleArchives;
@@ -2367,6 +2469,25 @@ function App() {
       '')
     : '';
   const migrationAlreadyInPlace = selected ? normalizePath(selected.cwd) === normalizePath(migrationTarget) : false;
+  const selectedSameDirectoryMigrationSessions = useMemo(
+    () => (
+      selected
+        ? allSessions.filter(
+            (session) =>
+              selectedKeySet.has(sessionKey(session)) &&
+              session.machineId === selected.machineId &&
+              normalizePath(session.cwd) === normalizePath(selected.cwd)
+          )
+        : []
+    ),
+    [allSessions, selected, selectedKeySet]
+  );
+  const selectedCodexMigrationCount = selectedSameDirectoryMigrationSessions.filter(
+    (session) => session.agent === 'codex'
+  ).length;
+  const selectedClaudeMigrationCount = selectedSameDirectoryMigrationSessions.filter(
+    (session) => session.agent === 'claude'
+  ).length;
   const knowledgeSearchText = (knowledgeQuery.trim() || query.trim() || selected?.title || '').trim();
   const selectedProjectPath = selected?.evaluation.recommendedWorkdir ?? selected?.cwd ?? null;
   const contextPackSummary = contextPack
@@ -2443,7 +2564,19 @@ function App() {
   }, [contextPack]);
 
   const selectedWorkerJobs = useMemo(
-    () => (selected ? sortWorkerJobs(workerJobs.filter((job) => job.sessionId === selected.id)) : []),
+    () => (
+      selected
+        ? sortWorkerJobs(
+            workerJobs.filter(
+              (job) =>
+                job.agentVerified === true &&
+                job.agent === selected.agent &&
+                job.sessionId === selected.id &&
+                (job.machineId ?? job.machine) === selected.machineId
+            )
+          )
+        : []
+    ),
     [selected, workerJobs]
   );
   const currentWorkerJob = useMemo(() => {
@@ -2513,10 +2646,10 @@ function App() {
       setSelectedWorkerJobId(null);
     }, 0);
     return () => window.clearTimeout(handle);
-  }, [selected?.id]);
+  }, [selectedIdentityKey]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || activeTab === 'recycle' || !selected?.id) return;
+    if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedIdentityKey) return;
     const firstLoad = window.setTimeout(() => {
       void loadWorkerJobs();
     }, 0);
@@ -2527,7 +2660,12 @@ function App() {
       window.clearTimeout(firstLoad);
       window.clearInterval(interval);
     };
-  }, [activeTab, isTerminalOnlyPage, loadWorkerJobs, selected?.id]);
+  }, [
+    activeTab,
+    isTerminalOnlyPage,
+    loadWorkerJobs,
+    selectedIdentityKey,
+  ]);
 
   useEffect(() => {
     if (isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob?.id) return;
@@ -2574,7 +2712,10 @@ function App() {
   const openTerminal = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
     setSelectedSessionKey(sessionKey(session));
-    const opened = window.open(terminalPageUrl(session.id, session.machineId), '_blank');
+    const opened = window.open(
+      terminalPageUrl(session.id, session.machineId, session.agent),
+      '_blank'
+    );
     if (opened) opened.opener = null;
     opened?.focus();
     if (!opened) setActionMessage('浏览器阻止了新终端页面，请允许弹出窗口后重试');
@@ -2583,23 +2724,27 @@ function App() {
   const openSessionFiles = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
     setSelectedSessionKey(sessionKey(session));
-    const opened = window.open(filesPageUrl(session.id), '_blank');
+    const opened = window.open(
+      filesPageUrl(session.id, session.machineId, session.agent),
+      '_blank'
+    );
     if (opened) opened.opener = null;
     opened?.focus();
     if (!opened) setActionMessage('浏览器阻止了新目录页面，请允许弹出窗口后重试');
   }, []);
 
-  const closeTerminal = useCallback((id: string) => {
-    setOpenedTerminalIds((current) => current.filter((item) => item !== id));
+  const closeTerminal = useCallback((key: string) => {
+    setOpenedTerminalKeys((current) => current.filter((item) => item !== key));
   }, []);
 
   const copyResumeCommand = useCallback(async (session: CodexSession) => {
+    const key = sessionKey(session);
     try {
       await navigator.clipboard.writeText(session.resumeCommand);
-      setCopiedResumeId(session.id);
+      setCopiedResumeKey(key);
       setActionMessage(`已复制恢复命令：${session.resumeCommand}`);
       window.setTimeout(() => {
-        setCopiedResumeId((current) => (current === session.id ? null : current));
+        setCopiedResumeKey((current) => (current === key ? null : current));
       }, 1800);
     } catch {
       setActionMessage('复制失败：浏览器阻止访问剪贴板');
@@ -2609,12 +2754,16 @@ function App() {
   const loadHistory = useCallback(async (session: CodexSession, before: number | null = null) => {
     setHistoryLoading(true);
     try {
-      const params = new URLSearchParams({ limit: '60', machineId: session.machineId });
+      const params = new URLSearchParams({
+        limit: '60',
+        machineId: session.machineId,
+        agent: session.agent,
+      });
       if (before !== null) params.set('before', String(before));
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/history?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = (await response.json()) as HistoryPayload;
-      setHistoryLoadedSessionId(sessionKey(session));
+      setHistoryLoadedSessionKey(sessionKey(session));
       setHistoryMessages((current) => (before === null ? payload.messages : [...payload.messages, ...current]));
       setHistoryBefore(payload.nextBefore);
       setHistoryHasMore(payload.hasMore);
@@ -2626,11 +2775,16 @@ function App() {
   const loadAllMessages = useCallback(async (session: CodexSession) => {
     setHistoryLoading(true);
     try {
-      const params = new URLSearchParams({ full: '1', preserve: '1', machineId: session.machineId });
+      const params = new URLSearchParams({
+        full: '1',
+        preserve: '1',
+        machineId: session.machineId,
+        agent: session.agent,
+      });
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/messages?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = (await response.json()) as HistoryPayload;
-      setHistoryLoadedSessionId(sessionKey(session));
+      setHistoryLoadedSessionKey(sessionKey(session));
       setHistoryMessages(payload.messages);
       setHistoryBefore(null);
       setHistoryHasMore(false);
@@ -2645,10 +2799,10 @@ function App() {
       setHistoryMessages([]);
       setHistoryBefore(null);
       setHistoryHasMore(false);
-      setHistoryLoadedSessionId(null);
+      setHistoryLoadedSessionKey(null);
     }, 0);
     return () => window.clearTimeout(handle);
-  }, [activeTab, selected?.id, selected?.machineId]);
+  }, [activeTab, selectedIdentityKey]);
 
   useEffect(() => {
     if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedSummary?.id) {
@@ -2663,6 +2817,7 @@ function App() {
     const params = new URLSearchParams({
       limit: '200',
       machineId: selectedSummary.machineId,
+      agent: selectedSummary.agent,
     });
     const controller = new AbortController();
     let cancelled = false;
@@ -2702,7 +2857,10 @@ function App() {
     const detailKey = sessionKey(selectedSummary);
     if (sessionDetails[detailKey]) return;
     let cancelled = false;
-    const params = new URLSearchParams({ machineId: selectedSummary.machineId });
+    const params = new URLSearchParams({
+      machineId: selectedSummary.machineId,
+      agent: selectedSummary.agent,
+    });
     void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}?${params.toString()}`)
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -2710,6 +2868,9 @@ function App() {
       })
       .then((session) => {
         const normalized = normalizeSession(session);
+        if (sessionKey(normalized) !== detailKey) {
+          throw new Error('Session detail identity mismatch');
+        }
         if (!cancelled) setSessionDetails((current) => ({ ...current, [detailKey]: normalized }));
       })
       .catch(() => {
@@ -2755,12 +2916,17 @@ function App() {
   }, [agentFilter, aiSearchResult, allSessions, machineFilter, query, visibleSessions]);
 
   async function setKept(session: CodexSession, kept: boolean) {
-    setBusyId(session.id);
+    const actionKey = sessionKey(session);
+    setBusyId(actionKey);
     try {
-      const response = await fetch(`/api/sessions/${session.id}/keep`, {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/keep`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kept }),
+        body: JSON.stringify({
+          kept,
+          machineId: session.machineId,
+          agent: session.agent,
+        }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const targetKey = sessionKey(session);
@@ -2776,13 +2942,17 @@ function App() {
   }
 
   async function refreshEvaluation(session: CodexSession) {
-    setBusyId(`${session.id}:refresh`);
+    const actionKey = `${sessionKey(session)}:refresh`;
+    setBusyId(actionKey);
     setActionMessage(null);
     try {
       const response = await fetch(`/api/evaluations/${encodeURIComponent(session.id)}/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ machineId: session.machineId }),
+        body: JSON.stringify({
+          machineId: session.machineId,
+          agent: session.agent,
+        }),
       });
       const payload = (await response.json().catch(() => ({}))) as { job?: { id?: string }; error?: string };
       if (!response.ok || !payload.job?.id) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -2821,7 +2991,6 @@ function App() {
   function removeSessionsFromPanel(keys: string[]) {
     const removedKeys = new Set(keys);
     if (!removedKeys.size) return;
-    const removedIds = new Set(allSessions.filter((item) => removedKeys.has(sessionKey(item))).map((item) => item.id));
     setAllSessions((current) => current.filter((item) => !removedKeys.has(sessionKey(item))));
     setSessionDetails((current) => {
       const next = { ...current };
@@ -2829,20 +2998,28 @@ function App() {
       return next;
     });
     setSelectedSessionKeys((current) => current.filter((key) => !removedKeys.has(key)));
-    setOpenedTerminalIds((current) => current.filter((id) => !removedIds.has(id)));
+    setOpenedTerminalKeys((current) => current.filter((key) => !removedKeys.has(key)));
     setSelectedSessionKey((current) => current && removedKeys.has(current) ? null : current);
   }
 
   async function deleteSession(session: CodexSession) {
     if (!window.confirm(`只删除当前机器 ${session.machineId} 上的会话：${session.id}？会先移入回收站，原 Codex / Claude 活跃目录会被清除。`)) return;
-    setBusyId(session.id);
+    const actionKey = sessionKey(session);
+    setBusyId(actionKey);
     setActionMessage(null);
     try {
-      const params = new URLSearchParams({ machineId: session.machineId });
-      const response = await fetch(`/api/sessions/${session.id}?${params.toString()}`, {
+      const params = new URLSearchParams({
+        machineId: session.machineId,
+        agent: session.agent,
+      });
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}?${params.toString()}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
+        body: JSON.stringify({
+          confirm: true,
+          machineId: session.machineId,
+          agent: session.agent,
+        }),
       });
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -2868,23 +3045,44 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           confirm: true,
-          sessions: selectedSessions.map((session) => ({ id: session.id, machineId: session.machineId })),
+          sessions: selectedSessions.map((session) => ({
+            id: session.id,
+            machineId: session.machineId,
+            agent: session.agent,
+          })),
         }),
       });
       const payload = (await response.json()) as {
         deleted?: number;
         failed?: number;
         error?: string;
-        results?: Array<{ id: string; machineId?: string; ok: boolean }>;
+        results?: Array<{
+          id: string;
+          machineId?: string;
+          agent?: AgentKind;
+          ok: boolean;
+        }>;
       };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       const deletedRoutes = new Set(
         (payload.results ?? [])
           .filter((item) => item.ok)
-          .map((item) => `${item.machineId ?? 'unknown'}|||${item.id}`)
+          .flatMap((item) => {
+            if (item.agent) {
+              return [`${item.machineId ?? 'unknown'}|||${item.agent}|||${item.id}`];
+            }
+            const compatibleMatches = selectedSessions.filter(
+              (session) =>
+                session.machineId === (item.machineId ?? 'unknown') &&
+                session.id === item.id
+            );
+            return compatibleMatches.length === 1
+              ? [sessionKey(compatibleMatches[0])]
+              : [];
+          })
       );
       const deletedKeys = selectedSessions
-        .filter((session) => deletedRoutes.has(`${session.machineId}|||${session.id}`))
+        .filter((session) => deletedRoutes.has(sessionKey(session)))
         .map(sessionKey);
       removeSessionsFromPanel(deletedKeys);
       setActionMessage(`已移入回收站 ${payload.deleted ?? 0} 个会话，失败 ${payload.failed ?? 0} 个`);
@@ -2902,10 +3100,24 @@ function App() {
     setBusyId('prune');
     setActionMessage(null);
     try {
+      const sessions = allSessions
+        .filter(
+          (session) =>
+            !session.kept &&
+            session.evaluation.recommendation === 'delete'
+        )
+        .map((session) => ({
+          id: session.id,
+          machineId: session.machineId,
+          agent: session.agent,
+        }));
       const response = await fetch('/api/sessions/prune', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
+        body: JSON.stringify({
+          confirm: true,
+          ...(sessions.length ? { sessions } : {}),
+        }),
       });
       const payload = (await response.json().catch(() => ({}))) as { deleted?: number; failed?: number; error?: string };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -2923,10 +3135,20 @@ function App() {
     setBusyId('prune-non-kept');
     setActionMessage(null);
     try {
+      const sessions = allSessions
+        .filter((session) => !session.kept)
+        .map((session) => ({
+          id: session.id,
+          machineId: session.machineId,
+          agent: session.agent,
+        }));
       const response = await fetch('/api/sessions/prune-non-kept', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
+        body: JSON.stringify({
+          confirm: true,
+          ...(sessions.length ? { sessions } : {}),
+        }),
       });
       const payload = (await response.json().catch(() => ({}))) as { deleted?: number; failed?: number; error?: string };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -2940,12 +3162,16 @@ function App() {
   }
 
   async function saveTitle(session: CodexSession) {
-    setBusyId(`${session.id}:title`);
+    setBusyId(`${sessionKey(session)}:title`);
     try {
-      const response = await fetch(`/api/sessions/${session.id}/title`, {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/title`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: titleDraft }),
+        body: JSON.stringify({
+          title: titleDraft,
+          machineId: session.machineId,
+          agent: session.agent,
+        }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await loadSessions();
@@ -2955,14 +3181,22 @@ function App() {
   }
 
   async function migrateSession(session: CodexSession) {
+    if (session.agent !== 'codex') {
+      setActionMessage('Claude 会话暂不支持跨目录迁移；请在原 cwd 使用 Claude 恢复命令继续。');
+      return;
+    }
     if (!migrationTarget.trim()) return;
-    setBusyId(`${session.id}:migrate`);
+    setBusyId(`${sessionKey(session)}:migrate`);
     setActionMessage(null);
     try {
-      const response = await fetch(`/api/sessions/${session.id}/migrate`, {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/migrate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetProjectDir: migrationTarget.trim() }),
+        body: JSON.stringify({
+          targetProjectDir: migrationTarget.trim(),
+          machineId: session.machineId,
+          agent: session.agent,
+        }),
       });
       const payload = (await response.json()) as {
         resumeCommand?: string;
@@ -2987,20 +3221,39 @@ function App() {
   async function migrateSelectedSameDirectory(session: CodexSession) {
     const target = migrationTarget.trim();
     if (!target || !selectedSessionKeys.length) return;
-    const targetIds = allSessions
-      .filter((item) => selectedKeySet.has(sessionKey(item)) && item.machineId === session.machineId && normalizePath(item.cwd) === normalizePath(session.cwd))
-      .map((item) => item.id);
-    if (!targetIds.length) return;
-    if (!window.confirm(`将当前目录下已选中的 ${targetIds.length} 个会话批量迁移到：${target}？`)) return;
+    const sameDirectorySelections = allSessions
+      .filter((item) => selectedKeySet.has(sessionKey(item)) && item.machineId === session.machineId && normalizePath(item.cwd) === normalizePath(session.cwd));
+    const targetRoutes = sameDirectorySelections
+      .filter((item) => item.agent === 'codex')
+      .map((item) => ({
+        id: item.id,
+        machineId: item.machineId,
+        agent: item.agent,
+      }));
+    const skippedClaude = sameDirectorySelections.length - targetRoutes.length;
+    if (!targetRoutes.length) {
+      setActionMessage(
+        skippedClaude
+          ? '未执行迁移：当前目录已选会话均为 Claude；Claude 暂不支持跨目录迁移。'
+          : '未找到可迁移的已选 Codex 会话。'
+      );
+      return;
+    }
+    const skipNote = skippedClaude ? `（将跳过 ${skippedClaude} 个 Claude 会话）` : '';
+    if (!window.confirm(`将当前目录下已选中的 ${targetRoutes.length} 个 Codex 会话批量迁移到：${target}？${skipNote}`)) return;
     setBusyId('bulk-migrate');
     let ok = 0;
     let failed = 0;
-    for (const id of targetIds) {
+    for (const route of targetRoutes) {
       try {
-        const response = await fetch(`/api/sessions/${id}/migrate`, {
+        const response = await fetch(`/api/sessions/${encodeURIComponent(route.id)}/migrate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetProjectDir: target }),
+          body: JSON.stringify({
+            targetProjectDir: target,
+            machineId: route.machineId,
+            agent: route.agent,
+          }),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         ok += 1;
@@ -3008,17 +3261,24 @@ function App() {
         failed += 1;
       }
     }
-    setActionMessage(`批量迁移完成：成功 ${ok} 个，失败 ${failed} 个`);
+    setActionMessage(
+      `批量迁移完成：成功 ${ok} 个，失败 ${failed} 个${skippedClaude ? `，已跳过 Claude ${skippedClaude} 个` : ''}`
+    );
     setBusyId(null);
     await loadSessions();
   }
 
   async function restoreArchive(archive: RecycleArchive) {
-    if (!window.confirm(`恢复 ${archive.machineId} 回收站中的会话 ${archive.sessionId} 到原 Codex / Claude 目录？`)) return;
-    setBusyId(`${archive.sessionId}:restore`);
+    if (!window.confirm(`恢复 ${archive.machineId} 回收站归档 ${archive.archiveDir} 中的会话 ${archive.sessionId} 到原 Codex / Claude 目录？`)) return;
+    const actionId = `${archive.machineId}:${archive.archiveDir}:restore`;
+    setBusyId(actionId);
     setActionMessage(null);
     try {
-      const params = new URLSearchParams({ machineId: archive.machineId });
+      const params = new URLSearchParams({
+        machineId: archive.machineId,
+        archiveDir: archive.archiveDir,
+      });
+      if (archive.agent) params.set('agent', archive.agent);
       const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}/restore?${params.toString()}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3036,11 +3296,16 @@ function App() {
   }
 
   async function purgeArchive(archive: RecycleArchive) {
-    if (!window.confirm(`立即永久删除 ${archive.machineId} 上的回收站归档 ${archive.sessionId}？这个操作不可恢复。`)) return;
-    setBusyId(`${archive.sessionId}:purge`);
+    if (!window.confirm(`立即永久删除 ${archive.machineId} 上的回收站归档 ${archive.archiveDir}（会话 ${archive.sessionId}）？这个操作不可恢复。`)) return;
+    const actionId = `${archive.machineId}:${archive.archiveDir}:purge`;
+    setBusyId(actionId);
     setActionMessage(null);
     try {
-      const params = new URLSearchParams({ machineId: archive.machineId });
+      const params = new URLSearchParams({
+        machineId: archive.machineId,
+        archiveDir: archive.archiveDir,
+      });
+      if (archive.agent) params.set('agent', archive.agent);
       const response = await fetch(`/api/recycle-bin/${encodeURIComponent(archive.sessionId)}?${params.toString()}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
@@ -3068,8 +3333,13 @@ function App() {
           <header className="terminal-page-heading">
             <div>
               <p className="eyebrow">Session Files</p>
-              <h1>会话工作目录</h1>
-              <span>{filesOnlySessionId}</span>
+              <h1>{filesOnlySession?.title || '会话工作目录'}</h1>
+              <span>
+                {filesOnlyMachineId ?? '未知机器'} ·{' '}
+                {filesOnlyAgent ? agentLabel(filesOnlyAgent) : '未知 Agent'} ·{' '}
+                {filesOnlySession?.cwd ?? filesOnlySessionId}
+                {filesOnlyLoading ? ' · 正在加载会话详情' : ''}
+              </span>
             </div>
             <div className="terminal-page-actions">
               <button type="button" className="primary-button" onClick={() => window.location.assign('/')}>
@@ -3077,7 +3347,23 @@ function App() {
               </button>
             </div>
           </header>
-          <SessionFileBrowser sessionId={filesOnlySessionId} onUnauthorized={() => setAuthRequired(true)} />
+          <div className={`terminal-page-inline-notice${filesOnlyError ? '' : ' terminal-page-inline-notice-empty'}`}>
+            {filesOnlyError ?? '\u00a0'}
+          </div>
+          {filesOnlyMachineId && filesOnlyAgent && filesOnlySession ? (
+            <SessionFileBrowser
+              sessionId={filesOnlySessionId}
+              machineId={filesOnlyMachineId}
+              agent={filesOnlyAgent}
+              onUnauthorized={() => setAuthRequired(true)}
+            />
+          ) : !filesOnlyMachineId || !filesOnlyAgent ? (
+            <div className="terminal-page-message">文件页缺少机器或 Agent 标识</div>
+          ) : (
+            <div className="terminal-page-message">
+              {filesOnlyLoading ? '正在验证文件页会话身份...' : '未能验证文件页会话身份'}
+            </div>
+          )}
         </section>
       </main>
     );
@@ -3086,8 +3372,12 @@ function App() {
   if (isTerminalOnlyPage) {
     const terminalTitle = terminalOnlySession?.title || terminalOnlySessionId || 'SSH 终端';
     const terminalMeta = terminalOnlySession
-      ? `${terminalOnlySession.machineId} · ${terminalOnlySession.cwd ?? 'unknown cwd'}`
-      : terminalOnlySessionId;
+      ? `${terminalOnlySession.machineId} · ${agentLabel(terminalOnlySession.agent)} · ${terminalOnlySession.cwd ?? 'unknown cwd'}`
+      : [
+          terminalOnlyMachineId,
+          terminalOnlyAgent ? agentLabel(terminalOnlyAgent) : null,
+          terminalOnlySessionId,
+        ].filter(Boolean).join(' · ');
     return (
       <main className="terminal-page-shell">
         <section className="terminal-page-workspace">
@@ -3376,10 +3666,10 @@ function App() {
                   </span>
                   <span className="session-summary">{archive.archiveDir}</span>
                   <span className="archive-actions">
-                    <button type="button" className="primary-button" disabled={busyId === `${archive.sessionId}:restore`} onClick={() => void restoreArchive(archive)}>
+                    <button type="button" className="primary-button" disabled={busyId === `${archive.machineId}:${archive.archiveDir}:restore`} onClick={() => void restoreArchive(archive)}>
                       恢复
                     </button>
-                    <button type="button" className="danger-button" disabled={busyId === `${archive.sessionId}:purge`} onClick={() => void purgeArchive(archive)}>
+                    <button type="button" className="danger-button" disabled={busyId === `${archive.machineId}:${archive.archiveDir}:purge`} onClick={() => void purgeArchive(archive)}>
                       永久删除
                     </button>
                   </span>
@@ -3500,12 +3790,12 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={busyId === `${selected.id}:refresh`}
+                  disabled={busyId === `${sessionKey(selected)}:refresh`}
                   title="在 Hub 上读取完整 transcript 并执行可追踪的 AI 重算"
                   onClick={() => void refreshEvaluation(selected)}
                 >
                   <Sparkles size={17} />
-                  {busyId === `${selected.id}:refresh` ? 'AI 重算中' : 'AI 重算'}
+                  {busyId === `${sessionKey(selected)}:refresh` ? 'AI 重算中' : 'AI 重算'}
                 </button>
               </>
             ) : null}
@@ -3548,10 +3838,13 @@ function App() {
               <div className="terminal-stack">
                 {openedTerminalSessions.map((session) => (
                   <TerminalConsole
-                    key={session.id}
+                    key={sessionKey(session)}
                     session={session}
-                    active={selected?.id === session.id}
-                    onClose={() => closeTerminal(session.id)}
+                    active={Boolean(
+                      selected &&
+                      sessionKey(selected) === sessionKey(session)
+                    )}
+                    onClose={() => closeTerminal(sessionKey(session))}
                   />
                 ))}
               </div>
@@ -3575,10 +3868,10 @@ function App() {
                     <span>自动清理：{formatDate(archive.expiresAt)}</span>
                     <code>{archive.archiveDir}</code>
                     <div className="archive-actions">
-                      <button type="button" className="primary-button" onClick={() => void restoreArchive(archive)}>
+                      <button type="button" className="primary-button" disabled={busyId === `${archive.machineId}:${archive.archiveDir}:restore`} onClick={() => void restoreArchive(archive)}>
                         恢复
                       </button>
-                      <button type="button" className="danger-button" onClick={() => void purgeArchive(archive)}>
+                      <button type="button" className="danger-button" disabled={busyId === `${archive.machineId}:${archive.archiveDir}:purge`} onClick={() => void purgeArchive(archive)}>
                         立即永久删除
                       </button>
                     </div>
@@ -3624,7 +3917,7 @@ function App() {
                   <button
                     type="button"
                     className="primary-button"
-                    disabled={busyId === `${selected.id}:title`}
+                    disabled={busyId === `${sessionKey(selected)}:title`}
                     onClick={() => void saveTitle(selected)}
                   >
                     保存标题
@@ -3638,19 +3931,19 @@ function App() {
                 <button
                   type="button"
                   className="icon-button"
-                  title={copiedResumeId === selected.id ? '已复制' : '复制恢复命令'}
+                  title={copiedResumeKey === sessionKey(selected) ? '已复制' : '复制恢复命令'}
                   onClick={() => void copyResumeCommand(selected)}
                 >
                   <Copy size={17} />
                 </button>
-                {copiedResumeId === selected.id ? <span className="copy-feedback">已复制</span> : null}
+                {copiedResumeKey === sessionKey(selected) ? <span className="copy-feedback">已复制</span> : null}
               </div>
 
               <div className="action-row">
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={busyId === selected.id}
+                  disabled={busyId === sessionKey(selected)}
                   onClick={() => void setKept(selected, !selected.kept)}
                 >
                   <ShieldCheck size={17} />
@@ -3659,7 +3952,7 @@ function App() {
                 <button
                   type="button"
                   className="danger-button"
-                  disabled={busyId === selected.id}
+                  disabled={busyId === sessionKey(selected)}
                   onClick={() => void deleteSession(selected)}
                 >
                   <Trash2 size={17} />
@@ -3803,6 +4096,7 @@ function App() {
                     <span>recommended resume</span>
                     <strong>{Math.round(contextPack.recommendedResume.confidence * 100)}% · {contextPack.recommendedResume.reason}</strong>
                   </div>
+                  <span>{contextPack.recommendedResume.machineId} · {agentLabel(contextPack.recommendedResume.agent)} · {contextPack.recommendedResume.sessionId}</span>
                   <code>{contextPack.recommendedResume.resumeCommand}</code>
                 </div>
               ) : contextPack ? (
@@ -4329,15 +4623,15 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={historyLoading || historyLoadedSessionId === sessionKey(selected)}
+                  disabled={historyLoading || historyLoadedSessionKey === sessionKey(selected)}
                   onClick={() => void loadHistory(selected)}
                 >
-                  {historyLoadedSessionId === sessionKey(selected) ? '已加载最近记录' : '加载最近记录'}
+                  {historyLoadedSessionKey === sessionKey(selected) ? '已加载最近记录' : '加载最近记录'}
                 </button>
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={historyLoadedSessionId !== sessionKey(selected) || !historyHasMore || historyLoading || historyBefore === null}
+                  disabled={historyLoadedSessionKey !== sessionKey(selected) || !historyHasMore || historyLoading || historyBefore === null}
                   onClick={() => void loadHistory(selected, historyBefore)}
                 >
                   更早记录
@@ -4409,6 +4703,20 @@ function App() {
                     ? 'AI 从整段会话识别出实际工作目录'
                     : '未识别到明确目录，默认使用会话 cwd'}
               </div>
+              {selected.agent === 'claude' ? (
+                <div className="notice inline-warning">
+                  Claude 会话暂不支持跨目录迁移。请在原 cwd 使用
+                  {' '}
+                  {selected.resumeCommand || `claude --resume ${selected.id}`}
+                  {' '}
+                  继续；批量迁移只会提交已选 Codex 会话。
+                </div>
+              ) : null}
+              {selectedClaudeMigrationCount > 0 ? (
+                <div className="notice inline-info">
+                  批量迁移将跳过当前目录中已选的 {selectedClaudeMigrationCount} 个 Claude 会话。
+                </div>
+              ) : null}
               <div className="migration-box">
                 <input
                   value={migrationTarget}
@@ -4420,18 +4728,28 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={busyId === `${selected.id}:migrate` || !migrationTarget.trim() || migrationAlreadyInPlace}
+                  disabled={
+                    selected.agent !== 'codex' ||
+                    busyId === `${sessionKey(selected)}:migrate` ||
+                    !migrationTarget.trim() ||
+                    migrationAlreadyInPlace
+                  }
+                  title={selected.agent === 'claude' ? 'Claude 会话暂不支持跨目录迁移' : undefined}
                   onClick={() => void migrateSession(selected)}
                 >
-                  {migrationAlreadyInPlace ? '无需迁移' : '迁移到目录'}
+                  {selected.agent === 'claude'
+                    ? 'Claude 不支持迁移'
+                    : migrationAlreadyInPlace
+                      ? '无需迁移'
+                      : '迁移到目录'}
                 </button>
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={busyId === 'bulk-migrate' || !selectedSessionKeys.length || !migrationTarget.trim()}
+                  disabled={busyId === 'bulk-migrate' || selectedCodexMigrationCount === 0 || !migrationTarget.trim()}
                   onClick={() => void migrateSelectedSameDirectory(selected)}
                 >
-                  批量迁移同目录
+                  批量迁移 Codex{selectedCodexMigrationCount ? ` (${selectedCodexMigrationCount})` : ''}
                 </button>
               </div>
               {actionMessage ? <div className="notice inline-info">{actionMessage}</div> : null}

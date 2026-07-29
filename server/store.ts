@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import type { CommanderAction, PersistedState, StoredEvaluation } from './types.js';
+import { dirname, resolve } from 'node:path';
+import type { AgentKind, CommanderAction, PersistedState, StoredEvaluation } from './types.js';
 
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 30_000;
@@ -27,6 +27,77 @@ function normalizeState(parsed: Partial<PersistedState>): PersistedState {
       parsed.commanderActions && typeof parsed.commanderActions === 'object'
         ? (parsed.commanderActions as Record<string, CommanderAction>)
         : {},
+  };
+}
+
+function mergeByKey<T>(
+  incoming: T[] | undefined,
+  current: T[] | undefined,
+  key: (item: T) => string,
+  limit: number,
+): T[] {
+  const merged = new Map<string, T>();
+  for (const item of [...(incoming ?? []), ...(current ?? [])]) {
+    const itemKey = key(item);
+    if (!itemKey || merged.has(itemKey)) continue;
+    merged.set(itemKey, item);
+  }
+  return [...merged.values()].slice(0, limit);
+}
+
+function scopedAgent(stateKey: string): AgentKind | null {
+  if (stateKey.startsWith('codex|||')) return 'codex';
+  if (stateKey.startsWith('claude|||')) return 'claude';
+  return null;
+}
+
+function mergeStoredEvaluation(
+  stateKey: string,
+  incoming: StoredEvaluation,
+  current?: StoredEvaluation,
+): StoredEvaluation {
+  const agent = scopedAgent(stateKey);
+  const jobOutcomes = mergeByKey(
+    (incoming.jobOutcomes ?? [])
+      .filter((outcome) => !agent || !outcome.agent || outcome.agent === agent)
+      .map((outcome) => agent && !outcome.agent ? { ...outcome, agent } : outcome),
+    (current?.jobOutcomes ?? [])
+      .filter((outcome) => !agent || !outcome.agent || outcome.agent === agent)
+      .map((outcome) => agent && !outcome.agent ? { ...outcome, agent } : outcome),
+    (outcome) => outcome.jobId,
+    30,
+  );
+  const failureCards = mergeByKey(
+    incoming.failureCards,
+    current?.failureCards,
+    (card) => card.id || `${card.jobId}:${card.category}`,
+    20,
+  );
+  const keywords = [...new Set([
+    ...(incoming.keywords ?? []),
+    ...(current?.keywords ?? []),
+  ])].slice(0, 50);
+  const reviewSignals = [...new Set([
+    ...(incoming.reviewSignals ?? []),
+    ...(current?.reviewSignals ?? []),
+  ])].slice(0, 8);
+  const durableSearchText = [
+    incoming.searchText,
+    ...failureCards.flatMap((card) => [card.title, card.summary, card.evidence]),
+    ...jobOutcomes.flatMap((outcome) => [
+      outcome.goal,
+      outcome.summary,
+      ...outcome.changedFiles,
+      ...outcome.tests,
+    ]),
+  ].filter(Boolean).join('\n');
+  return {
+    ...incoming,
+    failureCards,
+    jobOutcomes,
+    keywords,
+    reviewSignals,
+    searchText: durableSearchText,
   };
 }
 
@@ -116,11 +187,91 @@ export class CuratorStore {
     return this.readState();
   }
 
+  async migrateLegacySessionKeys(
+    identities: Array<{
+      id: string;
+      stateKey: string;
+      agent: AgentKind;
+      filePath: string;
+    }>,
+  ): Promise<PersistedState> {
+    const identitiesById = new Map<string, Map<string, {
+      stateKey: string;
+      agent: AgentKind;
+      filePath: string;
+    }>>();
+    for (const identity of identities) {
+      if (!identity.id || !identity.stateKey || !identity.filePath) continue;
+      const matches = identitiesById.get(identity.id) ?? new Map();
+      matches.set(identity.stateKey, identity);
+      identitiesById.set(identity.id, matches);
+    }
+    return this.mutate((state) => {
+      const keptIds = new Set(state.keptIds);
+      const deletedIds = new Set(state.deletedIds);
+      for (const [id, matches] of identitiesById) {
+        if (matches.size !== 1) continue;
+        const [identity] = [...matches.values()];
+        const { stateKey, agent, filePath } = identity;
+        const legacyEvaluation = state.evaluations[id];
+        const scopedEvaluation = state.evaluations[stateKey];
+        const sourceEvaluation = legacyEvaluation ?? scopedEvaluation;
+        const sourceMatchesIdentity = Boolean(
+          sourceEvaluation &&
+          resolve(sourceEvaluation.filePath) === resolve(filePath) &&
+          (sourceEvaluation.jobOutcomes ?? []).every(
+            (outcome) => !outcome.agent || outcome.agent === agent,
+          ),
+        );
+
+        // Raw state has no Agent field. Only an evaluation whose original file
+        // path matches the active identity is sufficient proof for migration.
+        // Otherwise retain the legacy keys as inert quarantine data.
+        if (!sourceMatchesIdentity) continue;
+
+        if (keptIds.has(id)) {
+          keptIds.add(stateKey);
+          keptIds.delete(id);
+        }
+        if (deletedIds.has(id)) {
+          deletedIds.add(stateKey);
+          deletedIds.delete(id);
+        }
+        if (state.titles[id] !== undefined) {
+          if (state.titles[stateKey] === undefined) state.titles[stateKey] = state.titles[id];
+          delete state.titles[id];
+        }
+        if (legacyEvaluation !== undefined) {
+          if (state.evaluations[stateKey] === undefined) {
+            state.evaluations[stateKey] = legacyEvaluation;
+          }
+          delete state.evaluations[id];
+        }
+        const migratedEvaluation = state.evaluations[stateKey];
+        if (migratedEvaluation?.jobOutcomes?.length) {
+          migratedEvaluation.jobOutcomes = migratedEvaluation.jobOutcomes.map((outcome) => ({
+            ...outcome,
+            agent: outcome.agent ?? agent,
+          }));
+        }
+      }
+      state.keptIds = [...keptIds].sort();
+      state.deletedIds = [...deletedIds].sort();
+      return state;
+    });
+  }
+
   async save(state: PersistedState): Promise<void> {
     await this.mutate((current) => {
       const deletedIds = new Set(current.deletedIds);
       for (const [id, evaluation] of Object.entries(state.evaluations)) {
-        if (!deletedIds.has(id)) current.evaluations[id] = evaluation;
+        if (!deletedIds.has(id)) {
+          current.evaluations[id] = mergeStoredEvaluation(
+            id,
+            evaluation,
+            current.evaluations[id],
+          );
+        }
       }
     });
   }
@@ -180,7 +331,28 @@ export class CuratorStore {
 
   async setEvaluation(id: string, evaluation: StoredEvaluation): Promise<void> {
     await this.mutate((state) => {
-      if (!state.deletedIds.includes(id)) state.evaluations[id] = evaluation;
+      if (!state.deletedIds.includes(id)) {
+        state.evaluations[id] = mergeStoredEvaluation(
+          id,
+          evaluation,
+          state.evaluations[id],
+        );
+      }
+    });
+  }
+
+  async updateEvaluation(
+    id: string,
+    updater: (current: StoredEvaluation | undefined) => StoredEvaluation | null | undefined,
+  ): Promise<StoredEvaluation | null> {
+    return this.mutate((state) => {
+      if (state.deletedIds.includes(id)) return null;
+      const current = state.evaluations[id];
+      const next = updater(current);
+      if (!next) return current ?? null;
+      const merged = mergeStoredEvaluation(id, next, current);
+      state.evaluations[id] = merged;
+      return merged;
     });
   }
 

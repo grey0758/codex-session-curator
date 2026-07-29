@@ -211,6 +211,8 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
           query: 'Hermes dispatch E2E',
           prompt: 'Run the Hermes dispatch E2E fake worker and report the result.',
           sessionId,
+          machineId: 'hermes-e2e-machine',
+          agent: 'codex',
           repo: projectDir,
           mode: 'exec',
           supervisor: { autoStop: true, staleOutputMs: 1000 },
@@ -223,6 +225,8 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     assert.equal(dispatch.status, 'started');
     assert.equal(dispatch.selectedSession.id, sessionId);
     assert.equal(dispatch.contextPack.recommendedResume.sessionId, sessionId);
+    assert.equal(dispatch.contextPack.recommendedResume.machineId, 'hermes-e2e-machine');
+    assert.equal(dispatch.contextPack.recommendedResume.agent, 'codex');
     assert.match(dispatch.contextPack.workerPromptContext, /Recommended resume/);
     assert.equal(dispatch.job.sessionId, sessionId);
     assert.equal(dispatch.job.status, 'running');

@@ -1,5 +1,5 @@
-import { createReadStream } from 'node:fs';
-import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream } from 'node:fs';
+import { copyFile, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -221,6 +221,15 @@ async function moveFileToArchive(source: string, destination: string): Promise<v
   }
 }
 
+async function copyArchivedFileForRestore(source: string, destination: string): Promise<void> {
+  const sourceStat = await lstat(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+    throw new Error(`Refusing non-regular archived file: ${source}`);
+  }
+  await mkdir(dirname(destination), { recursive: true });
+  await copyFile(source, destination, fsConstants.COPYFILE_EXCL);
+}
+
 export async function archiveSessionFiles(input: {
   codexHome: string;
   sessionId: string;
@@ -239,14 +248,15 @@ export async function archiveSessionFiles(input: {
 }> {
   const pathInfo = sessionPathInfo(input);
 
-  const recycleRoot = input.recycleRoot ?? getRecycleRoot();
+  const recycleRoot = resolve(input.recycleRoot ?? getRecycleRoot());
   const deletedAt = new Date();
   const retentionDays = input.retentionDays ?? 30;
   const expiresAt = new Date(deletedAt.getTime() + retentionDays * 86_400_000).toISOString();
   const archiveDir = join(
     recycleRoot,
-    `${deletedAt.toISOString().replace(/[:.]/g, '-')}-${input.sessionId}`
+    `${deletedAt.toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`
   );
+  assertInside(archiveDir, recycleRoot);
   const archivedFiles: string[] = [];
   const removedOriginalFiles: string[] = [];
 
@@ -464,33 +474,103 @@ export async function listRecycleArchives(input: { recycleRoot?: string } = {}):
   return archives.sort((a, b) => Date.parse(b.deletedAt ?? '') - Date.parse(a.deletedAt ?? ''));
 }
 
-async function findArchiveBySessionId(recycleRoot: string, sessionId: string): Promise<RecycleArchive | null> {
+async function findRecycleArchive(input: {
+  recycleRoot: string;
+  sessionId: string;
+  archiveDir?: string;
+  agent?: SessionArchiveAgent;
+}): Promise<RecycleArchive | null> {
+  const recycleRoot = resolve(input.recycleRoot);
   const archives = await listRecycleArchives({ recycleRoot });
-  return archives.find((archive) => archive.sessionId === sessionId) ?? null;
+  const sessionMatches = archives.filter((archive) => archive.sessionId === input.sessionId);
+
+  let archive: RecycleArchive | undefined;
+  if (input.archiveDir) {
+    const requestedArchiveDir = resolve(input.archiveDir);
+    if (requestedArchiveDir === recycleRoot || !isInside(requestedArchiveDir, recycleRoot)) {
+      throw new Error(`Recycle archive path escapes root: ${requestedArchiveDir}`);
+    }
+    archive = archives.find((candidate) => sameResolvedPath(candidate.archiveDir, requestedArchiveDir));
+    if (!archive) return null;
+  } else {
+    if (sessionMatches.length > 1) {
+      throw new Error(`Multiple recycle archives found for session ${input.sessionId}; archiveDir is required`);
+    }
+    archive = sessionMatches[0];
+    if (!archive) return null;
+  }
+
+  assertInside(archive.archiveDir, recycleRoot);
+  const manifestPath = join(archive.archiveDir, 'manifest.json');
+  let manifest: Partial<RecycleArchive>;
+  try {
+    const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid manifest');
+    manifest = parsed as Partial<RecycleArchive>;
+  } catch {
+    throw new Error(`Invalid recycle archive manifest: ${archive.archiveDir}`);
+  }
+  if (manifest.sessionId !== input.sessionId) {
+    throw new Error(`Recycle archive session mismatch: ${archive.archiveDir}`);
+  }
+  if (manifest.agent !== undefined && manifest.agent !== 'codex' && manifest.agent !== 'claude') {
+    throw new Error(`Invalid recycle archive agent: ${archive.archiveDir}`);
+  }
+  if (input.agent && manifest.agent !== input.agent) {
+    throw new Error(`Recycle archive agent mismatch: ${archive.archiveDir}`);
+  }
+  return archive;
 }
 
 export async function restoreArchive(input: {
   codexHome: string;
   recycleRoot?: string;
   sessionId: string;
+  archiveDir?: string;
+  agent?: SessionArchiveAgent;
   claudeProjectsRoot?: string;
-}): Promise<{ sessionId: string; restoredFiles: string[]; archiveDir: string }> {
+  copyArchivedFile?: (source: string, destination: string) => Promise<void>;
+}): Promise<{
+  sessionId: string;
+  agent: SessionArchiveAgent;
+  restoredFiles: string[];
+  archiveDir: string;
+}> {
   const recycleRoot = input.recycleRoot ?? getRecycleRoot();
-  const archive = await findArchiveBySessionId(recycleRoot, input.sessionId);
+  const archive = await findRecycleArchive({
+    recycleRoot,
+    sessionId: input.sessionId,
+    archiveDir: input.archiveDir,
+    agent: input.agent,
+  });
   if (!archive) throw new Error(`Recycle archive not found: ${input.sessionId}`);
 
   const sessionsRoot = getSessionsRoot(input.codexHome);
   const snapshotsRoot = getShellSnapshotsRoot(input.codexHome);
   const claudeProjectsRoot = input.claudeProjectsRoot ?? getClaudeProjectsRoot();
-  const restoredFiles: string[] = [];
+  const archiveAgent: SessionArchiveAgent = archive.agent ?? 'codex';
+  if (archive.archivedFiles.length === 0) {
+    throw new Error(`Recycle archive has no archived files: ${archive.archiveDir}`);
+  }
+  const codexArchiveRoot = join(archive.archiveDir, 'sessions');
+  const claudeArchiveRoot = join(archive.archiveDir, 'claude-projects');
+  const hasTranscript = archive.archivedFiles.some(
+    (archivedFile) =>
+      archivedFile.endsWith('.jsonl')
+      && (isInside(archivedFile, codexArchiveRoot) || isInside(archivedFile, claudeArchiveRoot))
+  );
+  if (!hasTranscript) {
+    throw new Error(`Recycle archive has no Codex or Claude transcript: ${archive.archiveDir}`);
+  }
+  const restorePlan: Array<{ source: string; target: string }> = [];
+  const plannedTargets = new Set<string>();
 
   for (const archivedFile of archive.archivedFiles) {
     assertInside(archivedFile, archive.archiveDir);
     const fileName = basename(archivedFile);
     const shellArchiveRoot = join(archive.archiveDir, 'shell_snapshots');
-    const claudeArchiveRoot = join(archive.archiveDir, 'claude-projects');
     const isSnapshot = isInside(archivedFile, shellArchiveRoot);
-    const isClaude = archive.agent === 'claude' || isInside(archivedFile, claudeArchiveRoot);
+    const isClaude = archiveAgent === 'claude' || isInside(archivedFile, claudeArchiveRoot);
     const targetRoot = isSnapshot ? snapshotsRoot : isClaude ? claudeProjectsRoot : sessionsRoot;
     const preferredOriginal = [archive.originalSessionFile, ...archive.removedOriginalFiles]
       .find((file): file is string => Boolean(file && basename(file) === fileName && isInside(file, targetRoot)));
@@ -501,21 +581,57 @@ export async function restoreArchive(input: {
         : relative(join(archive.archiveDir, 'sessions'), archivedFile);
     const target = preferredOriginal ?? join(targetRoot, fallbackRelative || fileName);
     assertInside(target, targetRoot);
-    await mkdir(dirname(target), { recursive: true });
-    await moveFileToArchive(archivedFile, target);
-    restoredFiles.push(target);
+    const resolvedTarget = resolve(target);
+    if (plannedTargets.has(resolvedTarget)) {
+      throw new Error(`Duplicate recycle restore target: ${resolvedTarget}`);
+    }
+    plannedTargets.add(resolvedTarget);
+    const sourceStat = await lstat(archivedFile);
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+      throw new Error(`Refusing non-regular archived file: ${archivedFile}`);
+    }
+    try {
+      await lstat(resolvedTarget);
+      throw new Error(`Recycle restore target already exists: ${resolvedTarget}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    restorePlan.push({ source: archivedFile, target: resolvedTarget });
   }
 
+  const restoredFiles: string[] = [];
+  const copyRestoreFile = input.copyArchivedFile ?? copyArchivedFileForRestore;
+  try {
+    for (const item of restorePlan) {
+      await copyRestoreFile(item.source, item.target);
+      restoredFiles.push(item.target);
+    }
+  } catch (error) {
+    await Promise.all(restoredFiles.map((target) => rm(target, { force: true })));
+    throw error;
+  }
   await rm(archive.archiveDir, { recursive: true, force: true });
-  return { sessionId: input.sessionId, restoredFiles, archiveDir: archive.archiveDir };
+  return {
+    sessionId: input.sessionId,
+    agent: archiveAgent,
+    restoredFiles,
+    archiveDir: archive.archiveDir,
+  };
 }
 
 export async function permanentlyDeleteArchive(input: {
   recycleRoot?: string;
   sessionId: string;
+  archiveDir?: string;
+  agent?: SessionArchiveAgent;
 }): Promise<{ sessionId: string; purgedArchive: string }> {
   const recycleRoot = input.recycleRoot ?? getRecycleRoot();
-  const archive = await findArchiveBySessionId(recycleRoot, input.sessionId);
+  const archive = await findRecycleArchive({
+    recycleRoot,
+    sessionId: input.sessionId,
+    archiveDir: input.archiveDir,
+    agent: input.agent,
+  });
   if (!archive) throw new Error(`Recycle archive not found: ${input.sessionId}`);
   assertInside(archive.archiveDir, recycleRoot);
   await rm(archive.archiveDir, { recursive: true, force: true });

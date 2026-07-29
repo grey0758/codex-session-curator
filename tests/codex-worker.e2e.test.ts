@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,9 +18,48 @@ process.env.CURATOR_CODEX_JOB_MAX_EVENTS = '500';
 process.env.CURATOR_CODEX_SUPERVISOR_IDLE_MS = '10000';
 
 await chmod(fakeCodexBin, 0o755);
+await writeFile(
+  jobsPath,
+  JSON.stringify({
+    jobs: [{
+      id: 'legacy-unverified-agent-job',
+      sessionId: 'legacy-session',
+      machineId: 'test-machine',
+      command: '/opt/wrappers/opaque-worker --legacy session',
+      status: 'failed',
+      prompt: 'legacy prompt',
+    }, {
+      id: 'legacy-explicit-opaque-agent-job',
+      sessionId: 'legacy-session',
+      machineId: 'test-machine',
+      agent: 'codex',
+      command: '/opt/wrappers/opaque-worker --legacy session',
+      status: 'failed',
+      prompt: 'legacy explicit opaque prompt',
+    }, {
+      id: 'legacy-mismatched-agent-job',
+      sessionId: 'legacy-session',
+      machineId: 'test-machine',
+      agent: 'codex',
+      command: '/opt/agents/claude-enterprise --print --resume legacy-session task',
+      status: 'failed',
+      prompt: 'legacy mismatch prompt',
+    }, {
+      id: 'legacy-verified-custom-agent-job',
+      sessionId: 'legacy-session',
+      machineId: 'test-machine',
+      agent: 'claude',
+      command: '/opt/wrappers/worker --print --resume legacy-session task',
+      status: 'failed',
+      prompt: 'legacy verified prompt',
+    }],
+  }),
+  'utf8',
+);
 
 const {
   getCodexResumeJob,
+  inferPersistedJobAgent,
   listCodexJobEvents,
   startCodexResumeJob,
   stopCodexResumeJob,
@@ -28,6 +67,45 @@ const {
 } = await import('../server/codex-jobs.ts');
 
 const startedJobIds: string[] = [];
+
+test('persisted job Agent inference accepts custom binaries and fails closed when unknown', () => {
+  assert.equal(inferPersistedJobAgent('/opt/agents/claude-enterprise --print --resume session-1 task'), 'claude');
+  assert.equal(inferPersistedJobAgent('/opt/wrappers/worker --print --resume session-1 task', 'session-1'), 'claude');
+  assert.equal(inferPersistedJobAgent('/opt/agents/codex-worker resume --include-non-interactive -C /tmp session-1', 'session-1'), 'codex');
+  assert.equal(inferPersistedJobAgent('/opt/wrappers/worker --opaque session-1'), null);
+  assert.equal(
+    inferPersistedJobAgent(
+      "/opt/wrappers/opaque-worker --legacy session-1 'please document --print and --resume flags'",
+      'session-1',
+    ),
+    null,
+  );
+  assert.equal(
+    inferPersistedJobAgent(
+      "/opt/wrappers/opaque-worker --legacy session-1 'run resume later with -C example'",
+      'session-1',
+    ),
+    null,
+  );
+
+  const legacy = getCodexResumeJob('legacy-unverified-agent-job');
+  assert.equal(legacy?.agent, 'codex');
+  assert.equal(legacy?.agentVerified, false);
+  assert.equal(getCodexResumeJob('legacy-explicit-opaque-agent-job')?.agentVerified, false);
+  assert.equal(getCodexResumeJob('legacy-mismatched-agent-job')?.agentVerified, false);
+  assert.equal(getCodexResumeJob('legacy-verified-custom-agent-job')?.agentVerified, true);
+  let restartCalls = 0;
+  const supervised = superviseCodexResumeJob({
+    id: 'legacy-unverified-agent-job',
+    autoRetry: true,
+    restart: () => {
+      restartCalls += 1;
+      throw new Error('unverified Agent must not be retried');
+    },
+  });
+  assert.equal(supervised?.decision, 'failed');
+  assert.equal(restartCalls, 0);
+});
 
 test.after(async () => {
   for (const jobId of startedJobIds) {
@@ -41,6 +119,7 @@ function sessionFixture(name: string): CodexSession {
   const now = new Date().toISOString();
   return {
     id: `session-${name}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    agent: 'codex',
     filePath: join(testRoot, `${name}.jsonl`),
     cwd: testRoot,
     startedAt: now,
@@ -117,6 +196,8 @@ test('fake Codex worker completes normally', async () => {
   const completed = await waitForJob(job.id, (item) => item.status === 'completed');
 
   assert.equal(completed.exitCode, 0);
+  assert.equal(completed.agent, 'codex');
+  assert.equal(completed.agentVerified, true);
   assert.match(completed.outputTail, /Implemented requested change/);
   assert.ok(listCodexJobEvents(job.id).some((event) => event.type === 'completion'));
 });

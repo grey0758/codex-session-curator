@@ -45,6 +45,7 @@ export async function readSessionAuditEvents(options: {
   limit?: number;
   sessionId?: string | null;
   machineId?: string | null;
+  agent?: SessionAuditEvent['agent'] | null;
 } = {}): Promise<SessionAuditEvent[]> {
   let raw: string;
   try {
@@ -67,5 +68,6 @@ export async function readSessionAuditEvents(options: {
     .filter((event): event is SessionAuditEvent => Boolean(event))
     .filter((event) => !options.sessionId || event.sessionId === options.sessionId)
     .filter((event) => !options.machineId || event.machineId === options.machineId)
+    .filter((event) => !options.agent || event.agent === options.agent)
     .slice(-limit);
 }
