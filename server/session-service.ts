@@ -1784,20 +1784,39 @@ export class SessionService {
     };
   }
 
-  async findJobOutcome(jobId: string) {
+  async findJobOutcome(
+    jobId: string,
+    targetIdentity?: { sessionId: string; agent: AgentKind; machineId?: string },
+  ) {
     const state = await this.ensureLegacyStateMigrated();
     for (const [stateKey, evaluation] of Object.entries(state.evaluations)) {
-      const identity = parseSessionStateKey(stateKey);
-      if (!identity) continue;
+      const parsedIdentity = parseSessionStateKey(stateKey);
+      if (!parsedIdentity) continue;
+      if (
+        targetIdentity &&
+        (
+          parsedIdentity.sessionId !== targetIdentity.sessionId ||
+          parsedIdentity.agent !== targetIdentity.agent
+        )
+      ) {
+        continue;
+      }
       const outcome = (evaluation.jobOutcomes ?? []).find((item) => item.jobId === jobId);
       if (outcome) {
+        if (
+          outcome.sessionId !== parsedIdentity.sessionId ||
+          outcome.agent !== parsedIdentity.agent ||
+          (targetIdentity?.machineId && outcome.machineId !== targetIdentity.machineId)
+        ) {
+          continue;
+        }
         return {
-          sessionId: identity.sessionId,
-          agent: identity.agent,
+          sessionId: parsedIdentity.sessionId,
+          agent: parsedIdentity.agent,
           title: state.titles[stateKey] ||
             evaluation.title ||
             evaluation.summary ||
-            identity.sessionId,
+            parsedIdentity.sessionId,
           outcome,
           failureCards: (evaluation.failureCards ?? []).filter((card) => card.jobId === jobId),
         };

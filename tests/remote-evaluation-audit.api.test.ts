@@ -7,7 +7,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { compareSessionVisibility } from '../server/session-audit.js';
-import { hasPendingHubEvaluation, shouldQueueHubRemoteEvaluation } from '../server/remote-agents.js';
+import {
+  fetchAgentJson,
+  fetchAgentSessions,
+  hasPendingHubEvaluation,
+  shouldQueueHubRemoteEvaluation,
+  type RemoteAgent,
+} from '../server/remote-agents.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..');
@@ -51,6 +57,83 @@ async function stopServer(server: ChildProcessWithoutNullStreams): Promise<void>
 async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
+
+test('RemoteAgent session boundary binds configured machine identity and rejects invalid Agents', async () => {
+  let sessions: JsonRecord[] = [{
+    id: 'spoofed-machine-session',
+    agent: 'codex',
+    machineId: 'gpl001',
+  }, {
+    id: 'missing-machine-session',
+    agent: 'claude',
+  }];
+  const remote = createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    const pathname = new URL(request.url ?? '/', 'http://curator-remote.invalid').pathname;
+    response.end(JSON.stringify(
+      pathname.endsWith('/context')
+        ? { session: sessions[0] }
+        : { sessions },
+    ));
+  });
+  await new Promise<void>((resolve) => remote.listen(0, '127.0.0.1', resolve));
+  const address = remote.address();
+  assert.ok(address && typeof address === 'object');
+  const agent: RemoteAgent = {
+    id: 'legacy-worker',
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    token: null,
+  };
+
+  try {
+    const cachedSessions = await fetchAgentSessions(agent);
+    assert.deepEqual(cachedSessions.map((session) => session.machineId), [
+      'legacy-worker',
+      'legacy-worker',
+    ]);
+
+    const strictPayload = await fetchAgentJson<{ sessions: Array<{ machineId: string }> }>(
+      agent,
+      '/api/sessions?detail=0&remote=0',
+    );
+    assert.deepEqual(strictPayload.sessions.map((session) => session.machineId), [
+      'legacy-worker',
+      'legacy-worker',
+    ]);
+    const contextPayload = await fetchAgentJson<{ session: { machineId: string } }>(
+      agent,
+      '/api/hermes/sessions/spoofed-machine-session/context',
+    );
+    assert.equal(contextPayload.session.machineId, 'legacy-worker');
+
+    sessions = [{
+      id: 'invalid-agent-session',
+      agent: 'openclaw',
+      machineId: 'gpl001',
+    }];
+    assert.deepEqual(await fetchAgentSessions(agent), []);
+    await assert.rejects(
+      fetchAgentJson(agent, '/api/sessions?detail=0&remote=0'),
+      /Invalid remote session Agent from legacy-worker/,
+    );
+    await assert.rejects(
+      fetchAgentJson(agent, '/api/hermes/sessions/invalid-agent-session/context'),
+      /Invalid remote session Agent from legacy-worker/,
+    );
+
+    sessions = [{
+      id: 'missing-agent-session',
+      machineId: 'gpl001',
+    }];
+    assert.deepEqual(await fetchAgentSessions(agent), []);
+    await assert.rejects(
+      fetchAgentJson(agent, '/api/sessions?detail=0&remote=0'),
+      /Invalid remote session Agent from legacy-worker/,
+    );
+  } finally {
+    await closeServer(remote);
+  }
+});
 
 async function requestJson<T extends JsonRecord>(
   baseUrl: string,

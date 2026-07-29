@@ -304,12 +304,15 @@ function normalizeEvaluation(session: Partial<CodexSession>): Evaluation {
 
 function normalizeSession(raw: unknown): CodexSession {
   const session = (raw ?? {}) as Partial<CodexSession>;
+  if (session.agent !== 'codex' && session.agent !== 'claude') {
+    throw new Error('会话缺少可验证的 Agent 身份');
+  }
   const id = String(session.id ?? session.filePath ?? 'unknown-session');
   const title = session.title || session.customTitle || id;
   return {
     ...session,
     id,
-    agent: session.agent === 'claude' ? 'claude' : 'codex',
+    agent: session.agent,
     filePath: session.filePath ?? '',
     cwd: session.cwd ?? null,
     startedAt: session.startedAt ?? null,
@@ -960,6 +963,80 @@ function normalizeWorkerJob(job: CodexWorkerJob): CodexWorkerJob {
     agent,
     agentVerified: agent !== null && job.agentVerified === true,
   };
+}
+
+interface VerifiedWorkerJobIdentity {
+  machineId: string;
+  agent: AgentKind;
+  sessionId: string;
+}
+
+function workerJobMachineId(job: CodexWorkerJob): string | null {
+  const machineId = (job.machineId ?? job.machine)?.trim();
+  return machineId || null;
+}
+
+function verifiedWorkerJobIdentity(job: CodexWorkerJob): VerifiedWorkerJobIdentity | null {
+  const jobId = typeof job.id === 'string' ? job.id.trim() : '';
+  const machineId = job.machineId?.trim() || null;
+  const sessionId = job.sessionId?.trim() || null;
+  const agent = job.agent === 'codex' || job.agent === 'claude' ? job.agent : null;
+  if (!jobId || !machineId || !sessionId || !agent || job.agentVerified !== true) return null;
+  return { machineId, agent, sessionId };
+}
+
+function requireVerifiedWorkerJobIdentity(job: CodexWorkerJob): VerifiedWorkerJobIdentity {
+  const identity = verifiedWorkerJobIdentity(job);
+  if (!identity) {
+    throw new Error(`Worker job 身份未验证或不完整：${job.id}`);
+  }
+  return identity;
+}
+
+function workerJobKey(job: CodexWorkerJob): string {
+  const machineId = workerJobMachineId(job) ?? 'unknown';
+  const agent = job.agent === 'codex' || job.agent === 'claude' ? job.agent : 'unknown';
+  const sessionId = job.sessionId?.trim() || 'unknown';
+  const jobId = typeof job.id === 'string' && job.id.trim() ? job.id : 'unknown';
+  return `${machineId}|||${agent}|||${sessionId}|||${jobId}`;
+}
+
+function workerJobActionKey(job: CodexWorkerJob, action: string): string {
+  return `${workerJobKey(job)}|||${action}`;
+}
+
+function workerJobRequestUrl(
+  job: CodexWorkerJob,
+  suffix = '',
+  extraQuery: Record<string, string> = {},
+): string {
+  const identity = requireVerifiedWorkerJobIdentity(job);
+  const query = new URLSearchParams({
+    ...extraQuery,
+    machineId: identity.machineId,
+    agent: identity.agent,
+    sessionId: identity.sessionId,
+  });
+  return `/api/codex/jobs/${encodeURIComponent(job.id)}${suffix}?${query.toString()}`;
+}
+
+function verifyWorkerJobResponse(
+  expected: CodexWorkerJob,
+  received: CodexWorkerJob,
+  options: { allowDifferentJobId?: boolean } = {},
+): CodexWorkerJob {
+  const expectedIdentity = requireVerifiedWorkerJobIdentity(expected);
+  const normalized = normalizeWorkerJob(received);
+  const receivedIdentity = requireVerifiedWorkerJobIdentity(normalized);
+  if (
+    (!options.allowDifferentJobId && normalized.id !== expected.id) ||
+    receivedIdentity.machineId !== expectedIdentity.machineId ||
+    receivedIdentity.agent !== expectedIdentity.agent ||
+    receivedIdentity.sessionId !== expectedIdentity.sessionId
+  ) {
+    throw new Error(`Worker job 响应身份不匹配：${expected.id}`);
+  }
+  return normalized;
 }
 
 function sortWorkerJobs(jobs: CodexWorkerJob[]): CodexWorkerJob[] {
@@ -1762,8 +1839,8 @@ function App() {
   const [jobRegistryErrors, setJobRegistryErrors] = useState<CodexJobRegistryError[]>([]);
   const [workerJobsLoading, setWorkerJobsLoading] = useState(false);
   const [workerJobsError, setWorkerJobsError] = useState<string | null>(null);
-  const [workerJobBusyId, setWorkerJobBusyId] = useState<string | null>(null);
-  const [selectedWorkerJobId, setSelectedWorkerJobId] = useState<string | null>(null);
+  const [workerJobBusyKey, setWorkerJobBusyKey] = useState<string | null>(null);
+  const [selectedWorkerJobKey, setSelectedWorkerJobKey] = useState<string | null>(null);
   const [workerGuidanceDrafts, setWorkerGuidanceDrafts] = useState<Record<string, string>>({});
   const [workerProtocolKindsByJob, setWorkerProtocolKindsByJob] = useState<Record<string, WorkerProtocolKind>>({});
   const [workerSupervisorDrafts, setWorkerSupervisorDrafts] = useState<Record<string, string>>({});
@@ -2048,9 +2125,11 @@ function App() {
 
   const upsertWorkerJob = useCallback((job: CodexWorkerJob) => {
     const normalizedJob = normalizeWorkerJob(job);
+    requireVerifiedWorkerJobIdentity(normalizedJob);
+    const key = workerJobKey(normalizedJob);
     setWorkerJobs((current) => sortWorkerJobs([
       normalizedJob,
-      ...current.filter((item) => item.id !== normalizedJob.id),
+      ...current.filter((item) => workerJobKey(item) !== key),
     ]));
   }, []);
 
@@ -2069,15 +2148,16 @@ function App() {
       setJobRegistryBaseUrl(payload.baseUrl ?? null);
       setJobRegistryHealth(Array.isArray(payload.health) ? payload.health : []);
       setJobRegistryErrors(Array.isArray(payload.errors) ? payload.errors : []);
-      setWorkerJobs(sortWorkerJobs(
-        (Array.isArray(payload.jobs) ? payload.jobs : [])
-          .filter((entry) => entry.job)
-          .map((entry) => normalizeWorkerJob({
-            ...entry.job,
-            machineId: entry.job?.machineId ?? entry.machineId ?? null,
-            machine: entry.job?.machine ?? entry.machineId ?? undefined,
-          } as CodexWorkerJob))
-      ));
+      const jobsByKey = new Map<string, CodexWorkerJob>();
+      (Array.isArray(payload.jobs) ? payload.jobs : [])
+        .filter((entry) => entry.job)
+        .map((entry) => normalizeWorkerJob({
+          ...entry.job,
+          machineId: entry.job?.machineId ?? entry.machineId ?? null,
+          machine: entry.job?.machine ?? entry.machineId ?? undefined,
+        } as CodexWorkerJob))
+        .forEach((job) => jobsByKey.set(workerJobKey(job), job));
+      setWorkerJobs(sortWorkerJobs([...jobsByKey.values()]));
     } catch (err) {
       setWorkerJobsError(err instanceof Error ? err.message : 'worker job 加载失败');
     } finally {
@@ -2085,27 +2165,37 @@ function App() {
     }
   }, []);
 
-  const refreshWorkerJob = useCallback(async (jobId: string) => {
-    const response = await fetch(`/api/codex/jobs/${encodeURIComponent(jobId)}`);
+  const refreshWorkerJob = useCallback(async (job: CodexWorkerJob) => {
+    const response = await fetch(workerJobRequestUrl(job));
     const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
     if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
-    upsertWorkerJob(payload.job);
-    return payload.job;
+    const verifiedJob = verifyWorkerJobResponse(job, payload.job);
+    upsertWorkerJob(verifiedJob);
+    return verifiedJob;
   }, [upsertWorkerJob]);
 
-  const loadWorkerJobEvents = useCallback(async (jobId: string) => {
-    if (workerJobEventsUnavailable[jobId]) return;
-    const afterSeq = workerJobEventSeq[jobId] ?? 0;
+  const loadWorkerJobEvents = useCallback(async (job: CodexWorkerJob) => {
+    const key = workerJobKey(job);
+    if (workerJobEventsUnavailable[key]) return;
+    const afterSeq = workerJobEventSeq[key] ?? 0;
     try {
-      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(jobId)}/events?afterSeq=${encodeURIComponent(String(afterSeq))}`);
+      const response = await fetch(workerJobRequestUrl(job, '/events', {
+        afterSeq: String(afterSeq),
+      }));
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = (await response.json()) as { events?: CodexWorkerEvent[]; nextSeq?: number };
+      const payload = (await response.json()) as {
+        events?: CodexWorkerEvent[];
+        nextSeq?: number;
+        job?: CodexWorkerJob;
+      };
+      if (!payload.job) throw new Error('Worker job 事件响应缺少身份');
+      upsertWorkerJob(verifyWorkerJobResponse(job, payload.job));
       const events = Array.isArray(payload.events) ? payload.events : [];
-      setWorkerJobEventsUnavailable((current) => ({ ...current, [jobId]: false }));
+      setWorkerJobEventsUnavailable((current) => ({ ...current, [key]: false }));
       if (!events.length) return;
 
       setWorkerJobEvents((current) => {
-        const existing = current[jobId] ?? [];
+        const existing = current[key] ?? [];
         const seen = new Set(
           existing.map((event) => (typeof event.seq === 'number' ? `seq:${event.seq}` : `raw:${formatUnknownValue(event)}`))
         );
@@ -2118,104 +2208,111 @@ function App() {
             return true;
           }),
         ].slice(-160);
-        return { ...current, [jobId]: merged };
+        return { ...current, [key]: merged };
       });
 
       const maxEventSeq = events.reduce((max, event) => (
         typeof event.seq === 'number' ? Math.max(max, event.seq) : max
       ), afterSeq);
       const nextSeq = typeof payload.nextSeq === 'number' ? payload.nextSeq : maxEventSeq;
-      setWorkerJobEventSeq((current) => ({ ...current, [jobId]: Math.max(current[jobId] ?? 0, nextSeq) }));
+      setWorkerJobEventSeq((current) => ({ ...current, [key]: Math.max(current[key] ?? 0, nextSeq) }));
     } catch {
-      setWorkerJobEventsUnavailable((current) => ({ ...current, [jobId]: true }));
+      setWorkerJobEventsUnavailable((current) => ({ ...current, [key]: true }));
     }
-  }, [workerJobEventSeq, workerJobEventsUnavailable]);
+  }, [upsertWorkerJob, workerJobEventSeq, workerJobEventsUnavailable]);
 
   async function stopWorkerJob(job: CodexWorkerJob) {
-    setWorkerJobBusyId(`${job.id}:stop`);
+    setWorkerJobBusyKey(workerJobActionKey(job, 'stop'));
     setWorkerActionMessage(null);
     try {
-      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/stop`, { method: 'POST' });
+      const response = await fetch(workerJobRequestUrl(job, '/stop'), { method: 'POST' });
       const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
       if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
-      upsertWorkerJob(payload.job);
+      upsertWorkerJob(verifyWorkerJobResponse(job, payload.job));
       setWorkerActionMessage(`已停止 job：${job.id}`);
     } catch (err) {
       setWorkerActionMessage(`停止失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
-      setWorkerJobBusyId(null);
+      setWorkerJobBusyKey(null);
     }
   }
 
   async function sendWorkerGuidance(job: CodexWorkerJob) {
-    const text = (workerGuidanceDrafts[job.id] ?? '').trim();
+    const key = workerJobKey(job);
+    const text = (workerGuidanceDrafts[key] ?? '').trim();
     if (!text) return;
-    setWorkerJobBusyId(`${job.id}:guidance`);
+    setWorkerJobBusyKey(workerJobActionKey(job, 'guidance'));
     setWorkerActionMessage(null);
     try {
-      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/guidance`, {
+      const response = await fetch(workerJobRequestUrl(job, '/guidance'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, source: 'api' }),
       });
       const payload = (await response.json()) as { job?: CodexWorkerJob; error?: string };
       if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
-      upsertWorkerJob(payload.job);
-      setWorkerGuidanceDrafts((current) => ({ ...current, [job.id]: '' }));
+      upsertWorkerJob(verifyWorkerJobResponse(job, payload.job));
+      setWorkerGuidanceDrafts((current) => ({ ...current, [key]: '' }));
       setWorkerActionMessage('已发送指导');
     } catch (err) {
       setWorkerActionMessage(`指导发送失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
-      setWorkerJobBusyId(null);
+      setWorkerJobBusyKey(null);
     }
   }
 
   async function sendWorkerProtocolKind(job: CodexWorkerJob) {
-    const kind = workerProtocolKindsByJob[job.id] ?? 'guide';
+    const key = workerJobKey(job);
+    const kind = workerProtocolKindsByJob[key] ?? 'guide';
     const label = workerProtocolKinds.find((item) => item.id === kind)?.label ?? kind;
-    setWorkerJobBusyId(`${job.id}:protocol`);
+    setWorkerJobBusyKey(workerJobActionKey(job, 'protocol'));
     setWorkerActionMessage(null);
     try {
-      const protocolResponse = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/protocol`, {
+      const protocolResponse = await fetch(workerJobRequestUrl(job, '/protocol'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ kind }),
       });
       if (protocolResponse.ok) {
         const payload = (await protocolResponse.json()) as { job?: CodexWorkerJob };
-        if (payload.job) upsertWorkerJob(payload.job);
-        else await refreshWorkerJob(job.id);
+        if (payload.job) upsertWorkerJob(verifyWorkerJobResponse(job, payload.job));
+        else await refreshWorkerJob(job);
         setWorkerActionMessage(`已发送 protocol：${label}`);
         return;
       }
+      if (![404, 405, 501].includes(protocolResponse.status)) {
+        const payload = (await protocolResponse.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error || `HTTP ${protocolResponse.status}`);
+      }
 
-      const fallbackResponse = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/guidance`, {
+      const fallbackResponse = await fetch(workerJobRequestUrl(job, '/guidance'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: `[protocol:${kind}] ${label}`, source: 'api' }),
       });
       const fallbackPayload = (await fallbackResponse.json()) as { job?: CodexWorkerJob; error?: string };
       if (!fallbackResponse.ok || !fallbackPayload.job) throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
-      upsertWorkerJob(fallbackPayload.job);
+      upsertWorkerJob(verifyWorkerJobResponse(job, fallbackPayload.job));
       setWorkerActionMessage(`后端未提供 protocol endpoint，已按 guidance 记录：${label}`);
     } catch (err) {
       setWorkerActionMessage(`protocol 发送失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
-      setWorkerJobBusyId(null);
+      setWorkerJobBusyKey(null);
     }
   }
 
   async function superviseWorkerJob(job: CodexWorkerJob) {
-    const instruction = (workerSupervisorDrafts[job.id] ?? '').trim();
-    setWorkerJobBusyId(`${job.id}:supervise`);
+    const key = workerJobKey(job);
+    const instruction = (workerSupervisorDrafts[key] ?? '').trim();
+    setWorkerJobBusyKey(workerJobActionKey(job, 'supervise'));
     setWorkerActionMessage(null);
     try {
-      const response = await fetch(`/api/codex/jobs/${encodeURIComponent(job.id)}/supervise`, {
+      const response = await fetch(workerJobRequestUrl(job, '/supervise'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...(instruction ? { instruction } : {}),
-          autoStop: workerSupervisorAutoStop[job.id] ?? false,
+          autoStop: workerSupervisorAutoStop[key] ?? false,
         }),
       });
       const payload = (await response.json()) as {
@@ -2226,13 +2323,17 @@ function App() {
         error?: string;
       };
       if (!response.ok || !payload.job) throw new Error(payload.error || `HTTP ${response.status}`);
-      upsertWorkerJob(payload.job);
-      if (payload.followupJob) upsertWorkerJob(payload.followupJob);
+      upsertWorkerJob(verifyWorkerJobResponse(job, payload.job));
+      if (payload.followupJob) {
+        upsertWorkerJob(verifyWorkerJobResponse(job, payload.followupJob, {
+          allowDifferentJobId: true,
+        }));
+      }
       setWorkerActionMessage(`监督结果：${payload.decision ?? '未知'} · ${payload.reason ?? '无原因'}`);
     } catch (err) {
       setWorkerActionMessage(`supervise 失败：${err instanceof Error ? err.message : '未知错误'}`);
     } finally {
-      setWorkerJobBusyId(null);
+      setWorkerJobBusyKey(null);
     }
   }
 
@@ -2567,13 +2668,13 @@ function App() {
     () => (
       selected
         ? sortWorkerJobs(
-            workerJobs.filter(
-              (job) =>
-                job.agentVerified === true &&
-                job.agent === selected.agent &&
-                job.sessionId === selected.id &&
-                (job.machineId ?? job.machine) === selected.machineId
-            )
+            workerJobs.filter((job) => {
+              const identity = verifiedWorkerJobIdentity(job);
+              return identity !== null &&
+                identity.agent === selected.agent &&
+                identity.sessionId === selected.id &&
+                identity.machineId === selected.machineId;
+            })
           )
         : []
     ),
@@ -2581,15 +2682,16 @@ function App() {
   );
   const currentWorkerJob = useMemo(() => {
     if (!selectedWorkerJobs.length) return null;
-    return selectedWorkerJobs.find((job) => job.id === selectedWorkerJobId)
+    return selectedWorkerJobs.find((job) => workerJobKey(job) === selectedWorkerJobKey)
       ?? selectedWorkerJobs.find(isWorkerJobRunning)
       ?? selectedWorkerJobs[0];
-  }, [selectedWorkerJobId, selectedWorkerJobs]);
-  const currentWorkerEvents = currentWorkerJob ? (workerJobEvents[currentWorkerJob.id] ?? []) : [];
-  const currentWorkerProtocolKind = currentWorkerJob ? (workerProtocolKindsByJob[currentWorkerJob.id] ?? 'guide') : 'guide';
-  const currentWorkerGuidanceDraft = currentWorkerJob ? (workerGuidanceDrafts[currentWorkerJob.id] ?? '') : '';
-  const currentWorkerSupervisorDraft = currentWorkerJob ? (workerSupervisorDrafts[currentWorkerJob.id] ?? '') : '';
-  const currentWorkerSupervisorAutoStop = currentWorkerJob ? (workerSupervisorAutoStop[currentWorkerJob.id] ?? false) : false;
+  }, [selectedWorkerJobKey, selectedWorkerJobs]);
+  const currentWorkerJobKey = currentWorkerJob ? workerJobKey(currentWorkerJob) : null;
+  const currentWorkerEvents = currentWorkerJobKey ? (workerJobEvents[currentWorkerJobKey] ?? []) : [];
+  const currentWorkerProtocolKind = currentWorkerJobKey ? (workerProtocolKindsByJob[currentWorkerJobKey] ?? 'guide') : 'guide';
+  const currentWorkerGuidanceDraft = currentWorkerJobKey ? (workerGuidanceDrafts[currentWorkerJobKey] ?? '') : '';
+  const currentWorkerSupervisorDraft = currentWorkerJobKey ? (workerSupervisorDrafts[currentWorkerJobKey] ?? '') : '';
+  const currentWorkerSupervisorAutoStop = currentWorkerJobKey ? (workerSupervisorAutoStop[currentWorkerJobKey] ?? false) : false;
   const recentCommanderActions = useMemo(() => commanderActions.slice(0, 8), [commanderActions]);
   const jobRegistryMachines = useMemo(() => {
     const machines = new Map<string, CodexJobRegistryHealth & { runningJobs: number; totalJobs: number }>();
@@ -2643,7 +2745,7 @@ function App() {
   useEffect(() => {
     const handle = window.setTimeout(() => {
       setWorkerActionMessage(null);
-      setSelectedWorkerJobId(null);
+      setSelectedWorkerJobKey(null);
     }, 0);
     return () => window.clearTimeout(handle);
   }, [selectedIdentityKey]);
@@ -2668,18 +2770,18 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob?.id) return;
+    if (isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob) return;
     const firstLoad = window.setTimeout(() => {
-      void loadWorkerJobEvents(currentWorkerJob.id);
+      void loadWorkerJobEvents(currentWorkerJob);
     }, 0);
     const interval = window.setInterval(() => {
-      void loadWorkerJobEvents(currentWorkerJob.id);
+      void loadWorkerJobEvents(currentWorkerJob);
     }, 4000);
     return () => {
       window.clearTimeout(firstLoad);
       window.clearInterval(interval);
     };
-  }, [activeTab, currentWorkerJob?.id, isTerminalOnlyPage, loadWorkerJobEvents]);
+  }, [activeTab, currentWorkerJob, currentWorkerJobKey, isTerminalOnlyPage, loadWorkerJobEvents]);
 
   const toggleSessionSelection = useCallback((key: string) => {
     setSelectedSessionKeys((current) => (current.includes(key) ? current.filter((item) => item !== key) : [...current, key]));
@@ -4246,12 +4348,12 @@ function App() {
                   {selectedWorkerJobs.length > 1 ? (
                     <select
                       className="worker-job-select"
-                      value={currentWorkerJob?.id ?? ''}
-                      onChange={(event) => setSelectedWorkerJobId(event.target.value || null)}
+                      value={currentWorkerJobKey ?? ''}
+                      onChange={(event) => setSelectedWorkerJobKey(event.target.value || null)}
                       aria-label="选择 worker job"
                     >
                       {selectedWorkerJobs.map((job) => (
-                        <option key={job.id} value={job.id}>
+                        <option key={workerJobKey(job)} value={workerJobKey(job)}>
                           {statusLabel(job.status)} · {formatDate(job.updatedAt ?? job.startedAt ?? null)} · {job.id.slice(0, 8)}
                         </option>
                       ))}
@@ -4264,7 +4366,7 @@ function App() {
                   <button
                     type="button"
                     className="danger-button"
-                    disabled={!currentWorkerJob || !isWorkerJobRunning(currentWorkerJob) || workerJobBusyId === `${currentWorkerJob.id}:stop`}
+                    disabled={!currentWorkerJob || !isWorkerJobRunning(currentWorkerJob) || workerJobBusyKey === workerJobActionKey(currentWorkerJob, 'stop')}
                     onClick={() => currentWorkerJob ? void stopWorkerJob(currentWorkerJob) : undefined}
                   >
                     <X size={16} />
@@ -4368,7 +4470,7 @@ function App() {
                       <textarea
                         value={currentWorkerGuidanceDraft}
                         onChange={(event) =>
-                          setWorkerGuidanceDrafts((current) => ({ ...current, [currentWorkerJob.id]: event.target.value }))
+                          setWorkerGuidanceDrafts((current) => ({ ...current, [workerJobKey(currentWorkerJob)]: event.target.value }))
                         }
                         placeholder="给运行中的 Codex worker 发送中文指导"
                       />
@@ -4376,7 +4478,7 @@ function App() {
                     <button
                       type="button"
                       className="primary-button"
-                      disabled={!currentWorkerGuidanceDraft.trim() || workerJobBusyId === `${currentWorkerJob.id}:guidance`}
+                      disabled={!currentWorkerGuidanceDraft.trim() || workerJobBusyKey === workerJobActionKey(currentWorkerJob, 'guidance')}
                       onClick={() => void sendWorkerGuidance(currentWorkerJob)}
                     >
                       <TerminalIcon size={16} />
@@ -4389,7 +4491,7 @@ function App() {
                         onChange={(event) =>
                           setWorkerProtocolKindsByJob((current) => ({
                             ...current,
-                            [currentWorkerJob.id]: event.target.value as WorkerProtocolKind,
+                            [workerJobKey(currentWorkerJob)]: event.target.value as WorkerProtocolKind,
                           }))
                         }
                         aria-label="protocol kind"
@@ -4403,7 +4505,7 @@ function App() {
                       <button
                         type="button"
                         className="primary-button"
-                        disabled={workerJobBusyId === `${currentWorkerJob.id}:protocol`}
+                        disabled={workerJobBusyKey === workerJobActionKey(currentWorkerJob, 'protocol')}
                         onClick={() => void sendWorkerProtocolKind(currentWorkerJob)}
                       >
                         <Sparkles size={16} />
@@ -4416,7 +4518,7 @@ function App() {
                       <textarea
                         value={currentWorkerSupervisorDraft}
                         onChange={(event) =>
-                          setWorkerSupervisorDrafts((current) => ({ ...current, [currentWorkerJob.id]: event.target.value }))
+                          setWorkerSupervisorDrafts((current) => ({ ...current, [workerJobKey(currentWorkerJob)]: event.target.value }))
                         }
                         placeholder="可选：监督指令"
                       />
@@ -4427,7 +4529,7 @@ function App() {
                           type="checkbox"
                           checked={currentWorkerSupervisorAutoStop}
                           onChange={(event) =>
-                            setWorkerSupervisorAutoStop((current) => ({ ...current, [currentWorkerJob.id]: event.target.checked }))
+                            setWorkerSupervisorAutoStop((current) => ({ ...current, [workerJobKey(currentWorkerJob)]: event.target.checked }))
                           }
                         />
                         autoStop
@@ -4435,7 +4537,7 @@ function App() {
                       <button
                         type="button"
                         className="primary-button"
-                        disabled={workerJobBusyId === `${currentWorkerJob.id}:supervise`}
+                        disabled={workerJobBusyKey === workerJobActionKey(currentWorkerJob, 'supervise')}
                         onClick={() => void superviseWorkerJob(currentWorkerJob)}
                       >
                         <ShieldCheck size={16} />
@@ -4572,7 +4674,7 @@ function App() {
                         ))
                       ) : (
                         <div className="empty compact">
-                          {workerJobEventsUnavailable[currentWorkerJob.id] ? '事件接口未启用或暂不可用' : '暂无事件流'}
+                          {workerJobEventsUnavailable[workerJobKey(currentWorkerJob)] ? '事件接口未启用或暂不可用' : '暂无事件流'}
                         </div>
                       )}
                     </div>

@@ -232,6 +232,11 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     assert.equal(dispatch.job.status, 'running');
     assert.ok(dispatch.candidates.length >= 1);
     const jobId = String(dispatch.job.id);
+    const jobQuery = new URLSearchParams({
+      machineId: String(dispatch.job.machineId),
+      agent: String(dispatch.job.agent),
+      sessionId: String(dispatch.job.sessionId),
+    }).toString();
 
     const sessionIndex = await requestJson<{ sessions: JsonRecord[]; resumePolicy: JsonRecord }>(
       baseUrl,
@@ -250,7 +255,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
 
     const supervise = await requestJson<{ decision: string; job: JsonRecord }>(
       baseUrl,
-      `/api/hermes/jobs/${jobId}/supervise`,
+      `/api/hermes/jobs/${jobId}/supervise?${jobQuery}`,
       {
         method: 'POST',
         body: JSON.stringify({ autoStop: true, staleOutputMs: 1000 }),
@@ -267,7 +272,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     );
 
     const runningEvents = await waitFor(
-      () => requestJson<{ events: JsonRecord[] }>(baseUrl, `/api/hermes/jobs/${jobId}/events?remote=0`),
+      () => requestJson<{ events: JsonRecord[] }>(baseUrl, `/api/hermes/jobs/${jobId}/events?${jobQuery}`),
       (payload) => payload.events.some((event) => event.type === 'output' && JSON.stringify(event.data ?? {}).includes('PROMPT_OK')),
       'fake worker prompt acknowledgement',
     );
@@ -276,7 +281,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
     assert.ok(runningEvents.events.some((event) => event.type === 'output' && JSON.stringify(event.data ?? {}).includes('RECOMMENDED_RESUME_OK')));
 
     const completed = await waitFor(
-      () => requestJson<{ job: JsonRecord }>(baseUrl, `/api/hermes/jobs/${jobId}`),
+      () => requestJson<{ job: JsonRecord }>(baseUrl, `/api/hermes/jobs/${jobId}?${jobQuery}`),
       (payload) => payload.job.status === 'completed' && payload.job.structuredReport !== null,
       'job completion with structured report',
     );
@@ -290,7 +295,7 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
 
     const finalEvents = await requestJson<{ events: JsonRecord[]; job: JsonRecord }>(
       baseUrl,
-      `/api/hermes/jobs/${jobId}/events?remote=0`,
+      `/api/hermes/jobs/${jobId}/events?${jobQuery}`,
     );
     assert.equal(finalEvents.job.status, 'completed');
     assert.ok(finalEvents.events.some((event) => event.type === 'supervisor'));

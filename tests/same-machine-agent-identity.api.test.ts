@@ -104,6 +104,7 @@ test('same-machine Codex and Claude duplicate IDs route and mutate by agent', as
   const codexSessionPath = join(codexHome, 'sessions', `${sessionId}.jsonl`);
   const claudeSessionPath = join(claudeHome, 'projects', '-fixture', `${sessionId}.jsonl`);
   const statePath = join(codexHome, 'session-curator-state.json');
+  const sharedJobId = 'same-machine-shared-job-id';
   const port = 55_000 + Math.floor(Math.random() * 2000);
   const baseUrl = `http://127.0.0.1:${port}`;
   const logs: string[] = [];
@@ -145,8 +146,48 @@ test('same-machine Codex and Claude duplicate IDs route and mutate by agent', as
       deletedIds: [],
       titles: {},
       evaluations: {
-        [`codex|||${sessionId}`]: evaluationFixture('CODEX_KNOWLEDGE_IDENTITY', codexProject, codexSessionPath, now),
-        [`claude|||${sessionId}`]: evaluationFixture('CLAUDE_KNOWLEDGE_IDENTITY', claudeProject, claudeSessionPath, now),
+        [`codex|||${sessionId}`]: {
+          ...evaluationFixture('CODEX_KNOWLEDGE_IDENTITY', codexProject, codexSessionPath, now),
+          jobOutcomes: [{
+            id: 'codex-outcome',
+            at: now,
+            jobId: sharedJobId,
+            sessionId,
+            machineId: 'same-machine',
+            agent: 'codex',
+            status: 'completed',
+            mode: 'exec',
+            goal: 'codex identity outcome',
+            cwd: codexProject,
+            changedFiles: [],
+            tests: [],
+            nextAction: null,
+            failureReason: null,
+            needsReview: false,
+            summary: 'CODEX_JOB_OUTCOME',
+          }],
+        },
+        [`claude|||${sessionId}`]: {
+          ...evaluationFixture('CLAUDE_KNOWLEDGE_IDENTITY', claudeProject, claudeSessionPath, now),
+          jobOutcomes: [{
+            id: 'claude-outcome',
+            at: now,
+            jobId: sharedJobId,
+            sessionId,
+            machineId: 'same-machine',
+            agent: 'claude',
+            status: 'completed',
+            mode: 'exec',
+            goal: 'claude identity outcome',
+            cwd: claudeProject,
+            changedFiles: [],
+            tests: [],
+            nextAction: null,
+            failureReason: null,
+            needsReview: false,
+            summary: 'CLAUDE_JOB_OUTCOME',
+          }],
+        },
       },
       commanderActions: {},
     }),
@@ -212,6 +253,21 @@ test('same-machine Codex and Claude duplicate IDs route and mutate by agent', as
     assert.equal(codexDetail.agent, 'codex');
     assert.equal(claudeDetail.cwd, claudeProject);
     assert.equal(claudeDetail.agent, 'claude');
+
+    const codexJobQuery = `${codexQuery}&sessionId=${encodeURIComponent(sessionId)}`;
+    const claudeJobQuery = `${claudeQuery}&sessionId=${encodeURIComponent(sessionId)}`;
+    const codexOutcome = await requestJson<{ outcome: { summary: string; agent: string } }>(
+      baseUrl,
+      `/api/hermes/jobs/${sharedJobId}/outcome?${codexJobQuery}`,
+    );
+    const claudeOutcome = await requestJson<{ outcome: { summary: string; agent: string } }>(
+      baseUrl,
+      `/api/hermes/jobs/${sharedJobId}/outcome?${claudeJobQuery}`,
+    );
+    assert.equal(codexOutcome.outcome.summary, 'CODEX_JOB_OUTCOME');
+    assert.equal(codexOutcome.outcome.agent, 'codex');
+    assert.equal(claudeOutcome.outcome.summary, 'CLAUDE_JOB_OUTCOME');
+    assert.equal(claudeOutcome.outcome.agent, 'claude');
 
     const codexFiles = await requestJson<{ entries: Array<{ name: string }> }>(
       baseUrl,

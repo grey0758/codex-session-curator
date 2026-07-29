@@ -362,6 +362,9 @@ const jobGuidanceSchema = z.object({
 const jobEventsQuerySchema = z.object({
   afterSeq: z.coerce.number().int().min(0).optional(),
   remote: z.enum(['0', '1', 'true', 'false']).optional(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+  sessionId: z.string().min(1).max(300).optional(),
 });
 const jobProtocolSchema = z.object({
   kind: z.enum(['guide', 'pause', 'continue', 'summarize', 'handoff', 'verify']),
@@ -399,6 +402,12 @@ const sessionFileUploadQuerySchema = z.object({
 });
 const remoteControlSchema = z.object({
   remote: z.enum(['0', '1', 'true', 'false']).optional(),
+});
+const jobRouteQuerySchema = z.object({
+  remote: z.enum(['0', '1', 'true', 'false']).optional(),
+  machineId: z.string().min(1).max(300).optional(),
+  agent: z.enum(['codex', 'claude']).optional(),
+  sessionId: z.string().min(1).max(300).optional(),
 });
 const includeDeprecatedSchema = z.object({
   includeDeprecated: z.enum(['0', '1', 'true', 'false']).optional(),
@@ -2405,7 +2414,7 @@ async function getRemoteSessionsStrict(
         agent,
         sessions: (payload.sessions ?? []).map((session) => ({
           ...session,
-          machineId: session.machineId || agent.id,
+          machineId: agent.id,
         })),
         unavailable: false,
       };
@@ -2443,7 +2452,7 @@ async function findRemoteSession(
         (!preferredAgent || candidate.agent === preferredAgent)
     );
     if (!session) continue;
-    return { agent, session: { ...session, machineId: session.machineId || agent.id } };
+    return { agent, session: { ...session, machineId: agent.id } };
   }
   return null;
 }
@@ -2587,6 +2596,410 @@ async function buildFleetAuditReport(refreshRemoteCache = false) {
   };
 }
 
+type JobIdentity = {
+  jobId: string;
+  machineId: string;
+  agent: AgentKind;
+  sessionId: string;
+};
+
+type JobRouteTarget =
+  | { kind: 'local'; identity: JobIdentity }
+  | { kind: 'remote'; identity: JobIdentity; remoteAgent: (typeof remoteAgents)[number] };
+
+type JobRouteResolution =
+  | { status: 'found'; target: JobRouteTarget }
+  | {
+      status: 'error';
+      statusCode: number;
+      code: string;
+      message: string;
+      details?: Record<string, unknown>;
+    };
+
+function bindRemoteJobToSource(
+  source: (typeof remoteAgents)[number],
+  value: unknown,
+): CodexResumeJob | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const job = value as Partial<CodexResumeJob>;
+  if (
+    typeof job.id !== 'string' ||
+    !job.id.trim() ||
+    job.agentVerified !== true ||
+    (job.agent !== 'codex' && job.agent !== 'claude') ||
+    typeof job.sessionId !== 'string' ||
+    !job.sessionId.trim() ||
+    job.machineId !== source.id
+  ) {
+    return null;
+  }
+  return { ...job, machineId: source.id } as CodexResumeJob;
+}
+
+function jobMatchesIdentity(job: CodexResumeJob, identity: JobIdentity): boolean {
+  return (
+    job.agentVerified === true &&
+    job.id === identity.jobId &&
+    job.machineId === identity.machineId &&
+    job.agent === identity.agent &&
+    job.sessionId === identity.sessionId
+  );
+}
+
+function jobIdentityKey(identity: JobIdentity): string {
+  return `${identity.machineId}|||${identity.agent}|||${identity.sessionId}|||${identity.jobId}`;
+}
+
+function requestedJobIdentity(
+  jobId: string,
+  query: {
+    machineId?: string;
+    agent?: AgentKind;
+    sessionId?: string;
+  },
+): JobIdentity | null {
+  if (!query.machineId || !query.agent || !query.sessionId) return null;
+  return {
+    jobId,
+    machineId: query.machineId,
+    agent: query.agent,
+    sessionId: query.sessionId,
+  };
+}
+
+function jobIdentitySearchParams(
+  identity: JobIdentity,
+  extra: Record<string, string | number | undefined> = {},
+): URLSearchParams {
+  const params = new URLSearchParams({
+    machineId: identity.machineId,
+    agent: identity.agent,
+    sessionId: identity.sessionId,
+    remote: '0',
+  });
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  return params;
+}
+
+function jobPollPath(job: CodexResumeJob): string {
+  const params = new URLSearchParams({
+    machineId: job.machineId,
+    agent: job.agent,
+    sessionId: job.sessionId,
+  });
+  return `/api/hermes/jobs/${encodeURIComponent(job.id)}?${params.toString()}`;
+}
+
+async function resolveLegacyJobTarget(
+  jobId: string,
+  allowRemote: boolean,
+): Promise<JobRouteResolution> {
+  const localMachineId = service.getMeta().machineId;
+  const candidates: JobRouteTarget[] = [];
+  let invalidIdentity = false;
+  const localJob = getCodexResumeJob(jobId);
+  if (localJob) {
+    if (
+      localJob.agentVerified === true &&
+      (localJob.agent === 'codex' || localJob.agent === 'claude') &&
+      localJob.sessionId &&
+      localJob.machineId === localMachineId
+    ) {
+      candidates.push({
+        kind: 'local',
+        identity: {
+          jobId,
+          machineId: localMachineId,
+          agent: localJob.agent,
+          sessionId: localJob.sessionId,
+        },
+      });
+    } else {
+      invalidIdentity = true;
+    }
+  }
+
+  if (allowRemote && remoteAgents.length) {
+    const inventories = await Promise.all(remoteAgents.map(async (remoteAgent) => {
+      try {
+        const payload = await fetchAgentJson<{ jobs?: CodexResumeJob[] }>(
+          remoteAgent,
+          '/api/hermes/jobs?remote=0',
+        );
+        if (!Array.isArray(payload.jobs)) {
+          throw new Error(`Invalid remote job registry from ${remoteAgent.id}`);
+        }
+        return { remoteAgent, jobs: payload.jobs, unavailable: false };
+      } catch {
+        return { remoteAgent, jobs: [] as CodexResumeJob[], unavailable: true };
+      }
+    }));
+    const unavailable = inventories
+      .filter((inventory) => inventory.unavailable)
+      .map((inventory) => inventory.remoteAgent.id);
+    if (unavailable.length) {
+      return {
+        status: 'error',
+        statusCode: 503,
+        code: 'REMOTE_JOB_REGISTRY_UNAVAILABLE',
+        message: `Remote job registry unavailable: ${unavailable.join(', ')}`,
+        details: { machineIds: unavailable },
+      };
+    }
+    for (const inventory of inventories) {
+      for (const candidate of inventory.jobs.filter((job) => job.id === jobId)) {
+        const job = bindRemoteJobToSource(inventory.remoteAgent, candidate);
+        if (!job) {
+          invalidIdentity = true;
+          continue;
+        }
+        candidates.push({
+          kind: 'remote',
+          remoteAgent: inventory.remoteAgent,
+          identity: {
+            jobId,
+            machineId: inventory.remoteAgent.id,
+            agent: job.agent,
+            sessionId: job.sessionId,
+          },
+        });
+      }
+    }
+  }
+
+  if (invalidIdentity) {
+    return {
+      status: 'error',
+      statusCode: 409,
+      code: 'UNVERIFIED_JOB_IDENTITY',
+      message: `Job identity is unverified: ${jobId}`,
+    };
+  }
+  const unique = [...new Map(candidates.map((candidate) => [
+    jobIdentityKey(candidate.identity),
+    candidate,
+  ])).values()];
+  if (!unique.length) {
+    return {
+      status: 'error',
+      statusCode: 404,
+      code: 'JOB_NOT_FOUND',
+      message: `Job not found: ${jobId}`,
+    };
+  }
+  if (unique.length > 1) {
+    return {
+      status: 'error',
+      statusCode: 409,
+      code: 'AMBIGUOUS_JOB_IDENTITY',
+      message: `Ambiguous job identity: ${jobId}`,
+      details: {
+        candidates: unique.map((candidate) => candidate.identity),
+      },
+    };
+  }
+  return { status: 'found', target: unique[0] };
+}
+
+async function resolveJobTarget(
+  jobId: string,
+  query: {
+    remote?: string;
+    machineId?: string;
+    agent?: AgentKind;
+    sessionId?: string;
+  },
+  mutation: boolean,
+): Promise<JobRouteResolution> {
+  const allowRemote = query.remote !== '0' && query.remote !== 'false';
+  const providedIdentityFields = [query.machineId, query.agent, query.sessionId].filter(Boolean).length;
+  if (providedIdentityFields > 0 && providedIdentityFields < 3) {
+    return {
+      status: 'error',
+      statusCode: 400,
+      code: 'INCOMPLETE_JOB_IDENTITY',
+      message: 'machineId, agent, and sessionId must be provided together',
+    };
+  }
+  const requested = requestedJobIdentity(jobId, query);
+  if (!requested) {
+    if (mutation) {
+      return {
+        status: 'error',
+        statusCode: 400,
+        code: 'JOB_IDENTITY_REQUIRED',
+        message: 'machineId, agent, and sessionId are required for job mutations',
+      };
+    }
+    return resolveLegacyJobTarget(jobId, allowRemote);
+  }
+
+  const localMachineId = service.getMeta().machineId;
+  if (requested.machineId === localMachineId) {
+    const localJob = getCodexResumeJob(jobId);
+    if (localJob && localJob.agentVerified !== true) {
+      return {
+        status: 'error',
+        statusCode: 409,
+        code: 'UNVERIFIED_JOB_IDENTITY',
+        message: `Job identity is unverified: ${jobId}`,
+      };
+    }
+    if (localJob && !jobMatchesIdentity(localJob, requested)) {
+      return {
+        status: 'error',
+        statusCode: 409,
+        code: 'JOB_IDENTITY_MISMATCH',
+        message: `Job identity mismatch: ${jobId}`,
+      };
+    }
+    return { status: 'found', target: { kind: 'local', identity: requested } };
+  }
+
+  if (!allowRemote) {
+    return {
+      status: 'error',
+      statusCode: 404,
+      code: 'REMOTE_JOB_ROUTING_DISABLED',
+      message: `Remote job routing disabled: ${requested.machineId}`,
+    };
+  }
+  const remoteAgent = remoteAgents.find((agent) => agent.id === requested.machineId);
+  if (!remoteAgent) {
+    return {
+      status: 'error',
+      statusCode: 404,
+      code: 'REMOTE_MACHINE_NOT_CONFIGURED',
+      message: `Remote machine not configured: ${requested.machineId}`,
+    };
+  }
+  return {
+    status: 'found',
+    target: { kind: 'remote', identity: requested, remoteAgent },
+  };
+}
+
+function sendJobRouteResolutionError(reply: FastifyReply, resolution: Extract<JobRouteResolution, { status: 'error' }>) {
+  return reply.code(resolution.statusCode).send({
+    error: resolution.message,
+    code: resolution.code,
+    ...(resolution.details ?? {}),
+  });
+}
+
+function remoteJobResponseMatchesIdentity(payload: unknown, identity: JobIdentity): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  const record = payload as {
+    job?: CodexResumeJob;
+    followupJob?: CodexResumeJob;
+    outcome?: {
+      jobId?: string;
+      machineId?: string;
+      agent?: AgentKind;
+      sessionId?: string;
+    };
+    jobId?: string;
+    sessionId?: string;
+    agent?: AgentKind;
+  };
+  let matchedPrimaryIdentity = false;
+  if (record.job) {
+    if (!jobMatchesIdentity(record.job, identity)) return false;
+    matchedPrimaryIdentity = true;
+  }
+  if (record.outcome) {
+    if (!(
+      (record.outcome.jobId ?? record.jobId) === identity.jobId &&
+      record.outcome.machineId === identity.machineId &&
+      record.outcome.agent === identity.agent &&
+      (record.outcome.sessionId ?? record.sessionId) === identity.sessionId
+    )) {
+      return false;
+    }
+    matchedPrimaryIdentity = true;
+  }
+  if (record.followupJob) {
+    const followupIdentity = bindRemoteJobToSource(
+      { id: identity.machineId, baseUrl: '', token: null },
+      record.followupJob,
+    );
+    if (
+      !followupIdentity ||
+      followupIdentity.agent !== identity.agent ||
+      followupIdentity.sessionId !== identity.sessionId
+    ) {
+      return false;
+    }
+  }
+  return matchedPrimaryIdentity;
+}
+
+function sendRemoteJobError(reply: FastifyReply, error: unknown, machineId: string) {
+  if (error instanceof RemoteAgentHttpError) {
+    const body = error.body && typeof error.body === 'object'
+      ? error.body as { error?: unknown; code?: unknown }
+      : {};
+    return reply.code(error.status).send({
+      error: typeof body.error === 'string' ? body.error : error.message,
+      ...(typeof body.code === 'string' ? { code: body.code } : {}),
+    });
+  }
+  return reply.code(502).send({
+    error: error instanceof Error ? error.message : `Remote job request failed: ${machineId}`,
+    code: 'REMOTE_JOB_REQUEST_FAILED',
+  });
+}
+
+async function proxyRemoteJobGet(
+  reply: FastifyReply,
+  target: Extract<JobRouteTarget, { kind: 'remote' }>,
+  suffix: string,
+  extra: Record<string, string | number | undefined> = {},
+) {
+  try {
+    const payload = await fetchAgentJson<unknown>(
+      target.remoteAgent,
+      `/api/hermes/jobs/${encodeURIComponent(target.identity.jobId)}${suffix}?${jobIdentitySearchParams(target.identity, extra).toString()}`,
+    );
+    if (!remoteJobResponseMatchesIdentity(payload, target.identity)) {
+      return reply.code(502).send({
+        error: `Remote job identity mismatch: ${target.identity.jobId}`,
+        code: 'REMOTE_JOB_IDENTITY_MISMATCH',
+      });
+    }
+    return payload;
+  } catch (error) {
+    return sendRemoteJobError(reply, error, target.identity.machineId);
+  }
+}
+
+async function proxyRemoteJobPost(
+  reply: FastifyReply,
+  target: Extract<JobRouteTarget, { kind: 'remote' }>,
+  suffix: string,
+  body: unknown,
+) {
+  try {
+    const payload = await postAgentJson<unknown>(
+      target.remoteAgent,
+      `/api/hermes/jobs/${encodeURIComponent(target.identity.jobId)}${suffix}?${jobIdentitySearchParams(target.identity).toString()}`,
+      body,
+    );
+    if (!remoteJobResponseMatchesIdentity(payload, target.identity)) {
+      return reply.code(502).send({
+        error: `Remote job identity mismatch: ${target.identity.jobId}`,
+        code: 'REMOTE_JOB_IDENTITY_MISMATCH',
+      });
+    }
+    return payload;
+  } catch (error) {
+    return sendRemoteJobError(reply, error, target.identity.machineId);
+  }
+}
+
 async function fetchRemoteJobRegistryCached(agent: (typeof remoteAgents)[number]): Promise<{
   jobs: Array<{ machineId: string; baseUrl: string | null; job: CodexResumeJob }>;
   health: { machineId: string; baseUrl: string; healthy: boolean; updatedAt: string; cached: boolean; error: string | null };
@@ -2612,13 +3025,18 @@ async function fetchRemoteJobRegistryCached(agent: (typeof remoteAgents)[number]
     const payload = await fetchAgentJson<{
       jobs?: Array<{ machineId?: string; baseUrl?: string | null; job?: CodexResumeJob }>;
     }>(agent, '/api/hermes/job-registry?remote=0');
-    const jobs = (payload.jobs ?? [])
-      .filter((item) => item.job)
-      .map((item) => ({
-        machineId: item.machineId || item.job?.machineId || agent.id,
-        baseUrl: item.baseUrl ?? agent.baseUrl,
-        job: item.job as CodexResumeJob,
-      }));
+    if (!Array.isArray(payload.jobs)) throw new Error(`Invalid remote job registry from ${agent.id}`);
+    const jobs = payload.jobs
+      .flatMap((item) => {
+        const job = item && typeof item === 'object' && item.job
+          ? bindRemoteJobToSource(agent, item.job)
+          : null;
+        return job ? [{
+          machineId: agent.id,
+          baseUrl: typeof item.baseUrl === 'string' ? item.baseUrl : agent.baseUrl,
+          job,
+        }] : [];
+      });
     const updatedAt = new Date().toISOString();
     remoteJobRegistryCache.set(agent.id, {
       expiresAt: now + ttlMs,
@@ -2634,7 +3052,13 @@ async function fetchRemoteJobRegistryCached(agent: (typeof remoteAgents)[number]
   } catch (error) {
     try {
       const fallback = await fetchAgentJson<{ jobs?: CodexResumeJob[] }>(agent, '/api/hermes/jobs');
-      const jobs = (fallback.jobs ?? []).map((job) => ({ machineId: job.machineId || agent.id, baseUrl: agent.baseUrl, job }));
+      if (!Array.isArray(fallback.jobs)) {
+        throw new Error(`Invalid remote job registry from ${agent.id}`, { cause: error });
+      }
+      const jobs = fallback.jobs.flatMap((item) => {
+        const job = bindRemoteJobToSource(agent, item);
+        return job ? [{ machineId: agent.id, baseUrl: agent.baseUrl, job }] : [];
+      });
       const updatedAt = new Date().toISOString();
       remoteJobRegistryCache.set(agent.id, {
         expiresAt: now + ttlMs,
@@ -3963,15 +4387,35 @@ app.post('/api/hermes/jobs/resume', async (request, reply) => {
       return reply.code(404).send({ error: `Remote machine not configured: ${resolution.session.machineId}` });
     }
     try {
-      return await postAgentJson(remoteAgent, '/api/hermes/jobs/resume?remote=0', {
+      const payload = await postAgentJson<{ job?: CodexResumeJob }>(
+        remoteAgent,
+        '/api/hermes/jobs/resume?remote=0',
+        {
         ...body,
         machineId: resolution.session.machineId,
         agent: resolution.session.agent,
-      });
+        },
+      );
+      const remoteJob = payload.job
+        ? bindRemoteJobToSource(remoteAgent, payload.job)
+        : null;
+      if (
+        !remoteJob ||
+        remoteJob.sessionId !== resolution.session.id ||
+        remoteJob.agent !== resolution.session.agent
+      ) {
+        return reply.code(502).send({
+          error: `Remote job identity mismatch: ${resolution.session.id}`,
+          code: 'REMOTE_JOB_IDENTITY_MISMATCH',
+        });
+      }
+      return {
+        ...payload,
+        job: remoteJob,
+        nextAction: `Poll ${jobPollPath(remoteJob)} until status is completed, failed, or stopped.`,
+      };
     } catch (error) {
-      return reply.code(502).send({
-        error: error instanceof Error ? error.message : `Remote resume failed: ${resolution.session.machineId}`,
-      });
+      return sendRemoteJobError(reply, error, resolution.session.machineId);
     }
   }
 
@@ -4151,7 +4595,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     }
     try {
       const remotePayload = await postAgentJson<{
-        job?: unknown;
+        job?: CodexResumeJob;
       }>(remoteAgent, '/api/hermes/jobs/resume?remote=0', {
         sessionId: selectedSession.id,
         machineId: selectedSession.machineId,
@@ -4165,22 +4609,32 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
         policyProfile: body.policyProfile,
         template: body.template,
       });
+      const remoteJob = remotePayload.job
+        ? bindRemoteJobToSource(remoteAgent, remotePayload.job)
+        : null;
+      if (
+        !remoteJob ||
+        remoteJob.sessionId !== selectedSession.id ||
+        remoteJob.agent !== selectedSession.agent
+      ) {
+        return reply.code(502).send({
+          error: `Remote job identity mismatch: ${selectedSession.id}`,
+          code: 'REMOTE_JOB_IDENTITY_MISMATCH',
+        });
+      }
       return {
         status: 'started',
         ...remotePayload,
+        job: remoteJob,
         routedTo: remoteAgent.id,
         query: body.query,
         selectedSession: selected,
         contextPack,
         candidates,
-        nextAction: remotePayload.job && typeof remotePayload.job === 'object' && 'id' in remotePayload.job
-          ? `Poll /api/hermes/jobs/${String((remotePayload.job as { id?: unknown }).id)} until status is completed, failed, or stopped.`
-          : 'Poll the remote job registry for completion.',
+        nextAction: `Poll ${jobPollPath(remoteJob)} until status is completed, failed, or stopped.`,
       };
     } catch (error) {
-      return reply.code(502).send({
-        error: error instanceof Error ? error.message : `Failed to dispatch session ${selected.id} to ${remoteAgent.id}`,
-      });
+      return sendRemoteJobError(reply, error, remoteAgent.id);
     }
   }
 
@@ -4220,7 +4674,7 @@ app.post('/api/hermes/dispatch', async (request, reply) => {
     contextPack,
     candidates,
     job,
-    nextAction: `Poll /api/hermes/jobs/${job.id} until status is completed, failed, or stopped.`,
+    nextAction: `Poll ${jobPollPath(job)} until status is completed, failed, or stopped.`,
   };
 });
 
@@ -4230,11 +4684,18 @@ app.get('/api/hermes/job-registry', async (request) => {
   const query = remoteControlSchema.parse(request.query);
   const includeRemote = query.remote !== '0' && query.remote !== 'false';
   const meta = service.getMeta();
-  const jobs: Array<{ machineId: string; baseUrl: string | null; job: CodexResumeJob }> = listCodexResumeJobs().map((job) => ({
-    machineId: job.machineId || meta.machineId,
-    baseUrl: null,
-    job,
-  }));
+  const jobs: Array<{ machineId: string; baseUrl: string | null; job: CodexResumeJob }> = listCodexResumeJobs()
+    .filter((job) =>
+      job.agentVerified === true &&
+      (job.agent === 'codex' || job.agent === 'claude') &&
+      Boolean(job.sessionId) &&
+      job.machineId === meta.machineId
+    )
+    .map((job) => ({
+      machineId: meta.machineId,
+      baseUrl: null,
+      job,
+    }));
   const errors: Array<{ machineId: string; baseUrl: string; error: string }> = [];
   const health: Array<{ machineId: string; baseUrl: string; healthy: boolean; updatedAt: string; cached: boolean; error: string | null }> = [];
 
@@ -4259,28 +4720,25 @@ app.get('/api/hermes/job-registry', async (request) => {
 
 app.get('/api/hermes/jobs/:id', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const job = getCodexResumeJob(params.id);
-  if (!job) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}?remote=0`);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, false);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobGet(reply, resolution.target, '');
   }
+  const job = getCodexResumeJob(params.id);
+  if (!job) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
   return { job };
 });
 
 app.get('/api/hermes/jobs/:id/outcome', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, false);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobGet(reply, resolution.target, '/outcome');
+  }
   const liveJob = getCodexResumeJob(params.id);
   if (liveJob) {
     return {
@@ -4290,19 +4748,8 @@ app.get('/api/hermes/jobs/:id/outcome', async (request, reply) => {
       job: liveJob,
     };
   }
-  const stored = await service.findJobOutcome(params.id);
-  if (!stored) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await fetchAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/outcome?remote=0`);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job outcome not found' });
-  }
+  const stored = await service.findJobOutcome(params.id, resolution.target.identity);
+  if (!stored) return reply.code(404).send({ error: 'Job outcome not found', code: 'JOB_NOT_FOUND' });
   return { jobId: params.id, ...stored };
 });
 
@@ -4360,23 +4807,13 @@ app.get('/api/hermes/jobs/:id/events', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = jobEventsQuerySchema.parse(request.query);
   const afterSeq = query.afterSeq ?? 0;
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const job = getCodexResumeJob(params.id);
-  if (!job) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await fetchAgentJson(
-            agent,
-            `/api/hermes/jobs/${encodeURIComponent(params.id)}/events?afterSeq=${afterSeq}&remote=0`
-          );
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
+  const resolution = await resolveJobTarget(params.id, query, false);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobGet(reply, resolution.target, '/events', { afterSeq });
   }
+  const job = getCodexResumeJob(params.id);
+  if (!job) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
   const events = listCodexJobEvents(params.id, afterSeq);
   return {
     jobId: params.id,
@@ -4390,8 +4827,16 @@ app.get('/api/hermes/jobs/:id/events', async (request, reply) => {
 app.get('/api/hermes/jobs/:id/events/stream', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = jobEventsQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, false);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return reply.code(501).send({
+      error: 'Remote job event streaming is unsupported; use the polling events endpoint',
+      code: 'REMOTE_JOB_EVENT_STREAM_UNSUPPORTED',
+    });
+  }
   const job = getCodexResumeJob(params.id);
-  if (!job) return reply.code(404).send({ error: 'Job not found' });
+  if (!job) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
 
   let afterSeq = query.afterSeq ?? 0;
   reply.raw.writeHead(200, {
@@ -4430,21 +4875,14 @@ app.get('/api/hermes/jobs/:id/events/stream', async (request, reply) => {
 
 app.post('/api/hermes/jobs/:id/stop', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const job = stopCodexResumeJob(params.id);
-  if (!job) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/stop?remote=0`, {});
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, true);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobPost(reply, resolution.target, '/stop', {});
   }
+  const job = stopCodexResumeJob(params.id);
+  if (!job) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
   recordCodexJobAudit(params.id, 'stop', auditMeta(request));
   await finalizeJobFacts(job, job.prompt, 'job stopped by API');
   return { job };
@@ -4453,21 +4891,14 @@ app.post('/api/hermes/jobs/:id/stop', async (request, reply) => {
 app.post('/api/hermes/jobs/:id/protocol', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = jobProtocolSchema.parse(request.body ?? {});
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const localJob = getCodexResumeJob(params.id);
-  if (!localJob) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/protocol?remote=0`, body);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, true);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobPost(reply, resolution.target, '/protocol', body);
   }
+  const localJob = getCodexResumeJob(params.id);
+  if (!localJob) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
 
   const protocolText = body.text.trim() || {
     continue: '继续当前任务，按既定目标完成并报告验证结果。',
@@ -4499,21 +4930,14 @@ app.post('/api/hermes/jobs/:id/protocol', async (request, reply) => {
 app.post('/api/hermes/jobs/:id/guidance', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = jobGuidanceSchema.parse(request.body ?? {});
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
-  const job = sendCodexJobGuidance(params.id, body.text, body.source ?? 'hermes');
-  if (!job) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/guidance?remote=0`, body);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, true);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobPost(reply, resolution.target, '/guidance', body);
   }
+  const job = sendCodexJobGuidance(params.id, body.text, body.source ?? 'hermes');
+  if (!job) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
   recordCodexJobAudit(params.id, 'guidance', {
     ...auditMeta(request),
     source: body.source ?? 'hermes',
@@ -4525,8 +4949,12 @@ app.post('/api/hermes/jobs/:id/guidance', async (request, reply) => {
 app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const body = jobSupervisorSchema.parse(request.body ?? {});
-  const query = remoteControlSchema.parse(request.query);
-  const allowRemote = query.remote !== '0' && query.remote !== 'false';
+  const query = jobRouteQuerySchema.parse(request.query);
+  const resolution = await resolveJobTarget(params.id, query, true);
+  if (resolution.status === 'error') return sendJobRouteResolutionError(reply, resolution);
+  if (resolution.target.kind === 'remote') {
+    return proxyRemoteJobPost(reply, resolution.target, '/supervise', body);
+  }
   const localSessions = body.autoRetry ? await getStateSessionsForHermes() : [];
   const superviseInput = {
     id: params.id,
@@ -4569,18 +4997,7 @@ app.post('/api/hermes/jobs/:id/supervise', async (request, reply) => {
     },
   };
   const result = superviseCodexResumeJob(superviseInput);
-  if (!result) {
-    if (allowRemote) {
-      for (const agent of remoteAgents) {
-        try {
-          return await postAgentJson(agent, `/api/hermes/jobs/${encodeURIComponent(params.id)}/supervise?remote=0`, body);
-        } catch {
-          // Try the next remote agent.
-        }
-      }
-    }
-    return reply.code(404).send({ error: 'Job not found' });
-  }
+  if (!result) return reply.code(404).send({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
   recordCodexJobAudit(params.id, 'supervise', {
     ...auditMeta(request),
     autoStop: body.autoStop,

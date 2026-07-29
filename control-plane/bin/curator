@@ -607,6 +607,26 @@ def add_common_output_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="print raw JSON response")
 
 
+def add_job_identity_flags(parser: argparse.ArgumentParser, *, required: bool = False) -> None:
+    parser.add_argument("--machine-id", required=required, help="target job machine identity")
+    parser.add_argument("--agent", choices=["codex", "claude"], required=required, help="target job session agent")
+    parser.add_argument("--session-id", required=required, help="target job session identity")
+
+
+def job_identity_params(args: argparse.Namespace, *, required: bool = False) -> dict[str, str] | None:
+    identity = {
+        "machineId": args.machine_id,
+        "agent": args.agent,
+        "sessionId": args.session_id,
+    }
+    provided = sum(value is not None for value in identity.values())
+    if provided == 0 and not required:
+        return None
+    if provided != len(identity):
+        raise CuratorError("--machine-id, --agent, and --session-id must be provided together")
+    return identity
+
+
 def add_direct_action_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser("direct-action", help="record Commander direct actions")
     action_sub = p.add_subparsers(dest="direct_action_command", required=True)
@@ -788,32 +808,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("job", help="inspect a job")
     p.add_argument("job_id")
+    add_job_identity_flags(p)
     add_common_output_flags(p)
 
     p = sub.add_parser("events", help="read job events")
     p.add_argument("job_id")
     p.add_argument("--after-seq", type=int, default=0)
     p.add_argument("--no-remote", action="store_true")
+    add_job_identity_flags(p)
     add_common_output_flags(p)
 
     p = sub.add_parser("outcome", help="read a job outcome")
     p.add_argument("job_id")
+    add_job_identity_flags(p)
     add_common_output_flags(p)
 
     p = sub.add_parser("stop", help="stop a job")
     p.add_argument("job_id")
+    add_job_identity_flags(p, required=True)
     add_common_output_flags(p)
 
     p = sub.add_parser("guide", help="send guidance to a running PTY job or record guidance on an exec job")
     p.add_argument("job_id")
     p.add_argument("text")
     p.add_argument("--source", choices=["hermes", "supervisor", "api"], default="api")
+    add_job_identity_flags(p, required=True)
     add_common_output_flags(p)
 
     p = sub.add_parser("protocol", help="send a structured worker protocol command")
     p.add_argument("job_id")
     p.add_argument("kind", choices=["guide", "pause", "continue", "summarize", "handoff", "verify"])
     p.add_argument("text", nargs="?")
+    add_job_identity_flags(p, required=True)
     add_common_output_flags(p)
 
     p = sub.add_parser("supervise", help="run one supervisor check for a job")
@@ -824,6 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--semantic", action="store_true")
     p.add_argument("--check-interval-ms", type=int)
     p.add_argument("--stale-output-ms", type=int)
+    add_job_identity_flags(p, required=True)
     add_common_output_flags(p)
 
     p = sub.add_parser("refresh", help="enqueue AI re-evaluation for a session")
@@ -983,25 +1010,57 @@ def main(argv: list[str] | None = None) -> int:
             data = request_json("GET", "/api/hermes/job-registry", {"remote": "0" if args.no_remote else None})
             print_json(data)
         elif args.command == "job":
-            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}")
+            data = request_json(
+                "GET",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}",
+                job_identity_params(args),
+            )
             print_json(data) if args.json else print_job(data)
         elif args.command == "events":
-            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/events", {"afterSeq": args.after_seq, "remote": "0" if args.no_remote else None})
+            identity = job_identity_params(args) or {}
+            data = request_json(
+                "GET",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/events",
+                {
+                    "afterSeq": args.after_seq,
+                    "remote": "0" if args.no_remote else None,
+                    **identity,
+                },
+            )
             print_json(data)
         elif args.command == "outcome":
-            data = request_json("GET", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/outcome")
+            data = request_json(
+                "GET",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/outcome",
+                job_identity_params(args),
+            )
             print_json(data)
         elif args.command == "stop":
-            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/stop", body={})
+            data = request_json(
+                "POST",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/stop",
+                job_identity_params(args, required=True),
+                {},
+            )
             print_json(data) if args.json else print_job(data)
         elif args.command == "guide":
-            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/guidance", body={"text": args.text, "source": args.source})
+            data = request_json(
+                "POST",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/guidance",
+                job_identity_params(args, required=True),
+                {"text": args.text, "source": args.source},
+            )
             print_json(data) if args.json else print_job(data)
         elif args.command == "protocol":
             body = {"kind": args.kind}
             if args.text:
                 body["text"] = args.text
-            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/protocol", body=body)
+            data = request_json(
+                "POST",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/protocol",
+                job_identity_params(args, required=True),
+                body,
+            )
             print_json(data)
         elif args.command == "supervise":
             body = {
@@ -1012,7 +1071,12 @@ def main(argv: list[str] | None = None) -> int:
                 "checkIntervalMs": args.check_interval_ms,
                 "staleOutputMs": args.stale_output_ms,
             }
-            data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/supervise", body={k: v for k, v in body.items() if v is not None})
+            data = request_json(
+                "POST",
+                f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/supervise",
+                job_identity_params(args, required=True),
+                {k: v for k, v in body.items() if v is not None},
+            )
             print_json(data)
         elif args.command == "refresh":
             data = request_json(

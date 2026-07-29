@@ -7,7 +7,7 @@ import importlib.machinery
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -321,6 +321,149 @@ class CuratorCliTests(unittest.TestCase):
                 "agent": "claude",
             },
         )
+
+    def test_job_read_commands_forward_complete_identity_or_allow_none(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {}
+
+        identity = [
+            "--machine-id", "sgp001",
+            "--agent", "claude",
+            "--session-id", "shared-session",
+        ]
+        cases = [
+            (
+                ["job", "job/one", *identity, "--json"],
+                ("GET", "/api/hermes/jobs/job%2Fone", {
+                    "machineId": "sgp001",
+                    "agent": "claude",
+                    "sessionId": "shared-session",
+                }, None),
+            ),
+            (
+                ["events", "job/one", "--after-seq", "7", "--no-remote", *identity],
+                ("GET", "/api/hermes/jobs/job%2Fone/events", {
+                    "afterSeq": 7,
+                    "remote": "0",
+                    "machineId": "sgp001",
+                    "agent": "claude",
+                    "sessionId": "shared-session",
+                }, None),
+            ),
+            (
+                ["outcome", "job/one", *identity],
+                ("GET", "/api/hermes/jobs/job%2Fone/outcome", {
+                    "machineId": "sgp001",
+                    "agent": "claude",
+                    "sessionId": "shared-session",
+                }, None),
+            ),
+            (
+                ["job", "job-one", "--json"],
+                ("GET", "/api/hermes/jobs/job-one", None, None),
+            ),
+            (
+                ["events", "job-one"],
+                ("GET", "/api/hermes/jobs/job-one/events", {
+                    "afterSeq": 0,
+                    "remote": None,
+                }, None),
+            ),
+            (
+                ["outcome", "job-one"],
+                ("GET", "/api/hermes/jobs/job-one/outcome", None, None),
+            ),
+        ]
+
+        self.cli.request_json = fake_request_json
+        for argv, expected in cases:
+            with self.subTest(argv=argv), redirect_stdout(StringIO()):
+                calls.clear()
+                self.assertEqual(self.cli.main(argv), 0)
+                self.assertEqual(calls, [expected])
+
+    def test_job_read_commands_reject_partial_identity(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {}
+
+        self.cli.request_json = fake_request_json
+        for command in ("job", "events", "outcome"):
+            with self.subTest(command=command), redirect_stderr(StringIO()):
+                self.assertEqual(
+                    self.cli.main([command, "job-one", "--machine-id", "sgp001"]),
+                    1,
+                )
+                self.assertEqual(calls, [])
+
+    def test_job_mutations_forward_required_composite_identity(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None):
+            calls.append((method, path, params, body))
+            return {}
+
+        identity = [
+            "--machine-id", "sgp001",
+            "--agent", "codex",
+            "--session-id", "shared-session",
+        ]
+        params = {
+            "machineId": "sgp001",
+            "agent": "codex",
+            "sessionId": "shared-session",
+        }
+        cases = [
+            (
+                ["stop", "job/one", *identity, "--json"],
+                ("POST", "/api/hermes/jobs/job%2Fone/stop", params, {}),
+            ),
+            (
+                ["guide", "job/one", "stay scoped", *identity, "--json"],
+                ("POST", "/api/hermes/jobs/job%2Fone/guidance", params, {
+                    "text": "stay scoped",
+                    "source": "api",
+                }),
+            ),
+            (
+                ["protocol", "job/one", "verify", "run checks", *identity],
+                ("POST", "/api/hermes/jobs/job%2Fone/protocol", params, {
+                    "kind": "verify",
+                    "text": "run checks",
+                }),
+            ),
+            (
+                ["supervise", "job/one", "--auto-retry", *identity],
+                ("POST", "/api/hermes/jobs/job%2Fone/supervise", params, {
+                    "autoRetry": True,
+                }),
+            ),
+        ]
+
+        self.cli.request_json = fake_request_json
+        for argv, expected in cases:
+            with self.subTest(argv=argv), redirect_stdout(StringIO()):
+                calls.clear()
+                self.assertEqual(self.cli.main(argv), 0)
+                self.assertEqual(calls, [expected])
+
+    def test_job_mutations_require_complete_identity(self) -> None:
+        cases = [
+            ["stop", "job-one"],
+            ["guide", "job-one", "stay scoped"],
+            ["protocol", "job-one", "verify"],
+            ["supervise", "job-one"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.cli.build_parser().parse_args(argv)
+                self.assertEqual(raised.exception.code, 2)
 
     def test_knowledge_search_uses_expected_endpoint_and_params(self) -> None:
         calls = []

@@ -129,6 +129,70 @@ function remoteUrl(agent: RemoteAgent, path: string): URL {
   return url;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeRemoteSession(
+  agent: RemoteAgent,
+  value: unknown,
+  location: string,
+): CodexSession {
+  if (!isRecord(value) || typeof value.id !== 'string' || !value.id.trim()) {
+    throw new Error(`Invalid remote session from ${agent.id} at ${location}`);
+  }
+  if (value.agent !== 'codex' && value.agent !== 'claude') {
+    throw new Error(`Invalid remote session Agent from ${agent.id} at ${location}`);
+  }
+  return {
+    ...value,
+    agent: value.agent,
+    machineId: agent.id,
+  } as unknown as CodexSession;
+}
+
+function normalizeRemoteAgentPayload<T>(
+  agent: RemoteAgent,
+  payload: unknown,
+  options: { requireSessions?: boolean } = {},
+): T {
+  if (!isRecord(payload)) {
+    if (options.requireSessions) throw new Error(`Invalid remote sessions payload from ${agent.id}`);
+    return payload as T;
+  }
+
+  const hasSessions = Object.prototype.hasOwnProperty.call(payload, 'sessions');
+  if (options.requireSessions && !Array.isArray(payload.sessions)) {
+    throw new Error(`Invalid remote sessions payload from ${agent.id}`);
+  }
+
+  let normalized: Record<string, unknown> = payload;
+  if (hasSessions) {
+    if (!Array.isArray(payload.sessions)) {
+      throw new Error(`Invalid remote sessions payload from ${agent.id}`);
+    }
+    normalized = {
+      ...normalized,
+      sessions: payload.sessions.map((session, index) =>
+        normalizeRemoteSession(agent, session, `sessions[${index}]`)
+      ),
+    };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'session')) {
+    normalized = {
+      ...normalized,
+      session: normalizeRemoteSession(agent, payload.session, 'session'),
+    };
+  }
+
+  return normalized as T;
+}
+
+function isSessionCollectionPath(path: string): boolean {
+  return new URL(path, 'http://curator-remote.invalid').pathname === '/api/sessions';
+}
+
 export async function fetchAgentSessions(agent: RemoteAgent): Promise<CodexSession[]> {
   try {
     const response = await fetchWithTimeout(
@@ -137,8 +201,12 @@ export async function fetchAgentSessions(agent: RemoteAgent): Promise<CodexSessi
       { headers: remoteHeaders(agent) },
     );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = (await response.json()) as { sessions?: CodexSession[] };
-    return (payload.sessions ?? []).map((session) => ({ ...session, machineId: session.machineId || agent.id }));
+    const payload = normalizeRemoteAgentPayload<{ sessions: CodexSession[] }>(
+      agent,
+      await response.json(),
+      { requireSessions: true },
+    );
+    return payload.sessions;
   } catch (error) {
     console.warn('[RemoteAgents] Failed to fetch sessions:', agent.id, error instanceof Error ? error.message : error);
     return [];
@@ -182,8 +250,15 @@ export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promi
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     { headers: remoteHeaders(agent) },
   );
-  if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
-  return (await response.json()) as T;
+  if (!response.ok) {
+    const responseBody = await response.json().catch(() => null) as unknown;
+    throw new RemoteAgentHttpError(agent.id, response.status, responseBody);
+  }
+  return normalizeRemoteAgentPayload<T>(
+    agent,
+    await response.json(),
+    { requireSessions: isSessionCollectionPath(path) },
+  );
 }
 
 export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: unknown): Promise<T> {

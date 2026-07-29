@@ -201,23 +201,65 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
           id: `remote-job-${remoteCalls.length}`,
           sessionId,
           machineId: 'sgp001',
+          agent: 'claude',
+          agentVerified: true,
           status: 'running',
         },
       }));
       return;
     }
-    if (
-      url.pathname.startsWith('/api/hermes/jobs/remote-only-job') &&
-      (
-        incoming.method === 'GET' ||
-        (incoming.method === 'POST' && /\/(?:stop|guidance|supervise)$/.test(url.pathname))
-      )
-    ) {
+    const remoteJobIds = [
+      'remote-only-job-detail',
+      'remote-only-job-events',
+      'remote-only-job-outcome',
+      'remote-only-job-stop',
+      'remote-only-job-guidance',
+      'remote-only-job-protocol',
+      'remote-only-job-supervise',
+    ];
+    if (incoming.method === 'GET' && url.pathname === '/api/hermes/jobs') {
       response.end(JSON.stringify({
-        remoteMarker: true,
-        query: url.search,
-        method: incoming.method,
+        jobs: remoteJobIds.map((id) => ({
+          id,
+          sessionId,
+          machineId: 'sgp001',
+          agent: 'claude',
+          agentVerified: true,
+          status: 'running',
+        })),
       }));
+      return;
+    }
+    const remoteJobId = remoteJobIds.find((id) =>
+      url.pathname === `/api/hermes/jobs/${id}` ||
+      url.pathname.startsWith(`/api/hermes/jobs/${id}/`)
+    );
+    if (remoteJobId) {
+      const job = {
+        id: remoteJobId,
+        sessionId,
+        machineId: 'sgp001',
+        agent: 'claude',
+        agentVerified: true,
+        status: 'running',
+      };
+      if (url.pathname.endsWith('/outcome')) {
+        response.end(JSON.stringify({
+          jobId: remoteJobId,
+          sessionId,
+          agent: 'claude',
+          outcome: {
+            jobId: remoteJobId,
+            sessionId,
+            machineId: 'sgp001',
+            agent: 'claude',
+          },
+        }));
+      } else if (url.pathname.endsWith('/events')) {
+        response.end(JSON.stringify({ jobId: remoteJobId, events: [], job }));
+      } else {
+        response.end(JSON.stringify({ job }));
+      }
       return;
     }
     if (incoming.method === 'GET' && url.pathname === `/api/sessions/${sessionId}/outcome`) {
@@ -410,37 +452,72 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
       'CLAUDE_SESSION_MIGRATION_UNSUPPORTED',
     );
 
-    const jobFallbackRequests: Array<[string, RequestInit | undefined]> = [
+    const legacyJobReadRequests: Array<[string, RequestInit | undefined]> = [
       ['/api/hermes/jobs/remote-only-job-detail', undefined],
+      ['/api/hermes/jobs/remote-only-job-events/events', undefined],
       ['/api/hermes/jobs/remote-only-job-outcome/outcome', undefined],
+    ];
+    for (const [path, init] of legacyJobReadRequests) {
+      const proxied = await request(baseUrl, path, init);
+      assert.equal(proxied.status, 200, `${path} should resolve one verified remote identity`);
+    }
+
+    const rawJobMutationRequests: Array<[string, RequestInit]> = [
       ['/api/hermes/jobs/remote-only-job-stop/stop', { method: 'POST', body: '{}' }],
       ['/api/hermes/jobs/remote-only-job-guidance/guidance', {
         method: 'POST',
         body: JSON.stringify({ text: 'single hop guidance' }),
+      }],
+      ['/api/hermes/jobs/remote-only-job-protocol/protocol', {
+        method: 'POST',
+        body: JSON.stringify({ kind: 'verify' }),
       }],
       ['/api/hermes/jobs/remote-only-job-supervise/supervise', {
         method: 'POST',
         body: '{}',
       }],
     ];
-    for (const [path, init] of jobFallbackRequests) {
-      const proxied = await request(baseUrl, path, init);
-      assert.equal(proxied.status, 200, `${path} should proxy exactly one hop`);
-      assert.equal(proxied.payload.remoteMarker, true);
-      assert.equal(proxied.payload.query, '?remote=0');
+    const callsBeforeRawMutations = remoteCalls.length;
+    for (const [path, init] of rawJobMutationRequests) {
+      const rejected = await request(baseUrl, path, init);
+      assert.equal(rejected.status, 400, `${path} must require a composite identity`);
+      assert.equal(rejected.payload.code, 'JOB_IDENTITY_REQUIRED');
     }
-    const fallbackCalls = remoteCalls.filter((call) => call.path.startsWith('/api/hermes/jobs/remote-only-job'));
-    assert.equal(fallbackCalls.length, jobFallbackRequests.length);
+    assert.equal(remoteCalls.length, callsBeforeRawMutations);
 
-    for (const [path, init] of jobFallbackRequests) {
-      const separator = path.includes('?') ? '&' : '?';
-      const fenced = await request(baseUrl, `${path}${separator}remote=0`, init);
-      assert.equal(fenced.status, 404, `${path}?remote=0 must not fan out`);
+    const jobIdentityQuery = new URLSearchParams({
+      machineId: 'sgp001',
+      agent: 'claude',
+      sessionId,
+    }).toString();
+    for (const [path, init] of rawJobMutationRequests) {
+      const callsBeforeMutation = remoteCalls.length;
+      const proxied = await request(baseUrl, `${path}?${jobIdentityQuery}`, init);
+      assert.equal(proxied.status, 200, `${path} should proxy exactly one explicit target`);
+      assert.equal(remoteCalls.length, callsBeforeMutation + 1);
+      const call = remoteCalls.at(-1);
+      const forwarded = new URLSearchParams(call?.query ?? '');
+      assert.equal(forwarded.get('machineId'), 'sgp001');
+      assert.equal(forwarded.get('agent'), 'claude');
+      assert.equal(forwarded.get('sessionId'), sessionId);
+      assert.equal(forwarded.get('remote'), '0');
     }
-    assert.equal(
-      remoteCalls.filter((call) => call.path.startsWith('/api/hermes/jobs/remote-only-job')).length,
-      fallbackCalls.length,
+
+    const partialIdentity = await request(
+      baseUrl,
+      '/api/hermes/jobs/remote-only-job-detail?machineId=sgp001',
     );
+    assert.equal(partialIdentity.status, 400);
+    assert.equal(partialIdentity.payload.code, 'INCOMPLETE_JOB_IDENTITY');
+
+    const callsBeforeFence = remoteCalls.length;
+    const fenced = await request(
+      baseUrl,
+      `/api/hermes/jobs/remote-only-job-detail?${jobIdentityQuery}&remote=0`,
+    );
+    assert.equal(fenced.status, 404);
+    assert.equal(fenced.payload.code, 'REMOTE_JOB_ROUTING_DISABLED');
+    assert.equal(remoteCalls.length, callsBeforeFence);
 
     remoteSessionInventoryAvailable = false;
     const unavailable = await request(
