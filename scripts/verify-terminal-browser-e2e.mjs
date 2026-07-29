@@ -341,9 +341,9 @@ async function main() {
     const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
-    sessionId,
-    machineId,
-    agent,
+      sessionId,
+      machineId,
+      agent,
       sshTarget: sshTarget || null,
       sshCommand: sshTarget ? sshCommand : null,
       baseUrl,
