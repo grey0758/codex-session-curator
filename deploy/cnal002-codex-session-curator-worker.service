@@ -1,5 +1,5 @@
 [Unit]
-Description=Codex and Claude Curator thin worker canary on us002
+Description=Codex and Claude Curator thin worker on cnal002
 After=network-online.target
 Wants=network-online.target
 
@@ -15,20 +15,26 @@ Environment=CLAUDE_CONFIG_DIR=/home/grey/.claude
 Environment=CODEX_CURATOR_STATE=/home/grey/.codex/session-curator-worker-state.json
 Environment=CURATOR_CODEX_JOBS_PATH=/home/grey/.codex/session-curator-worker-jobs.json
 Environment=CURATOR_RECYCLE_ROOT=/home/grey/.codex/session-curator-worker-recycle-bin
-Environment=CODEX_BIN=/home/grey/.npm-global/bin/codex
-Environment=CLAUDE_BIN=/home/grey/.npm-global/bin/claude
+Environment=CURATOR_SESSION_AUDIT_LOG=/home/grey/.codex/session-curator-worker-audit.jsonl
+Environment=CODEX_BIN=/home/grey/.local/bin/codex
+Environment=CLAUDE_BIN=/home/grey/.local/bin/claude
+Environment=CLAUDE_REAL_BIN=/home/grey/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+Environment=CLAUDE_PROVIDER_TOKEN_FILE=/home/grey/.config/claude/provider-token
 Environment=CURATOR_ROLE=worker
-Environment=CURATOR_MACHINE_ID=us002-canary
+Environment=CURATOR_MACHINE_ID=cnal002
 Environment=CURATOR_REMOTE_AGENTS=
 Environment=CURATOR_AUTO_BACKFILL_INTERVAL_MS=0
 Environment=CURATOR_EVALUATION_QUIET_MS=60000
 Environment=CURATOR_SESSION_AUDIT_PENDING_GRACE_MS=900000
 Environment=CURATOR_CODEX_SEMANTIC_SUPERVISOR_INTERVAL_MS=0
 Environment=CURATOR_SESSION_CACHE_TTL_MS=8000
+Environment=CURATOR_SESSION_AUDIT_INTERVAL_MS=300000
+Environment=CURATOR_SESSION_AUDIT_INITIAL_DELAY_MS=30000
 Environment=CURATOR_TERMINAL_TRANSPORT=local
-Environment=CURATOR_TERMINAL_TMUX_SOCKET=codex-curator-canary
+Environment=CURATOR_TERMINAL_TMUX_SOCKET=codex-curator-worker
 Environment=CURATOR_HUB_BASE_URL=http://127.0.0.1:54176
 EnvironmentFile=-/home/grey/.config/codex-session-curator/auth.env
+EnvironmentFile=-/home/grey/.config/codex-session-curator/worker-auth.env
 ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=5

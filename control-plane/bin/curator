@@ -4,19 +4,33 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:54177"
 DEFAULT_AUTH_FILE = Path.home() / ".config" / "codex-session-curator" / "auth.env"
 DEFAULT_CLIENT_FILE = Path.home() / ".config" / "codex-session-curator" / "client.env"
+DEFAULT_PROPOSAL_ROOT = Path.home() / ".local" / "share" / "curator" / "knowledge-proposals"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+LOCAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+TERMINAL_PROPOSAL_STATUSES = {"applied", "rejected", "conflict", "failed"}
 
 
 class CuratorError(RuntimeError):
@@ -43,6 +57,12 @@ def get_admin_token() -> str | None:
     return read_env_file(DEFAULT_AUTH_FILE).get("CURATOR_ADMIN_TOKEN")
 
 
+def get_proposal_apply_token() -> str | None:
+    if os.environ.get("CURATOR_PROPOSAL_APPLY_TOKEN"):
+        return os.environ["CURATOR_PROPOSAL_APPLY_TOKEN"]
+    return read_env_file(DEFAULT_AUTH_FILE).get("CURATOR_PROPOSAL_APPLY_TOKEN")
+
+
 def base_url() -> str:
     client_env = read_env_file(DEFAULT_CLIENT_FILE)
     return (
@@ -65,9 +85,17 @@ def with_query(path: str, params: dict[str, Any] | None = None) -> str:
     return f"{base_url()}{path}{'?' + encoded if encoded else ''}"
 
 
-def request_json(method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> Any:
+def request_json(
+    method: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     data = None
     headers = {"Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -99,6 +127,329 @@ def request_text(method: str, path: str, params: dict[str, Any] | None = None) -
 
 def print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def proposal_root() -> Path:
+    configured = os.environ.get("CURATOR_KNOWLEDGE_PROPOSAL_ROOT")
+    root = Path(configured).expanduser() if configured else DEFAULT_PROPOSAL_ROOT
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    return root.resolve()
+
+
+def validate_proposal_path(value: str) -> str:
+    if not value or value.startswith("/") or "\\" in value or "\0" in value:
+        raise CuratorError(f"invalid proposal path: {value or '(empty)'}")
+    pure = PurePosixPath(value)
+    if pure.as_posix() != value or any(part in ("", ".", "..") or part.startswith(".") for part in pure.parts):
+        raise CuratorError(f"proposal path must be normalized and repository-relative: {value}")
+    if value.startswith("knowledge/"):
+        if not value.endswith(".md"):
+            raise CuratorError(f"knowledge proposal files must be Markdown: {value}")
+    elif value.startswith("skills/shared/"):
+        if len(pure.parts) < 4 or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", pure.parts[2]):
+            raise CuratorError(f"invalid shared skill proposal path: {value}")
+    else:
+        raise CuratorError(f"proposal path must be under knowledge/ or skills/shared/: {value}")
+    if re.search(r"(?:^|/)(?:\.env(?:\..*)?|id_(?:rsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx|sqlite3?|db))(?:$|/)", value, re.I):
+        raise CuratorError(f"proposal path looks like secret or runtime data: {value}")
+    return value
+
+
+def find_knowledge_root(explicit: str | None = None) -> Path:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    if os.environ.get("CURATOR_KNOWLEDGE_ROOT"):
+        candidates.append(Path(os.environ["CURATOR_KNOWLEDGE_ROOT"]).expanduser())
+    candidates.extend([
+        Path.home() / "work" / "agent-knowledge-stack",
+        Path.home() / "work" / "ops-agent-knowledge-stack" / "repos" / "agent-knowledge-stack",
+        Path.home() / "work" / "agent-knowledge-stack-mirror" / "current",
+    ])
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if (resolved / "knowledge").is_dir() and (resolved / "skills" / "shared").is_dir():
+            return resolved
+    raise CuratorError("local knowledge mirror not found; set CURATOR_KNOWLEDGE_ROOT")
+
+
+def git_source_hash(root: Path) -> str:
+    try:
+        files_result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CuratorError(f"cannot enumerate canonical source files: {error}") from error
+    paths = sorted({item for item in files_result.stdout.split(b"\0") if item})
+    with tempfile.NamedTemporaryFile() as file_list:
+        for raw_path in paths:
+            relative_path = raw_path.decode("utf-8")
+            source = root / relative_path
+            if not source.exists() and not source.is_symlink():
+                continue
+            if re.search(r"(?:^|/)(?:\.env|[^/]+\.(?:env|pem|key|p12|pfx|sqlite3?|db))$", relative_path, re.I) and not relative_path.endswith(".env.example"):
+                raise CuratorError(f"refusing secret/runtime-looking source path: {relative_path}")
+            file_list.write(raw_path + b"\0")
+        file_list.flush()
+        try:
+            archive = subprocess.run(
+                [
+                    "tar", "-C", str(root), "--null", f"--files-from={file_list.name}",
+                    "--sort=name", "--mtime=UTC 1970-01-01", "--owner=0", "--group=0",
+                    "--numeric-owner", "--mode=a=rX", "-cf", "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise CuratorError(f"cannot hash canonical source: {error}") from error
+    return hashlib.sha256(archive.stdout).hexdigest()
+
+
+def knowledge_source_hash(root: Path) -> str:
+    metadata = root / ".mirror-source-hash"
+    if metadata.is_file():
+        value = metadata.read_text(encoding="utf-8").strip()
+        if SHA256_PATTERN.fullmatch(value):
+            return value
+        raise CuratorError(f"invalid mirror source hash: {metadata}")
+    if (root / ".git").exists():
+        return git_source_hash(root)
+    raise CuratorError(f"knowledge root has neither mirror metadata nor Git source: {root}")
+
+
+def proposal_machine_id(root: Path, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    client_env = read_env_file(DEFAULT_CLIENT_FILE)
+    for value in (
+        os.environ.get("CURATOR_MACHINE_ID"),
+        client_env.get("CURATOR_MACHINE_ID"),
+    ):
+        if value:
+            return value
+    mirror_target = root / ".mirror-target-machine"
+    if mirror_target.is_file():
+        value = mirror_target.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    return socket.gethostname()
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def local_proposal_directory(reference: str) -> Path:
+    candidate = Path(reference).expanduser()
+    if candidate.is_dir():
+        directory = candidate.resolve()
+    else:
+        if not LOCAL_ID_PATTERN.fullmatch(reference):
+            raise CuratorError(f"invalid local proposal ID: {reference}")
+        directory = (proposal_root() / reference).resolve()
+    try:
+        directory.relative_to(proposal_root())
+    except ValueError as error:
+        raise CuratorError(f"local proposal is outside {proposal_root()}: {directory}") from error
+    if not (directory / "proposal.json").is_file():
+        raise CuratorError(f"local proposal metadata not found: {directory / 'proposal.json'}")
+    return directory
+
+
+def initialize_local_proposal(args: argparse.Namespace) -> dict[str, Any]:
+    root = find_knowledge_root(args.knowledge_root)
+    source_hash = knowledge_source_hash(root)
+    local_id = args.local_id or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:10]}"
+    if not LOCAL_ID_PATTERN.fullmatch(local_id):
+        raise CuratorError("local proposal ID may contain only letters, numbers, dot, underscore, and hyphen")
+    directory = proposal_root() / local_id
+    if directory.exists():
+        raise CuratorError(f"local proposal already exists: {directory}")
+    files_root = directory / "files"
+    files_root.mkdir(parents=True, mode=0o700)
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for raw_path in args.paths:
+            relative_path = validate_proposal_path(raw_path)
+            if relative_path in seen:
+                raise CuratorError(f"duplicate proposal path: {relative_path}")
+            seen.add(relative_path)
+            source = root / relative_path
+            destination = files_root / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_symlink():
+                raise CuratorError(f"refusing symlink source file: {relative_path}")
+            if source.exists():
+                if not source.is_file():
+                    raise CuratorError(f"proposal source is not a regular file: {relative_path}")
+                shutil.copyfile(source, destination)
+                base_sha = sha256_path(source)
+                mode = "100755" if source.stat().st_mode & 0o111 else "100644"
+            else:
+                destination.touch(mode=0o600)
+                base_sha = None
+                mode = "100644"
+            os.chmod(destination, 0o755 if mode == "100755" else 0o644)
+            entries.append({"path": relative_path, "baseSha256": base_sha, "mode": mode})
+        metadata = {
+            "schemaVersion": 1,
+            "localId": local_id,
+            "baseSourceHash": source_hash,
+            "reason": args.reason.strip(),
+            "sourceMachineId": proposal_machine_id(root, args.machine_id),
+            "sourceSessionId": args.session_id,
+            "createdAt": utc_now(),
+            "knowledgeRoot": str(root),
+            "files": entries,
+        }
+        write_json_atomic(directory / "proposal.json", metadata)
+        return {"proposal": metadata, "directory": str(directory), "editRoot": str(files_root)}
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def read_local_proposal(reference: str) -> tuple[Path, dict[str, Any]]:
+    directory = local_proposal_directory(reference)
+    try:
+        metadata = json.loads((directory / "proposal.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CuratorError(f"invalid local proposal metadata: {error}") from error
+    if not isinstance(metadata, dict) or metadata.get("schemaVersion") != 1:
+        raise CuratorError("unsupported local proposal schema")
+    return directory, metadata
+
+
+def submit_local_proposal(args: argparse.Namespace) -> dict[str, Any]:
+    directory, metadata = read_local_proposal(args.local_id)
+    current_root = find_knowledge_root(args.knowledge_root)
+    current_source_hash = knowledge_source_hash(current_root)
+    if current_source_hash != metadata.get("baseSourceHash"):
+        raise CuratorError(
+            "local knowledge mirror changed after proposal init; create a new proposal against the current mirror"
+        )
+    delete_paths = {validate_proposal_path(path) for path in args.delete}
+    entries = metadata.get("files")
+    if not isinstance(entries, list):
+        raise CuratorError("local proposal file metadata is invalid")
+    known_paths = {entry.get("path") for entry in entries if isinstance(entry, dict)}
+    unknown_deletes = delete_paths - known_paths
+    if unknown_deletes:
+        raise CuratorError(f"--delete paths were not included at init: {', '.join(sorted(unknown_deletes))}")
+    changes: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise CuratorError("local proposal file entry is invalid")
+        relative_path = validate_proposal_path(str(entry.get("path") or ""))
+        base_sha = entry.get("baseSha256")
+        if base_sha is not None and (not isinstance(base_sha, str) or not SHA256_PATTERN.fullmatch(base_sha)):
+            raise CuratorError(f"invalid base hash in local metadata: {relative_path}")
+        base_mode = entry.get("mode")
+        if base_mode not in ("100644", "100755"):
+            raise CuratorError(f"invalid base mode in local metadata: {relative_path}")
+        if relative_path in delete_paths:
+            if base_sha is None:
+                raise CuratorError(f"cannot delete a file that did not exist at init: {relative_path}")
+            changes.append({
+                "path": relative_path,
+                "operation": "delete",
+                "baseSha256": base_sha,
+                "content": None,
+                "mode": base_mode,
+            })
+            continue
+        overlay = directory / "files" / relative_path
+        if not overlay.is_file() or overlay.is_symlink():
+            raise CuratorError(f"overlay file is missing or not regular: {overlay}")
+        try:
+            content = overlay.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise CuratorError(f"overlay file must be UTF-8 text: {relative_path}") from error
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        mode = "100755" if overlay.stat().st_mode & 0o111 else "100644"
+        if digest == base_sha and mode == base_mode:
+            continue
+        changes.append({
+            "path": relative_path,
+            "operation": "upsert",
+            "baseSha256": base_sha,
+            "content": content,
+            "mode": mode,
+        })
+    if not changes:
+        raise CuratorError("proposal overlay has no changes")
+    body = {
+        "localId": metadata.get("localId"),
+        "baseSourceHash": metadata.get("baseSourceHash"),
+        "reason": metadata.get("reason"),
+        "sourceMachineId": metadata.get("sourceMachineId"),
+        "sourceSessionId": metadata.get("sourceSessionId"),
+        "changes": changes,
+    }
+    response = request_json("POST", "/api/knowledge/proposals", body=body)
+    proposal = response.get("proposal") if isinstance(response, dict) else None
+    if isinstance(proposal, dict):
+        metadata["remoteId"] = proposal.get("id")
+        metadata["remoteStatus"] = proposal.get("status")
+        metadata["submittedAt"] = proposal.get("submittedAt") or utc_now()
+        write_json_atomic(directory / "proposal.json", metadata)
+    return {**response, "localDirectory": str(directory)} if isinstance(response, dict) else response
+
+
+def proposal_apply_headers() -> dict[str, str]:
+    token = get_proposal_apply_token()
+    if not token:
+        raise CuratorError(
+            "CURATOR_PROPOSAL_APPLY_TOKEN is unavailable; apply/reject is intentionally limited to gpl001/sgp001"
+        )
+    return {"X-Curator-Proposal-Apply-Token": token}
+
+
+def wait_for_proposal(proposal_id: str, timeout_seconds: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        response = request_json("GET", f"/api/knowledge/proposals/{urllib.parse.quote(proposal_id, safe='')}")
+        proposal = response.get("proposal") if isinstance(response, dict) else None
+        if isinstance(proposal, dict) and proposal.get("status") in TERMINAL_PROPOSAL_STATUSES:
+            return response
+        if time.monotonic() >= deadline:
+            raise CuratorError(f"timed out waiting for knowledge proposal {proposal_id}")
+        time.sleep(2)
 
 
 def print_search(data: dict[str, Any]) -> None:
@@ -275,6 +626,43 @@ def add_server_identity_parser(sub: argparse._SubParsersAction[argparse.Argument
     ssh_config.add_argument("--include-deprecated", action="store_true")
 
 
+def add_knowledge_proposal_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("knowledge-proposal", help="author locally and submit canonical knowledge changes to the Hub queue")
+    proposal_sub = p.add_subparsers(dest="knowledge_proposal_command", required=True)
+
+    init = proposal_sub.add_parser("init", help="create a writable local overlay from the read-only knowledge mirror")
+    init.add_argument("paths", nargs="+", help="repository-relative knowledge or shared-skill paths")
+    init.add_argument("--reason", required=True, help="why the canonical knowledge should change")
+    init.add_argument("--session-id", help="source Codex or Claude session ID")
+    init.add_argument("--machine-id", help="stable source machine ID; normally detected from mirror metadata")
+    init.add_argument("--local-id", help="optional stable local proposal ID")
+    init.add_argument("--knowledge-root", help="override the local read-only mirror path")
+
+    submit = proposal_sub.add_parser("submit", help="submit changed overlay files to the Curator Hub")
+    submit.add_argument("local_id", help="local proposal ID or directory")
+    submit.add_argument("--delete", action="append", default=[], help="delete an initialized path; may be repeated")
+    submit.add_argument("--knowledge-root", help="override the current local mirror path")
+
+    list_proposals = proposal_sub.add_parser("list", help="list Hub proposal queue entries")
+    list_proposals.add_argument("--status", choices=sorted(TERMINAL_PROPOSAL_STATUSES | {"pending", "applying"}))
+    list_proposals.add_argument("--machine-id")
+    list_proposals.add_argument("--limit", type=int, default=100)
+
+    show = proposal_sub.add_parser("show", help="show a Hub proposal or local overlay metadata")
+    show.add_argument("proposal_id")
+    show.add_argument("--local", action="store_true")
+
+    apply = proposal_sub.add_parser("apply", help="apply a pending proposal through the gpl001 single-writer capability")
+    apply.add_argument("proposal_id")
+    apply.add_argument("--publish", choices=["none", "workers", "fleet"], default="none")
+    apply.add_argument("--no-wait", action="store_true")
+    apply.add_argument("--timeout", type=float, default=1800)
+
+    reject = proposal_sub.add_parser("reject", help="reject a proposal through the single-writer capability")
+    reject.add_argument("proposal_id")
+    reject.add_argument("--reason", required=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control codex-session-curator from the Codex control plane.")
     parser.add_argument("--base-url", help=f"Curator base URL, default {DEFAULT_BASE_URL}")
@@ -403,10 +791,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("refresh", help="enqueue AI re-evaluation for a session")
     p.add_argument("session_id")
+    p.add_argument("--machine-id")
+    add_common_output_flags(p)
+
+    p = sub.add_parser("audit", help="inspect session discovery, indexing, search, and AI evaluation completeness")
+    p.add_argument("--session-id")
+    p.add_argument("--machine-id")
+    p.add_argument("--events", action="store_true", help="read per-session audit events instead of completeness summary")
+    p.add_argument("--local", action="store_true", help="inspect only the serving machine")
+    p.add_argument("--refresh", action="store_true", help="refresh the Hub remote-session cache before fleet comparison")
+    p.add_argument("--limit", type=int, default=200)
     add_common_output_flags(p)
 
     add_direct_action_parser(sub)
     add_server_identity_parser(sub)
+    add_knowledge_proposal_parser(sub)
 
     return parser
 
@@ -575,8 +974,74 @@ def main(argv: list[str] | None = None) -> int:
             data = request_json("POST", f"/api/hermes/jobs/{urllib.parse.quote(args.job_id, safe='')}/supervise", body={k: v for k, v in body.items() if v is not None})
             print_json(data)
         elif args.command == "refresh":
-            data = request_json("POST", f"/api/evaluations/{urllib.parse.quote(args.session_id, safe='')}/refresh", body={})
+            data = request_json(
+                "POST",
+                f"/api/evaluations/{urllib.parse.quote(args.session_id, safe='')}/refresh",
+                body={"machineId": args.machine_id} if args.machine_id else {},
+            )
             print_json(data)
+        elif args.command == "audit":
+            if args.events:
+                data = request_json(
+                    "GET",
+                    "/api/audit/events",
+                    {"sessionId": args.session_id, "machineId": args.machine_id, "limit": args.limit},
+                )
+            elif args.local:
+                data = request_json("GET", "/api/audit/completeness")
+            else:
+                data = request_json("GET", "/api/audit/fleet", {"refresh": "1" if args.refresh else None})
+            print_json(data)
+        elif args.command == "knowledge-proposal":
+            if args.knowledge_proposal_command == "init":
+                print_json(initialize_local_proposal(args))
+            elif args.knowledge_proposal_command == "submit":
+                print_json(submit_local_proposal(args))
+            elif args.knowledge_proposal_command == "list":
+                data = request_json(
+                    "GET",
+                    "/api/knowledge/proposals",
+                    {"status": args.status, "sourceMachineId": args.machine_id, "limit": args.limit},
+                )
+                print_json(data)
+            elif args.knowledge_proposal_command == "show":
+                if args.local:
+                    directory, metadata = read_local_proposal(args.proposal_id)
+                    print_json({"proposal": metadata, "directory": str(directory)})
+                else:
+                    data = request_json(
+                        "GET",
+                        f"/api/knowledge/proposals/{urllib.parse.quote(args.proposal_id, safe='')}",
+                    )
+                    print_json(data)
+            elif args.knowledge_proposal_command == "apply":
+                proposal_id = urllib.parse.quote(args.proposal_id, safe="")
+                data = request_json(
+                    "POST",
+                    f"/api/knowledge/proposals/{proposal_id}/apply",
+                    body={"publish": args.publish},
+                    extra_headers=proposal_apply_headers(),
+                )
+                if not args.no_wait:
+                    data = wait_for_proposal(args.proposal_id, args.timeout)
+                print_json(data)
+                proposal = data.get("proposal") if isinstance(data, dict) else None
+                if isinstance(proposal, dict) and proposal.get("status") in {"conflict", "failed", "rejected"}:
+                    return 2
+                result = proposal.get("result") if isinstance(proposal, dict) else None
+                publish = result.get("publish") if isinstance(result, dict) else None
+                if isinstance(publish, dict) and publish.get("status") == "failed":
+                    return 2
+            elif args.knowledge_proposal_command == "reject":
+                data = request_json(
+                    "POST",
+                    f"/api/knowledge/proposals/{urllib.parse.quote(args.proposal_id, safe='')}/reject",
+                    body={"reason": args.reason},
+                    extra_headers=proposal_apply_headers(),
+                )
+                print_json(data)
+            else:
+                parser.error(f"unknown knowledge-proposal command: {args.knowledge_proposal_command}")
         elif args.command == "direct-action":
             if args.direct_action_command == "start":
                 data = request_json("POST", "/api/commander-actions", body=direct_action_start_body(args))

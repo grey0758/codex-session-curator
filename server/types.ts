@@ -3,6 +3,7 @@ export type ActivityStatus = 'active' | 'inactive';
 export type UpdateCadence = 'new' | 'quiet' | 'low' | 'medium' | 'high';
 export type ReviewPriority = 'low' | 'normal' | 'review' | 'reunderstand';
 export type HermesRefreshStatus = 'never' | 'pending' | 'running' | 'ok' | 'failed';
+export type EvaluationOrigin = 'local-llm' | 'worker-fast' | 'hub-remote' | 'rule-fallback';
 export type KnowledgeItemType =
   | 'project'
   | 'preference'
@@ -72,6 +73,109 @@ export interface Evaluation {
   model: string;
   status: 'ok' | 'fallback' | 'failed';
   error: string | null;
+  evaluationOrigin?: EvaluationOrigin;
+  evaluatedByMachineId?: string | null;
+  evaluationRunId?: string | null;
+  transcriptHash?: string | null;
+}
+
+export interface RemoteEvaluationInput {
+  sessionId: string;
+  machineId: string;
+  agent: AgentKind;
+  cwd: string | null;
+  updatedAt: string | null;
+  bytes: number;
+  mtimeMs: number;
+  messageCount: number;
+  userTurns: number;
+  assistantTurns: number;
+  transcriptHash: string;
+  messages: ParsedMessage[];
+}
+
+export type SessionAuditEventType =
+  | 'session-discovered'
+  | 'session-indexed'
+  | 'history-read'
+  | 'evaluation-queued'
+  | 'evaluation-deferred'
+  | 'evaluation-started'
+  | 'evaluation-completed'
+  | 'evaluation-failed'
+  | 'evaluation-published'
+  | 'completeness-scan'
+  | 'completeness-issue'
+  | 'completeness-pending'
+  | 'completeness-skipped'
+  | 'completeness-recovered';
+
+export interface SessionAuditEvent {
+  id: string;
+  at: string;
+  event: SessionAuditEventType;
+  sessionId: string | null;
+  machineId: string;
+  agent: AgentKind | null;
+  runId: string | null;
+  evaluationOrigin: EvaluationOrigin | null;
+  transcriptHash: string | null;
+  messageCount: number | null;
+  userTurns: number | null;
+  assistantTurns: number | null;
+  bytes: number | null;
+  mtimeMs: number | null;
+  model: string | null;
+  status: string | null;
+  error: string | null;
+  details: Record<string, string | number | boolean | null>;
+}
+
+export interface SessionCompletenessIssue {
+  sessionId: string;
+  agent: AgentKind | null;
+  filePath: string | null;
+  classification: 'actionable' | 'pending' | 'skipped';
+  reasons: string[];
+  transcriptHash: string | null;
+  evaluationStatus: Evaluation['status'] | 'missing';
+  evaluationOrigin: EvaluationOrigin | null;
+  messageCount: number;
+  mtimeMs: number;
+  ageMs: number;
+}
+
+export interface SessionCompletenessReport {
+  generatedAt: string;
+  machineId: string;
+  role: 'hub' | 'worker';
+  sessionIds: string[];
+  counts: {
+    discoveredFiles: number;
+    parsedSessions: number;
+    indexedSessions: number;
+    searchableSessions: number;
+    historyReadableSessions: number;
+    evaluationOk: number;
+    evaluationFallback: number;
+      evaluationFailed: number;
+      evaluationMissing: number;
+      eligibleSessions: number;
+      fullyEvaluatedSessions: number;
+      pendingEvaluationSessions: number;
+      metadataOnlySessions: number;
+      activeWriteSessions: number;
+      actionableIssues: number;
+      transcriptVerified: number;
+      staleIndex: number;
+      unreadableFiles: number;
+      orphanedEvaluations: number;
+    };
+    issues: SessionCompletenessIssue[];
+    pending: SessionCompletenessIssue[];
+    skipped: SessionCompletenessIssue[];
+    unreadableFiles: Array<{ filePath: string; error: string }>;
+  orphanedEvaluationIds: string[];
 }
 
 export interface JobOutcome {
@@ -133,6 +237,60 @@ export interface KnowledgeItem {
 export interface KnowledgeSearchResult {
   score: number;
   item: KnowledgeItem;
+}
+
+export type KnowledgeProposalStatus =
+  | 'pending'
+  | 'applying'
+  | 'applied'
+  | 'rejected'
+  | 'conflict'
+  | 'failed';
+
+export type KnowledgeProposalRiskClass = 'ordinary' | 'shared_skill' | 'protected';
+export type KnowledgeProposalPublishMode = 'none' | 'workers' | 'fleet';
+
+export interface KnowledgeProposalChange {
+  path: string;
+  operation: 'upsert' | 'delete';
+  baseSha256: string | null;
+  content: string | null;
+  mode: '100644' | '100755';
+}
+
+export interface KnowledgeProposalPublishResult {
+  mode: KnowledgeProposalPublishMode;
+  status: 'skipped' | 'completed' | 'failed';
+  outputTail: string;
+  error: string | null;
+}
+
+export interface KnowledgeProposalApplyResult {
+  preSourceHash: string;
+  postSourceHash: string;
+  changedFiles: string[];
+  backupPath: string;
+  validations: string[];
+  publish: KnowledgeProposalPublishResult;
+}
+
+export interface KnowledgeProposal {
+  id: string;
+  localId: string;
+  status: KnowledgeProposalStatus;
+  riskClass: KnowledgeProposalRiskClass;
+  baseSourceHash: string;
+  reason: string;
+  sourceMachineId: string;
+  sourceSessionId: string | null;
+  changes: KnowledgeProposalChange[];
+  submittedAt: string;
+  updatedAt: string;
+  applyStartedAt: string | null;
+  completedAt: string | null;
+  rejectedReason: string | null;
+  result: KnowledgeProposalApplyResult | null;
+  error: string | null;
 }
 export interface FailureKnowledgeCard {
   id: string;

@@ -306,6 +306,79 @@ class CuratorCliTests(unittest.TestCase):
             ],
         )
 
+    def test_knowledge_proposal_overlay_packages_only_changed_files(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None, extra_headers=None):
+            calls.append((method, path, params, body, extra_headers))
+            return {
+                "proposal": {
+                    "id": "remote-proposal-1",
+                    "status": "pending",
+                    "submittedAt": "2026-07-18T00:00:00Z",
+                },
+                "idempotent": False,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "mirror"
+            source = root / "knowledge" / "runbooks" / "example.md"
+            (root / "skills" / "shared").mkdir(parents=True)
+            source.parent.mkdir(parents=True)
+            source.write_text("# Example\n\nBefore.\n", encoding="utf-8")
+            (root / ".mirror-source-hash").write_text("a" * 64 + "\n", encoding="utf-8")
+            (root / ".mirror-target-machine").write_text("us002\n", encoding="utf-8")
+            proposal_store = Path(tmp) / "proposals"
+
+            with patch.object(self.cli, "DEFAULT_PROPOSAL_ROOT", proposal_store):
+                init_args = self.cli.build_parser().parse_args([
+                    "knowledge-proposal", "init", "knowledge/runbooks/example.md",
+                    "--reason", "verified update", "--local-id", "local-proposal-1",
+                    "--knowledge-root", str(root), "--session-id", "session-1",
+                ])
+                initialized = self.cli.initialize_local_proposal(init_args)
+                overlay = Path(initialized["editRoot"]) / "knowledge" / "runbooks" / "example.md"
+                overlay.write_text("# Example\n\nAfter.\n", encoding="utf-8")
+                self.cli.request_json = fake_request_json
+                submit_args = self.cli.build_parser().parse_args([
+                    "knowledge-proposal", "submit", "local-proposal-1", "--knowledge-root", str(root),
+                ])
+                result = self.cli.submit_local_proposal(submit_args)
+
+        self.assertEqual(result["proposal"]["id"], "remote-proposal-1")
+        self.assertEqual(len(calls), 1)
+        method, path, params, body, headers = calls[0]
+        self.assertEqual((method, path, params, headers), ("POST", "/api/knowledge/proposals", None, None))
+        self.assertEqual(body["sourceMachineId"], "us002")
+        self.assertEqual(body["baseSourceHash"], "a" * 64)
+        self.assertEqual(body["changes"][0]["content"], "# Example\n\nAfter.\n")
+        self.assertEqual(body["changes"][0]["operation"], "upsert")
+
+    def test_knowledge_proposal_apply_sends_separate_capability_header(self) -> None:
+        calls = []
+
+        def fake_request_json(method, path, params=None, body=None, extra_headers=None):
+            calls.append((method, path, params, body, extra_headers))
+            return {"proposal": {"id": "proposal-1", "status": "applying"}}
+
+        self.cli.request_json = fake_request_json
+        with patch.object(self.cli, "get_proposal_apply_token", return_value="apply-capability-test"), redirect_stdout(StringIO()):
+            exit_code = self.cli.main([
+                "knowledge-proposal", "apply", "proposal-1", "--publish", "fleet", "--no-wait",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(
+                "POST",
+                "/api/knowledge/proposals/proposal-1/apply",
+                None,
+                {"publish": "fleet"},
+                {"X-Curator-Proposal-Apply-Token": "apply-capability-test"},
+            )],
+        )
+
     def test_server_identity_list_uses_expected_endpoint(self) -> None:
         calls = []
 

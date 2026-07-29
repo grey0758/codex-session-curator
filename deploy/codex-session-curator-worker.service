@@ -11,10 +11,15 @@ Environment=HOST=127.0.0.1
 Environment=PORT=55177
 Environment=CURATOR_REMOTE_AGENTS=
 Environment=CURATOR_AUTO_BACKFILL_INTERVAL_MS=0
+Environment=CURATOR_EVALUATION_QUIET_MS=60000
+Environment=CURATOR_SESSION_AUDIT_PENDING_GRACE_MS=900000
 Environment=CURATOR_CODEX_SEMANTIC_SUPERVISOR_INTERVAL_MS=0
 Environment=CURATOR_SESSION_CACHE_TTL_MS=8000
+Environment=CURATOR_SESSION_AUDIT_INTERVAL_MS=300000
+Environment=CURATOR_SESSION_AUDIT_INITIAL_DELAY_MS=30000
 Environment=CURATOR_HUB_BASE_URL=http://127.0.0.1:54176
 EnvironmentFile=-%h/.config/codex-session-curator/auth.env
+EnvironmentFile=-%h/.config/codex-session-curator/worker-auth.env
 EnvironmentFile=-%h/.config/codex-session-curator/worker.env
 ExecStart=/usr/bin/npm start
 Restart=always

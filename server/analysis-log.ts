@@ -11,6 +11,14 @@ export interface AnalysisRunRecord {
   durationMs: number;
   httpStatus: number | null;
   error: string | null;
+  phase?: 'request' | 'content' | 'parse' | 'parsed' | 'final';
+  attempt?: number | null;
+  final?: boolean;
+  sessionId?: string | null;
+  machineId?: string | null;
+  runId?: string | null;
+  source?: 'local' | 'hub-remote' | null;
+  transcriptHash?: string | null;
 }
 
 export interface AnalysisStats {
@@ -33,7 +41,7 @@ export function getAnalysisLogPath(): string {
 export async function recordAnalysisRun(record: AnalysisRunRecord): Promise<void> {
   const path = getAnalysisLogPath();
   await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, `${JSON.stringify(record)}\n`, 'utf8');
+  await appendFile(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
 export async function readAnalysisRuns(limit = 120): Promise<AnalysisRunRecord[]> {

@@ -2,7 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { KnowledgeItem, KnowledgeItemType, KnowledgeSearchResult } from './types.js';
+import type {
+  KnowledgeItem,
+  KnowledgeItemType,
+  KnowledgeProposal,
+  KnowledgeProposalApplyResult,
+  KnowledgeProposalChange,
+  KnowledgeProposalRiskClass,
+  KnowledgeProposalStatus,
+  KnowledgeSearchResult,
+} from './types.js';
 
 const KNOWLEDGE_TYPES = new Set<KnowledgeItemType>([
   'project',
@@ -34,6 +43,25 @@ type KnowledgeRow = {
   updated_at: string;
 };
 
+type KnowledgeProposalRow = {
+  id: string;
+  local_id: string;
+  status: KnowledgeProposalStatus;
+  risk_class: KnowledgeProposalRiskClass;
+  base_source_hash: string;
+  reason: string;
+  source_machine_id: string;
+  source_session_id: string | null;
+  changes_json: string;
+  submitted_at: string;
+  updated_at: string;
+  apply_started_at: string | null;
+  completed_at: string | null;
+  rejected_reason: string | null;
+  result_json: string | null;
+  error: string | null;
+};
+
 export interface KnowledgeItemCreateInput {
   id?: string;
   type: KnowledgeItemType;
@@ -59,6 +87,23 @@ export interface KnowledgeSearchInput {
   type?: KnowledgeItemType | KnowledgeItemType[];
   project?: string;
   repo?: string;
+  limit?: number;
+}
+
+export interface KnowledgeProposalCreateInput {
+  id?: string;
+  localId: string;
+  riskClass: KnowledgeProposalRiskClass;
+  baseSourceHash: string;
+  reason: string;
+  sourceMachineId: string;
+  sourceSessionId?: string | null;
+  changes: KnowledgeProposalChange[];
+}
+
+export interface KnowledgeProposalListInput {
+  status?: KnowledgeProposalStatus;
+  sourceMachineId?: string;
   limit?: number;
 }
 
@@ -119,6 +164,27 @@ function rowToItem(row: KnowledgeRow): KnowledgeItem {
     lastVerifiedAt: row.last_verified_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToProposal(row: KnowledgeProposalRow): KnowledgeProposal {
+  return {
+    id: row.id,
+    localId: row.local_id,
+    status: row.status,
+    riskClass: row.risk_class,
+    baseSourceHash: row.base_source_hash,
+    reason: row.reason,
+    sourceMachineId: row.source_machine_id,
+    sourceSessionId: row.source_session_id,
+    changes: JSON.parse(row.changes_json) as KnowledgeProposalChange[],
+    submittedAt: row.submitted_at,
+    updatedAt: row.updated_at,
+    applyStartedAt: row.apply_started_at,
+    completedAt: row.completed_at,
+    rejectedReason: row.rejected_reason,
+    result: row.result_json ? JSON.parse(row.result_json) as KnowledgeProposalApplyResult : null,
+    error: row.error,
   };
 }
 
@@ -227,6 +293,122 @@ export class KnowledgeStore {
     return this.searchLike({ ...input, q: query, limit });
   }
 
+  async createProposal(input: KnowledgeProposalCreateInput): Promise<KnowledgeProposal> {
+    const now = new Date().toISOString();
+    const proposal: KnowledgeProposal = {
+      id: input.id ?? randomUUID(),
+      localId: input.localId,
+      status: 'pending',
+      riskClass: input.riskClass,
+      baseSourceHash: input.baseSourceHash,
+      reason: input.reason,
+      sourceMachineId: input.sourceMachineId,
+      sourceSessionId: input.sourceSessionId ?? null,
+      changes: input.changes,
+      submittedAt: now,
+      updatedAt: now,
+      applyStartedAt: null,
+      completedAt: null,
+      rejectedReason: null,
+      result: null,
+      error: null,
+    };
+    this.db.prepare(
+      `INSERT INTO knowledge_proposals (
+        id, local_id, status, risk_class, base_source_hash, reason,
+        source_machine_id, source_session_id, changes_json, submitted_at,
+        updated_at, apply_started_at, completed_at, rejected_reason, result_json, error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      proposal.id,
+      proposal.localId,
+      proposal.status,
+      proposal.riskClass,
+      proposal.baseSourceHash,
+      proposal.reason,
+      proposal.sourceMachineId,
+      proposal.sourceSessionId,
+      JSON.stringify(proposal.changes),
+      proposal.submittedAt,
+      proposal.updatedAt,
+      proposal.applyStartedAt,
+      proposal.completedAt,
+      proposal.rejectedReason,
+      null,
+      proposal.error,
+    );
+    return proposal;
+  }
+
+  async getProposal(id: string): Promise<KnowledgeProposal | null> {
+    const row = this.db.prepare('SELECT * FROM knowledge_proposals WHERE id = ?').get(id) as KnowledgeProposalRow | undefined;
+    return row ? rowToProposal(row) : null;
+  }
+
+  async getProposalBySourceLocalId(sourceMachineId: string, localId: string): Promise<KnowledgeProposal | null> {
+    const row = this.db
+      .prepare('SELECT * FROM knowledge_proposals WHERE source_machine_id = ? AND local_id = ?')
+      .get(sourceMachineId, localId) as KnowledgeProposalRow | undefined;
+    return row ? rowToProposal(row) : null;
+  }
+
+  async listProposals(input: KnowledgeProposalListInput = {}): Promise<KnowledgeProposal[]> {
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.status) {
+      where.push('status = ?');
+      params.push(input.status);
+    }
+    if (input.sourceMachineId) {
+      where.push('source_machine_id = ?');
+      params.push(input.sourceMachineId);
+    }
+    params.push(Math.max(1, Math.min(input.limit ?? 100, 500)));
+    const rows = this.db.prepare(
+      `SELECT * FROM knowledge_proposals ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY submitted_at DESC LIMIT ?`
+    ).all(...params) as KnowledgeProposalRow[];
+    return rows.map(rowToProposal);
+  }
+
+  async claimProposalForApply(id: string): Promise<KnowledgeProposal | null> {
+    const now = new Date().toISOString();
+    const outcome = this.db.prepare(
+      `UPDATE knowledge_proposals
+       SET status = 'applying', apply_started_at = ?, updated_at = ?, completed_at = NULL,
+           result_json = NULL, error = NULL
+       WHERE id = ? AND status = 'pending'`
+    ).run(now, now, id);
+    if (Number(outcome.changes) !== 1) return null;
+    return this.getProposal(id);
+  }
+
+  async finishProposalApply(
+    id: string,
+    status: Extract<KnowledgeProposalStatus, 'applied' | 'conflict' | 'failed'>,
+    result: KnowledgeProposalApplyResult | null,
+    error: string | null,
+  ): Promise<KnowledgeProposal | null> {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE knowledge_proposals
+       SET status = ?, result_json = ?, error = ?, completed_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'applying'`
+    ).run(status, result ? JSON.stringify(result) : null, error, now, now, id);
+    return this.getProposal(id);
+  }
+
+  async rejectProposal(id: string, reason: string): Promise<KnowledgeProposal | null> {
+    const now = new Date().toISOString();
+    const outcome = this.db.prepare(
+      `UPDATE knowledge_proposals
+       SET status = 'rejected', rejected_reason = ?, completed_at = ?, updated_at = ?, error = NULL
+       WHERE id = ? AND status IN ('pending', 'conflict', 'failed')`
+    ).run(reason, now, now, id);
+    if (Number(outcome.changes) !== 1) return null;
+    return this.getProposal(id);
+  }
+
   private initialize(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS knowledge_items (
@@ -250,6 +432,29 @@ export class KnowledgeStore {
       CREATE INDEX IF NOT EXISTS idx_knowledge_items_project ON knowledge_items(project);
       CREATE INDEX IF NOT EXISTS idx_knowledge_items_repo ON knowledge_items(repo);
       CREATE INDEX IF NOT EXISTS idx_knowledge_items_updated_at ON knowledge_items(updated_at);
+
+      CREATE TABLE IF NOT EXISTS knowledge_proposals (
+        id TEXT PRIMARY KEY,
+        local_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        risk_class TEXT NOT NULL,
+        base_source_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        source_machine_id TEXT NOT NULL,
+        source_session_id TEXT,
+        changes_json TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        apply_started_at TEXT,
+        completed_at TEXT,
+        rejected_reason TEXT,
+        result_json TEXT,
+        error TEXT,
+        UNIQUE(source_machine_id, local_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_proposals_status ON knowledge_proposals(status);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_proposals_submitted_at ON knowledge_proposals(submitted_at);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_proposals_source_machine ON knowledge_proposals(source_machine_id);
     `);
 
     try {

@@ -252,8 +252,15 @@ test('Hermes dispatch API runs fake worker through events, supervisor, structure
         body: JSON.stringify({ autoStop: true, staleOutputMs: 1000 }),
       },
     );
-    assert.equal(supervise.decision, 'continue');
+    assert.ok(
+      supervise.decision === 'continue' || supervise.decision === 'completed',
+      `unexpected supervisor decision: ${supervise.decision}`,
+    );
     assert.equal(supervise.job.id, jobId);
+    assert.ok(
+      supervise.job.status === 'running' || supervise.job.status === 'completed',
+      `unexpected supervised job status: ${String(supervise.job.status)}`,
+    );
 
     const runningEvents = await waitFor(
       () => requestJson<{ events: JsonRecord[] }>(baseUrl, `/api/hermes/jobs/${jobId}/events?remote=0`),

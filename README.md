@@ -161,6 +161,36 @@ NVIDIA_API_KEYS=key-one,key-two
 
 Multiple keys are rotated per request. Keep all keys in an untracked environment file.
 
+The panel's fuzzy session search is a separate low-latency path. It only calls
+DeepSeek, never the primary background-analysis model, and falls back to local
+index ranking when the request times out or returns invalid candidates:
+
+```bash
+CURATOR_AI_SEARCH_BASE_URL=https://api.deepseek.com
+CURATOR_AI_SEARCH_MODEL=deepseek-v4-flash
+CURATOR_AI_SEARCH_API_KEYS=deepseek-key
+CURATOR_AI_SEARCH_TIMEOUT_MS=12000
+CURATOR_AI_SEARCH_PRIMARY_TIMEOUT_MS=6500
+CURATOR_AI_SEARCH_MAX_TOKENS=500
+CURATOR_AI_SEARCH_CANDIDATE_LIMIT=18
+```
+
+When the AI-search base URL or keys are omitted, the server reuses
+`CURATOR_LLM_FALLBACK_BASE_URL` and `CURATOR_LLM_FALLBACK_API_KEYS`; the
+AI-search model can still be independently fixed to a faster DeepSeek model.
+The browser never receives these credentials.
+
+Search uses one compact joint DeepSeek request to infer the likely source
+machine(s), understand the intent, generate semantic expansion terms, and
+rerank a balanced candidate set. Cross-machine safety candidates let the model
+correct an explicit-machine hint instead of turning it into a hard filter.
+Keeping routing and ranking in one request avoids paying two provider
+round-trips in the normal path. If the primary request reaches its 6.5-second
+tail-latency threshold, Curator retries once with a smaller but still
+cross-machine-balanced rescue set inside the 12-second overall deadline.
+If both requests time out, registered machine IDs in the query and balanced
+local ranking provide the safe fallback.
+
 ## Remote Agents
 
 To manage sessions on several machines, run one curator agent on each machine. The control panel talks to those agents over private networking, SSH tunnels, FRP, or another trusted transport.

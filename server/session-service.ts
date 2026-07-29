@@ -1,5 +1,6 @@
 import { stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { relative, sep } from 'node:path';
 import {
@@ -25,6 +26,7 @@ import {
   isEvaluationWorkflowComplete,
 } from './evaluation-workflow.js';
 import { getCuratorRole } from './runtime-role.js';
+import { hashTranscript, recordSessionAuditEvent } from './session-audit.js';
 import { extractSessionId, parseSessionFile, parseSessionHistory, parseSessionMessages } from './session-parser.js';
 import { CuratorStore } from './store.js';
 import type {
@@ -32,12 +34,16 @@ import type {
   AgentKind,
   CodexSession,
   Evaluation,
+  EvaluationOrigin,
   FailureKnowledgeCard,
   JobOutcome,
   ParsedMessage,
   Recommendation,
   RemoteMachine,
   ReviewPriority,
+  RemoteEvaluationInput,
+  SessionCompletenessIssue,
+  SessionCompletenessReport,
   StoredEvaluation,
   UpdateCadence,
 } from './types.js';
@@ -49,6 +55,11 @@ async function getEvaluationConcurrency(): Promise<number> {
 }
 
 async function evaluateSessionWithModel(input: {
+  sessionId: string;
+  machineId: string;
+  runId: string;
+  evaluationOrigin: 'local-llm' | 'hub-remote';
+  transcriptHash: string;
   messages: ParsedMessage[];
   userTurns: number;
   assistantTurns: number;
@@ -73,6 +84,27 @@ async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index
   const runners = Array.from({ length: Math.min(limit, items.length) }, () => run());
   await Promise.all(runners);
   return results;
+}
+
+function readDurationEnv(name: string, fallback: number, max = 24 * 60 * 60 * 1000): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(max, Math.floor(value)));
+}
+
+function evaluationQuietMs(): number {
+  return readDurationEnv('CURATOR_EVALUATION_QUIET_MS', 60_000);
+}
+
+function auditPendingGraceMs(): number {
+  return readDurationEnv('CURATOR_SESSION_AUDIT_PENDING_GRACE_MS', 15 * 60_000);
+}
+
+function evaluationNeedsRefresh(evaluation: StoredEvaluation): boolean {
+  return evaluation.hermesNeedsRefresh === true ||
+    evaluation.hermesRefreshStatus === 'pending' ||
+    evaluation.hermesRefreshStatus === 'running' ||
+    !isEvaluationWorkflowComplete(evaluation.workflow);
 }
 
 function hasCachedMetadata(cached: unknown): cached is {
@@ -363,6 +395,10 @@ function publicEvaluation(evaluation: Evaluation | StoredEvaluation): Evaluation
     model: evaluation.model ?? process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
     status: evaluation.status ?? 'fallback',
     error: evaluation.error ?? null,
+    evaluationOrigin: evaluation.evaluationOrigin,
+    evaluatedByMachineId: evaluation.evaluatedByMachineId ?? null,
+    evaluationRunId: evaluation.evaluationRunId ?? null,
+    transcriptHash: evaluation.transcriptHash ?? null,
   };
 }
 
@@ -374,6 +410,9 @@ function fastEvaluation(input: {
   assistantTurns: number;
   messageCount: number;
   updateMeta?: ReturnType<typeof classifyUpdate>;
+  transcriptHash?: string | null;
+  runId?: string | null;
+  evaluationOrigin: Extract<EvaluationOrigin, 'worker-fast' | 'rule-fallback'>;
 }): Evaluation {
   if (input.cached?.summary) {
     const cached = publicEvaluation(input.cached);
@@ -382,6 +421,7 @@ function fastEvaluation(input: {
       reviewPriority: cached.reviewPriority,
       reviewSignals: cached.reviewSignals,
     };
+    const needsRefresh = updateMeta.updateCadence !== 'quiet' || evaluationNeedsRefresh(input.cached);
     return {
       ...cached,
       ...updateMeta,
@@ -393,6 +433,9 @@ function fastEvaluation(input: {
         updateMeta.updateCadence === 'quiet'
           ? cached.reasons
           : [...cached.reasons, ...updateMeta.reviewSignals].slice(-8),
+      hermesNeedsRefresh: needsRefresh,
+      hermesRefreshStatus: needsRefresh ? 'pending' : cached.hermesRefreshStatus,
+      hermesRefreshError: needsRefresh ? null : cached.hermesRefreshError,
     };
   }
   const title = input.cwd?.split('/').filter(Boolean).at(-1) ?? input.id.slice(0, 12);
@@ -433,6 +476,10 @@ function fastEvaluation(input: {
     model: process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
     status: 'fallback',
     error: null,
+    evaluationOrigin: input.evaluationOrigin,
+    evaluatedByMachineId: getMachineId(),
+    evaluationRunId: input.runId ?? null,
+    transcriptHash: input.transcriptHash ?? null,
   };
   return {
     ...evaluation,
@@ -472,6 +519,7 @@ export class SessionService {
   private sessionsRoot = getSessionsRoot(this.codexHome);
   private claudeProjectsRoot = getClaudeProjectsRoot();
   private store: CuratorStore;
+  private lastAuditFindingFingerprints = new Map<string, string>();
 
   constructor(store: CuratorStore) {
     this.store = store;
@@ -524,6 +572,7 @@ export class SessionService {
   }
 
   async listSessions(options: { refreshWorkflow?: boolean; fast?: boolean } = {}): Promise<CodexSession[]> {
+    const curatorRole = getCuratorRole();
     const state = await this.store.load();
     const files = await this.discoverSessionFiles();
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
@@ -584,6 +633,26 @@ export class SessionService {
 
     const evaluated = await mapLimit(parseQueue, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
+      const transcriptHash = hashTranscript(parsed.messages);
+      const runId = randomUUID();
+      await recordSessionAuditEvent({
+        event: 'session-discovered',
+        sessionId: parsed.id,
+        machineId: getMachineId(),
+        agent: parsed.source,
+        runId,
+        evaluationOrigin: curatorRole === 'worker' ? 'worker-fast' : 'local-llm',
+        transcriptHash,
+        messageCount: parsed.messageCount,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        model: null,
+        status: 'discovered',
+        error: null,
+        details: {},
+      }).catch(() => undefined);
       const cached = state.evaluations[parsed.id];
       const updateMeta = classifyUpdate({
         cached,
@@ -599,6 +668,52 @@ export class SessionService {
         cached.bytes === parsed.bytes &&
         isEvaluationWorkflowComplete(cached.workflow) &&
         hasCachedMetadata(cached);
+      const evaluationMode = canReuseParsedCache && !options.refreshWorkflow
+        ? 'cache'
+        : options.fast && !options.refreshWorkflow && curatorRole === 'hub'
+          ? 'deferred'
+          : curatorRole === 'worker'
+            ? 'worker-fast'
+            : 'model';
+      if (evaluationMode === 'deferred') {
+        await recordSessionAuditEvent({
+          event: 'evaluation-deferred',
+          sessionId: parsed.id,
+          machineId: getMachineId(),
+          agent: parsed.source,
+          runId,
+          evaluationOrigin: 'local-llm',
+          transcriptHash,
+          messageCount: parsed.messageCount,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          bytes: parsed.bytes,
+          mtimeMs: parsed.mtimeMs,
+          model: null,
+          status: 'pending',
+          error: null,
+          details: { reason: 'fast-list-transcript-changed' },
+        }).catch(() => undefined);
+      } else if (evaluationMode === 'model' || evaluationMode === 'worker-fast') {
+        await recordSessionAuditEvent({
+          event: 'evaluation-started',
+          sessionId: parsed.id,
+          machineId: getMachineId(),
+          agent: parsed.source,
+          runId,
+          evaluationOrigin: evaluationMode === 'worker-fast' ? 'worker-fast' : 'local-llm',
+          transcriptHash,
+          messageCount: parsed.messageCount,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          bytes: parsed.bytes,
+          mtimeMs: parsed.mtimeMs,
+          model: null,
+          status: 'running',
+          error: null,
+          details: { reason: options.refreshWorkflow ? 'workflow-refresh' : 'new-or-changed-session' },
+        }).catch(() => undefined);
+      }
       const evaluation =
         canReuseParsedCache && !options.refreshWorkflow
           ? {
@@ -632,8 +747,12 @@ export class SessionService {
               model: cached.model ?? process.env.CURATOR_LLM_MODEL ?? process.env.MODEL ?? 'gpt-5.4',
               status: cached.status ?? 'fallback',
               error: cached.error ?? null,
+              evaluationOrigin: cached.evaluationOrigin,
+              evaluatedByMachineId: cached.evaluatedByMachineId ?? null,
+              evaluationRunId: cached.evaluationRunId ?? null,
+              transcriptHash: cached.transcriptHash ?? null,
             }
-          : options.fast || getCuratorRole() === 'worker'
+          : (options.fast && !options.refreshWorkflow) || curatorRole === 'worker'
             ? fastEvaluation({
                 id: parsed.id,
                 cwd: parsed.cwd,
@@ -642,9 +761,17 @@ export class SessionService {
                 assistantTurns: parsed.assistantTurns,
                 messageCount: parsed.messageCount,
                 updateMeta,
+                transcriptHash,
+                runId,
+                evaluationOrigin: curatorRole === 'worker' ? 'worker-fast' : 'rule-fallback',
               })
             : applyUpdateMeta(
                 await evaluateSessionWithModel({
+                  sessionId: parsed.id,
+                  machineId: getMachineId(),
+                  runId,
+                  evaluationOrigin: 'local-llm',
+                  transcriptHash,
                   messages: parsed.messages,
                   userTurns: parsed.userTurns,
                   assistantTurns: parsed.assistantTurns,
@@ -652,6 +779,27 @@ export class SessionService {
                 }),
                 updateMeta
               );
+
+      if (evaluationMode === 'model' || evaluationMode === 'worker-fast') {
+        await recordSessionAuditEvent({
+          event: evaluation.status === 'failed' ? 'evaluation-failed' : 'evaluation-completed',
+          sessionId: parsed.id,
+          machineId: getMachineId(),
+          agent: parsed.source,
+          runId,
+          evaluationOrigin: evaluation.evaluationOrigin ?? (evaluationMode === 'worker-fast' ? 'worker-fast' : 'local-llm'),
+          transcriptHash,
+          messageCount: parsed.messageCount,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          bytes: parsed.bytes,
+          mtimeMs: parsed.mtimeMs,
+          model: evaluation.model,
+          status: evaluation.status,
+          error: evaluation.error,
+          details: {},
+        }).catch(() => undefined);
+      }
 
       if (
         !cached ||
@@ -688,6 +836,29 @@ export class SessionService {
           }),
         };
         stateChanged = true;
+        await recordSessionAuditEvent({
+          event: 'session-indexed',
+          sessionId: parsed.id,
+          machineId: getMachineId(),
+          agent: parsed.source,
+          runId,
+          evaluationOrigin: evaluation.evaluationOrigin ?? (getCuratorRole() === 'worker' ? 'worker-fast' : 'local-llm'),
+          transcriptHash,
+          messageCount: parsed.messageCount,
+          userTurns: parsed.userTurns,
+          assistantTurns: parsed.assistantTurns,
+          bytes: parsed.bytes,
+          mtimeMs: parsed.mtimeMs,
+          model: evaluation.model,
+          status: evaluation.status,
+          error: evaluation.error,
+          details: {
+            searchable: Boolean(evaluation.searchText?.trim()),
+            aiAnalysisCurrent: evaluation.status === 'ok' &&
+              evaluation.transcriptHash === transcriptHash &&
+              isEvaluationWorkflowComplete(evaluation.workflow),
+          },
+        }).catch(() => undefined);
       }
 
       return { parsed, evaluation };
@@ -763,6 +934,421 @@ export class SessionService {
     });
   }
 
+  async getRemoteEvaluationInput(id: string): Promise<RemoteEvaluationInput> {
+    const { found, missingIds } = await this.findSessionFilesByIds([id]);
+    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
+    const parsed = await parseSessionFile(found[0].filePath);
+    const transcriptHash = hashTranscript(parsed.messages);
+    await recordSessionAuditEvent({
+      event: 'history-read',
+      sessionId: parsed.id,
+      machineId: getMachineId(),
+      agent: parsed.source,
+      runId: null,
+      evaluationOrigin: null,
+      transcriptHash,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      model: null,
+      status: 'ok',
+      error: null,
+      details: { purpose: 'hub-remote-evaluation-input' },
+    }).catch(() => undefined);
+    return {
+      sessionId: parsed.id,
+      machineId: getMachineId(),
+      agent: parsed.source,
+      cwd: parsed.cwd,
+      updatedAt: parsed.updatedAt,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      transcriptHash,
+      messages: parsed.messages,
+    };
+  }
+
+  async applyHubEvaluation(input: {
+    sessionId: string;
+    hubMachineId: string;
+    runId: string;
+    transcriptHash: string;
+    reason: string;
+    evaluation: Evaluation;
+  }) {
+    const { found, missingIds } = await this.findSessionFilesByIds([input.sessionId]);
+    if (missingIds.length || !found[0]) throw new Error(`Session not found: ${input.sessionId}`);
+    const parsed = await parseSessionFile(found[0].filePath);
+    const currentTranscriptHash = hashTranscript(parsed.messages);
+    if (currentTranscriptHash !== input.transcriptHash) {
+      await recordSessionAuditEvent({
+        event: 'evaluation-failed',
+        sessionId: parsed.id,
+        machineId: getMachineId(),
+        agent: parsed.source,
+        runId: input.runId,
+        evaluationOrigin: 'hub-remote',
+        transcriptHash: currentTranscriptHash,
+        messageCount: parsed.messageCount,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        model: input.evaluation.model,
+        status: 'stale-transcript',
+        error: 'Transcript changed while Hub evaluation was running',
+        details: { expectedTranscriptHash: input.transcriptHash },
+      }).catch(() => undefined);
+      throw new Error('Transcript changed while Hub evaluation was running');
+    }
+
+    const state = await this.store.load();
+    const cached = state.evaluations[parsed.id];
+    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const evaluation: Evaluation = {
+      ...input.evaluation,
+      evaluationOrigin: 'hub-remote',
+      evaluatedByMachineId: input.hubMachineId,
+      evaluationRunId: input.runId,
+      transcriptHash: currentTranscriptHash,
+      hermesLastUsedAt: cached?.hermesLastUsedAt ?? input.evaluation.hermesLastUsedAt ?? null,
+      hermesLastJobId: cached?.hermesLastJobId ?? input.evaluation.hermesLastJobId ?? null,
+      hermesNeedsRefresh: input.evaluation.status === 'failed',
+      hermesRefreshStatus: input.evaluation.status === 'failed' ? 'failed' : 'ok',
+      hermesRefreshError: input.evaluation.error ?? null,
+      reviewSignals: [`Hub 中央评估：${input.reason}`, ...(input.evaluation.reviewSignals ?? [])].slice(0, 6),
+    };
+    await this.store.setEvaluation(parsed.id, {
+      ...evaluation,
+      filePath: parsed.filePath,
+      mtimeMs: parsed.mtimeMs,
+      bytes: parsed.bytes,
+      cwd: parsed.cwd,
+      startedAt: parsed.startedAt,
+      updatedAt: parsed.updatedAt,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      lastUserMessage: parsed.lastUserMessage,
+      lastAssistantMessage: parsed.lastAssistantMessage,
+      shellSnapshotCount: shellSnapshotCounts.get(parsed.id) ?? 0,
+      searchText: buildEvaluationSearchText({
+        id: parsed.id,
+        cwd: parsed.cwd,
+        lastUserMessage: parsed.lastUserMessage,
+        lastAssistantMessage: parsed.lastAssistantMessage,
+        evaluation,
+      }),
+    });
+    await recordSessionAuditEvent({
+      event: 'evaluation-published',
+      sessionId: parsed.id,
+      machineId: getMachineId(),
+      agent: parsed.source,
+      runId: input.runId,
+      evaluationOrigin: 'hub-remote',
+      transcriptHash: currentTranscriptHash,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      model: evaluation.model,
+      status: evaluation.status,
+      error: evaluation.error,
+      details: { hubMachineId: input.hubMachineId, reason: input.reason },
+    }).catch(() => undefined);
+    return {
+      id: parsed.id,
+      machineId: getMachineId(),
+      status: evaluation.status,
+      model: evaluation.model,
+      runId: input.runId,
+      transcriptHash: currentTranscriptHash,
+    };
+  }
+
+  async auditCompleteness(): Promise<SessionCompletenessReport> {
+    const generatedAt = new Date().toISOString();
+    const nowMs = Date.now();
+    const machineId = getMachineId();
+    const quietMs = evaluationQuietMs();
+    const pendingGraceMs = Math.max(quietMs, auditPendingGraceMs());
+    const files = await this.discoverSessionFiles();
+    const state = await this.store.load();
+    const parsedResults = await mapLimit(files, 4, async (filePath) => {
+      try {
+        return { parsed: await parseSessionFile(filePath), filePath, error: null };
+      } catch (error) {
+        return {
+          parsed: null,
+          filePath,
+          error: error instanceof Error ? error.message.slice(0, 240) : 'Unreadable session file',
+        };
+      }
+    });
+    const parsedSessions = parsedResults.flatMap((item) => (item.parsed ? [item.parsed] : []));
+    const unreadableFiles = parsedResults
+      .filter((item) => !item.parsed)
+      .map((item) => ({ filePath: item.filePath, error: item.error ?? 'Unreadable session file' }));
+    const parsedIds = new Set(parsedSessions.map((parsed) => parsed.id));
+    const issues: SessionCompletenessIssue[] = [];
+    const pending: SessionCompletenessIssue[] = [];
+    const skipped: SessionCompletenessIssue[] = [];
+    let stateChanged = false;
+    let indexedSessions = 0;
+    let searchableSessions = 0;
+    let historyReadableSessions = 0;
+    let evaluationOk = 0;
+    let evaluationFallback = 0;
+    let evaluationFailed = 0;
+    let evaluationMissing = 0;
+    let eligibleSessions = 0;
+    let fullyEvaluatedSessions = 0;
+    let pendingEvaluationSessions = 0;
+    let metadataOnlySessions = 0;
+    let activeWriteSessions = 0;
+    let transcriptVerified = 0;
+    let staleIndex = 0;
+
+    for (const parsed of parsedSessions) {
+      const cached = state.evaluations[parsed.id];
+      const transcriptHash = hashTranscript(parsed.messages);
+      const ageMs = Math.max(0, nowMs - parsed.mtimeMs);
+      const metadataOnly = parsed.messageCount <= 0;
+      const recentlyModified = ageMs < quietMs;
+      const reasons: string[] = [];
+      const metadataMatches = Boolean(
+        cached &&
+        cached.filePath === parsed.filePath &&
+        cached.bytes === parsed.bytes &&
+        cached.mtimeMs === parsed.mtimeMs,
+      );
+      if (metadataMatches) indexedSessions += 1;
+      else {
+        if (cached) {
+          staleIndex += 1;
+          reasons.push('stale-index');
+        } else {
+          evaluationMissing += 1;
+          reasons.push('missing-index');
+        }
+      }
+      if (metadataOnly) metadataOnlySessions += 1;
+      else {
+        eligibleSessions += 1;
+        historyReadableSessions += 1;
+      }
+      if (cached?.searchText?.trim()) searchableSessions += 1;
+      else if (!metadataOnly) reasons.push('not-searchable');
+
+      if (cached) {
+        if (cached.status === 'ok') evaluationOk += 1;
+        else if (cached.status === 'fallback') {
+          evaluationFallback += 1;
+          reasons.push('evaluation-fallback');
+        } else {
+          evaluationFailed += 1;
+          reasons.push('evaluation-failed');
+        }
+        if (metadataMatches && !cached.transcriptHash) {
+          cached.transcriptHash = transcriptHash;
+          cached.evaluationOrigin = cached.workflow.endsWith(':fast-list') ? 'worker-fast' : 'local-llm';
+          cached.evaluatedByMachineId = cached.evaluatedByMachineId ?? machineId;
+          state.evaluations[parsed.id] = cached;
+          stateChanged = true;
+        }
+        if (cached.transcriptHash === transcriptHash) transcriptVerified += 1;
+        else if (!metadataOnly) reasons.push('transcript-unverified');
+      } else {
+        if (!metadataOnly) reasons.push('evaluation-missing');
+      }
+
+      if (metadataOnly) {
+        skipped.push({
+          sessionId: parsed.id,
+          agent: parsed.source,
+          filePath: parsed.filePath,
+          classification: 'skipped',
+          reasons: ['metadata-only'],
+          transcriptHash,
+          evaluationStatus: cached?.status ?? 'missing',
+          evaluationOrigin: cached?.evaluationOrigin ?? null,
+          messageCount: parsed.messageCount,
+          mtimeMs: parsed.mtimeMs,
+          ageMs,
+        });
+        continue;
+      }
+
+      const refreshPending = Boolean(cached && evaluationNeedsRefresh(cached));
+      const analysisCurrent = Boolean(
+        cached &&
+        cached.status === 'ok' &&
+        metadataMatches &&
+        cached.transcriptHash === transcriptHash &&
+        cached.searchText?.trim() &&
+        !refreshPending,
+      );
+      if (analysisCurrent) {
+        fullyEvaluatedSessions += 1;
+        continue;
+      }
+
+      if (refreshPending) reasons.push('evaluation-pending');
+      if (recentlyModified) {
+        reasons.push('active-write');
+        activeWriteSessions += 1;
+      }
+      const uniqueReasons = [...new Set(reasons)];
+      const isPending = recentlyModified || (refreshPending && ageMs < pendingGraceMs);
+      const finding: SessionCompletenessIssue = {
+        sessionId: parsed.id,
+        agent: parsed.source,
+        filePath: parsed.filePath,
+        classification: isPending ? 'pending' : 'actionable',
+        reasons: uniqueReasons,
+        transcriptHash,
+        evaluationStatus: cached?.status ?? 'missing',
+        evaluationOrigin: cached?.evaluationOrigin ?? null,
+        messageCount: parsed.messageCount,
+        mtimeMs: parsed.mtimeMs,
+        ageMs,
+      };
+      if (isPending) {
+        pendingEvaluationSessions += 1;
+        pending.push(finding);
+      } else {
+        issues.push(finding);
+      }
+    }
+
+    if (stateChanged) await this.store.save(state);
+    const orphanedEvaluationIds = Object.keys(state.evaluations).filter((id) => !parsedIds.has(id));
+    const report: SessionCompletenessReport = {
+      generatedAt,
+      machineId,
+      role: getCuratorRole(),
+      sessionIds: [...parsedIds].sort(),
+      counts: {
+        discoveredFiles: files.length,
+        parsedSessions: parsedSessions.length,
+        indexedSessions,
+        searchableSessions,
+        historyReadableSessions,
+        evaluationOk,
+        evaluationFallback,
+        evaluationFailed,
+        evaluationMissing,
+        eligibleSessions,
+        fullyEvaluatedSessions,
+        pendingEvaluationSessions,
+        metadataOnlySessions,
+        activeWriteSessions,
+        actionableIssues: issues.length + unreadableFiles.length,
+        transcriptVerified,
+        staleIndex,
+        unreadableFiles: unreadableFiles.length,
+        orphanedEvaluations: orphanedEvaluationIds.length,
+      },
+      issues,
+      pending,
+      skipped,
+      unreadableFiles,
+      orphanedEvaluationIds,
+    };
+
+    await recordSessionAuditEvent({
+      event: 'completeness-scan',
+      sessionId: null,
+      machineId,
+      agent: null,
+      runId: null,
+      evaluationOrigin: null,
+      transcriptHash: null,
+      messageCount: null,
+      userTurns: null,
+      assistantTurns: null,
+      bytes: null,
+      mtimeMs: null,
+      model: null,
+      status: issues.length || unreadableFiles.length ? 'issues' : pending.length ? 'pending' : 'ok',
+      error: null,
+      details: {
+        discoveredFiles: files.length,
+        parsedSessions: parsedSessions.length,
+        issues: issues.length,
+        pending: pending.length,
+        skipped: skipped.length,
+        fullyEvaluatedSessions,
+        eligibleSessions,
+        unreadableFiles: unreadableFiles.length,
+        orphanedEvaluations: orphanedEvaluationIds.length,
+      },
+    }).catch(() => undefined);
+
+    const currentFingerprints = new Map<string, string>();
+    for (const finding of [...issues, ...pending, ...skipped]) {
+      const fingerprint = `${finding.classification}:${finding.reasons.slice().sort().join(',')}`;
+      currentFingerprints.set(finding.sessionId, fingerprint);
+      if (this.lastAuditFindingFingerprints.get(finding.sessionId) === fingerprint) continue;
+      await recordSessionAuditEvent({
+        event: finding.classification === 'actionable'
+          ? 'completeness-issue'
+          : finding.classification === 'pending'
+            ? 'completeness-pending'
+            : 'completeness-skipped',
+        sessionId: finding.sessionId,
+        machineId,
+        agent: finding.agent,
+        runId: null,
+        evaluationOrigin: finding.evaluationOrigin,
+        transcriptHash: finding.transcriptHash,
+        messageCount: finding.messageCount,
+        userTurns: null,
+        assistantTurns: null,
+        bytes: null,
+        mtimeMs: finding.mtimeMs,
+        model: null,
+        status: finding.classification === 'actionable' ? finding.evaluationStatus : finding.classification,
+        error: null,
+        details: {
+          classification: finding.classification,
+          reasons: finding.reasons.slice().sort().join(','),
+          ageMs: finding.ageMs,
+        },
+      }).catch(() => undefined);
+    }
+    for (const sessionId of this.lastAuditFindingFingerprints.keys()) {
+      if (currentFingerprints.has(sessionId)) continue;
+      await recordSessionAuditEvent({
+        event: 'completeness-recovered',
+        sessionId,
+        machineId,
+        agent: null,
+        runId: null,
+        evaluationOrigin: null,
+        transcriptHash: null,
+        messageCount: null,
+        userTurns: null,
+        assistantTurns: null,
+        bytes: null,
+        mtimeMs: null,
+        model: null,
+        status: 'ok',
+        error: null,
+        details: {},
+      }).catch(() => undefined);
+    }
+    this.lastAuditFindingFingerprints = currentFingerprints;
+    return report;
+  }
+
   async markHermesSessionUsed(id: string, jobId: string | null): Promise<void> {
     const state = await this.store.load();
     const cached = state.evaluations[id];
@@ -796,6 +1382,8 @@ export class SessionService {
     const { found, missingIds } = await this.findSessionFilesByIds([id]);
     if (missingIds.length || !found[0]) throw new Error(`Session not found: ${id}`);
     const parsed = await parseSessionFile(found[0].filePath);
+    const transcriptHash = hashTranscript(parsed.messages);
+    const runId = randomUUID();
     const state = await this.store.load();
     const cached = state.evaluations[id];
     const updateMeta = classifyUpdate({
@@ -814,6 +1402,24 @@ export class SessionService {
       };
       await this.store.save(state);
     }
+    await recordSessionAuditEvent({
+      event: 'evaluation-started',
+      sessionId: parsed.id,
+      machineId: getMachineId(),
+      agent: parsed.source,
+      runId,
+      evaluationOrigin: getCuratorRole() === 'worker' ? 'worker-fast' : 'local-llm',
+      transcriptHash,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      model: null,
+      status: 'running',
+      error: null,
+      details: { reason },
+    }).catch(() => undefined);
     try {
     const evaluation = getCuratorRole() === 'worker'
       ? fastEvaluation({
@@ -824,9 +1430,17 @@ export class SessionService {
           assistantTurns: parsed.assistantTurns,
           messageCount: parsed.messageCount,
           updateMeta,
+          transcriptHash,
+          runId,
+          evaluationOrigin: 'worker-fast',
         })
       : applyUpdateMeta(
           await evaluateSessionWithModel({
+            sessionId: parsed.id,
+            machineId: getMachineId(),
+            runId,
+            evaluationOrigin: 'local-llm',
+            transcriptHash,
             messages: parsed.messages,
             userTurns: parsed.userTurns,
             assistantTurns: parsed.assistantTurns,
@@ -868,7 +1482,35 @@ export class SessionService {
       }),
     };
     await this.store.save(state);
-    return { id, status: evaluation.status, title: evaluation.title, model: evaluation.model, error: evaluation.error };
+    await recordSessionAuditEvent({
+      event: evaluation.status === 'failed' ? 'evaluation-failed' : 'evaluation-completed',
+      sessionId: parsed.id,
+      machineId: getMachineId(),
+      agent: parsed.source,
+      runId,
+      evaluationOrigin: evaluation.evaluationOrigin ?? (getCuratorRole() === 'worker' ? 'worker-fast' : 'local-llm'),
+      transcriptHash,
+      messageCount: parsed.messageCount,
+      userTurns: parsed.userTurns,
+      assistantTurns: parsed.assistantTurns,
+      bytes: parsed.bytes,
+      mtimeMs: parsed.mtimeMs,
+      model: evaluation.model,
+      status: evaluation.status,
+      error: evaluation.error,
+      details: { reason },
+    }).catch(() => undefined);
+    return {
+      id,
+      machineId: getMachineId(),
+      status: evaluation.status,
+      title: evaluation.title,
+      model: evaluation.model,
+      error: evaluation.error,
+      runId,
+      transcriptHash,
+      evaluationOrigin: evaluation.evaluationOrigin,
+    };
     } catch (error) {
       const failedState = await this.store.load();
       const latest = failedState.evaluations[id] ?? cached;
@@ -881,6 +1523,24 @@ export class SessionService {
         };
         await this.store.save(failedState);
       }
+      await recordSessionAuditEvent({
+        event: 'evaluation-failed',
+        sessionId: parsed.id,
+        machineId: getMachineId(),
+        agent: parsed.source,
+        runId,
+        evaluationOrigin: getCuratorRole() === 'worker' ? 'worker-fast' : 'local-llm',
+        transcriptHash,
+        messageCount: parsed.messageCount,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        model: null,
+        status: 'failed',
+        error: error instanceof Error ? error.message : 'AI refresh failed',
+        details: { reason },
+      }).catch(() => undefined);
       throw error;
     }
   }
@@ -1103,10 +1763,13 @@ export class SessionService {
   }
 
   async backfillEvaluations(options: { limit?: number; includeFailed?: boolean } = {}) {
+    const nowMs = Date.now();
+    const quietMs = evaluationQuietMs();
     const state = await this.store.load();
     const files = await this.discoverSessionFiles();
     const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
     const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; sortTimeMs: number }> = [];
+    let deferredActive = 0;
 
     for (const filePath of files) {
       try {
@@ -1124,6 +1787,10 @@ export class SessionService {
           (options.includeFailed === true && cached.status === 'failed') ||
           !hasCachedMetadata(cached);
         if (!needsBackfill) continue;
+        if (nowMs - fileStat.mtimeMs < quietMs) {
+          deferredActive += 1;
+          continue;
+        }
         candidates.push({
           filePath,
           id,
@@ -1147,6 +1814,8 @@ export class SessionService {
 
     const results = await mapLimit(batch, await getEvaluationConcurrency(), async (item) => {
       const parsed = await parseSessionFile(item.filePath);
+      const transcriptHash = hashTranscript(parsed.messages);
+      const runId = randomUUID();
       const cached = state.evaluations[parsed.id];
       const updateMeta = classifyUpdate({
         cached,
@@ -1164,9 +1833,17 @@ export class SessionService {
             assistantTurns: parsed.assistantTurns,
             messageCount: parsed.messageCount,
             updateMeta,
+            transcriptHash,
+            runId,
+            evaluationOrigin: 'worker-fast',
           })
         : applyUpdateMeta(
             await evaluateSessionWithModel({
+              sessionId: parsed.id,
+              machineId: getMachineId(),
+              runId,
+              evaluationOrigin: 'local-llm',
+              transcriptHash,
               messages: parsed.messages,
               userTurns: parsed.userTurns,
               assistantTurns: parsed.assistantTurns,
@@ -1198,12 +1875,33 @@ export class SessionService {
         }),
       };
       stateChanged = true;
+      await recordSessionAuditEvent({
+        event: evaluation.status === 'failed' ? 'evaluation-failed' : 'evaluation-completed',
+        sessionId: parsed.id,
+        machineId: getMachineId(),
+        agent: parsed.source,
+        runId,
+        evaluationOrigin: evaluation.evaluationOrigin ?? (getCuratorRole() === 'worker' ? 'worker-fast' : 'local-llm'),
+        transcriptHash,
+        messageCount: parsed.messageCount,
+        userTurns: parsed.userTurns,
+        assistantTurns: parsed.assistantTurns,
+        bytes: parsed.bytes,
+        mtimeMs: parsed.mtimeMs,
+        model: evaluation.model,
+        status: evaluation.status,
+        error: evaluation.error,
+        details: { reason: 'backfill' },
+      }).catch(() => undefined);
       return {
         id: parsed.id,
         status: evaluation.status,
         title: evaluation.title,
         model: evaluation.model,
         error: evaluation.error,
+        runId,
+        transcriptHash,
+        evaluationOrigin: evaluation.evaluationOrigin,
       };
     });
 
@@ -1215,6 +1913,7 @@ export class SessionService {
       ok: results.filter((item) => item.status === 'ok').length,
       failed: results.filter((item) => item.status === 'failed').length,
       fallback: results.filter((item) => item.status === 'fallback').length,
+      deferredActive,
       results,
     };
   }

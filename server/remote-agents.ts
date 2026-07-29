@@ -3,6 +3,7 @@ import type { CodexSession } from './types.js';
 export interface RemoteAgent {
   id: string;
   baseUrl: string;
+  token: string | null;
 }
 
 export interface RemoteAgentStatus {
@@ -16,6 +17,31 @@ export interface RemoteAgentStatus {
 
 const DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS = 3500;
 const DEFAULT_REMOTE_JSON_TIMEOUT_MS = 8000;
+
+type HubEvaluationState = Pick<
+  CodexSession['evaluation'],
+  'status' | 'hermesNeedsRefresh' | 'evaluationOrigin' | 'workflow'
+>;
+
+export function hasPendingHubEvaluation(session: { evaluation: HubEvaluationState }): boolean {
+  return session.evaluation.status !== 'ok' ||
+    session.evaluation.hermesNeedsRefresh === true ||
+    session.evaluation.evaluationOrigin === 'worker-fast' ||
+    session.evaluation.workflow.includes(':needs-refresh:') ||
+    session.evaluation.workflow.endsWith(':fast-list');
+}
+
+export function shouldQueueHubRemoteEvaluation(
+  session: { messageCount: number; updatedAt?: string | null; evaluation: HubEvaluationState },
+  options: { nowMs?: number; quietMs?: number } = {},
+): boolean {
+  if (session.messageCount <= 0 || !hasPendingHubEvaluation(session)) return false;
+  const quietMs = Math.max(0, options.quietMs ?? 0);
+  if (!quietMs || !session.updatedAt) return true;
+  const updatedAtMs = Date.parse(session.updatedAt);
+  if (!Number.isFinite(updatedAtMs)) return true;
+  return (options.nowMs ?? Date.now()) - updatedAtMs >= quietMs;
+}
 
 function timeoutMs(envName: string, fallback: number): number {
   const value = Number(process.env[envName]);
@@ -42,7 +68,12 @@ export function getRemoteAgents(): RemoteAgent[] {
     .filter(Boolean)
     .map((entry) => {
       const [id, ...urlParts] = entry.split('=');
-      return { id: id.trim(), baseUrl: urlParts.join('=').trim().replace(/\/+$/, '') };
+      const cleanId = id.trim();
+      return {
+        id: cleanId,
+        baseUrl: urlParts.join('=').trim().replace(/\/+$/, ''),
+        token: remoteAgentToken(cleanId),
+      };
     })
     .filter((agent) => agent.id && agent.baseUrl);
 }
@@ -53,13 +84,33 @@ export function wsUrlForAgent(agent: RemoteAgent, path: string): string {
   return url.toString();
 }
 
-function getRemoteAdminToken(): string | null {
-  return process.env.CURATOR_REMOTE_ADMIN_TOKEN || process.env.CURATOR_ADMIN_TOKEN || null;
+function parseRemoteAgentTokens(): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const entry of (process.env.CURATOR_REMOTE_AGENT_TOKENS || '').split(',')) {
+    const [id, ...tokenParts] = entry.split('=');
+    const token = tokenParts.join('=').trim();
+    if (id?.trim() && token) result.set(id.trim(), token);
+  }
+  return result;
+}
+
+function remoteAgentToken(id: string): string | null {
+  const envName = `CURATOR_REMOTE_AGENT_TOKEN_${id.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+  return process.env[envName] || parseRemoteAgentTokens().get(id) || process.env.CURATOR_REMOTE_ADMIN_TOKEN || process.env.CURATOR_ADMIN_TOKEN || null;
+}
+
+function getRemoteAdminToken(agent: RemoteAgent): string | null {
+  return agent.token || remoteAgentToken(agent.id);
+}
+
+function remoteHeaders(agent: RemoteAgent, init: Record<string, string> = {}): Record<string, string> {
+  const token = getRemoteAdminToken(agent);
+  return token ? { ...init, Authorization: `Bearer ${token}` } : init;
 }
 
 function remoteUrl(agent: RemoteAgent, path: string): URL {
   const url = new URL(path, `${agent.baseUrl}/`);
-  const token = getRemoteAdminToken();
+  const token = getRemoteAdminToken(agent);
   if (token && !url.searchParams.has('admin_token')) url.searchParams.set('admin_token', token);
   return url;
 }
@@ -68,7 +119,8 @@ export async function fetchAgentSessions(agent: RemoteAgent): Promise<CodexSessi
   try {
     const response = await fetchWithTimeout(
       remoteUrl(agent, '/api/sessions?detail=0&remote=0'),
-      timeoutMs('CURATOR_REMOTE_SESSIONS_TIMEOUT_MS', DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS)
+      timeoutMs('CURATOR_REMOTE_SESSIONS_TIMEOUT_MS', DEFAULT_REMOTE_SESSIONS_TIMEOUT_MS),
+      { headers: remoteHeaders(agent) },
     );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = (await response.json()) as { sessions?: CodexSession[] };
@@ -84,7 +136,8 @@ export async function checkRemoteAgent(agent: RemoteAgent): Promise<RemoteAgentS
   try {
     const response = await fetchWithTimeout(
       remoteUrl(agent, '/api/meta'),
-      timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
+      timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+      { headers: remoteHeaders(agent) },
     );
     const latencyMs = Date.now() - started;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -112,7 +165,8 @@ export async function checkRemoteAgent(agent: RemoteAgent): Promise<RemoteAgentS
 export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promise<T> {
   const response = await fetchWithTimeout(
     remoteUrl(agent, path),
-    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS)
+    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+    { headers: remoteHeaders(agent) },
   );
   if (!response.ok) throw new Error(`${agent.id} HTTP ${response.status}`);
   return (await response.json()) as T;
@@ -124,7 +178,7 @@ export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: u
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: remoteHeaders(agent, { 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     }
   );
@@ -138,7 +192,7 @@ export async function deleteAgentJson<T>(agent: RemoteAgent, path: string, body:
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     {
       method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
+      headers: remoteHeaders(agent, { 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     }
   );
@@ -156,7 +210,7 @@ export async function deleteAgentSessionsBulk<T>(agent: RemoteAgent, sessionIds:
     timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: remoteHeaders(agent, { 'Content-Type': 'application/json' }),
       body: JSON.stringify({ confirm: true, ids: sessionIds }),
     }
   );

@@ -124,10 +124,26 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
     assert.equal(history.messages.length, 2);
     await requestJson<JsonRecord>(baseUrl, '/api/hermes/jobs');
     await requestJson<JsonRecord>(baseUrl, '/api/recycle-bin?remote=0');
+    const audit = await requestJson<{ counts: JsonRecord; issues: JsonRecord[]; pending: JsonRecord[]; skipped: JsonRecord[] }>(baseUrl, '/api/audit/completeness');
+    assert.equal(audit.counts.parsedSessions, 2);
+    assert.equal(audit.counts.eligibleSessions, 2);
+    assert.equal(audit.counts.fullyEvaluatedSessions, 0);
+    assert.equal(audit.counts.pendingEvaluationSessions, 2);
+    assert.equal(audit.counts.actionableIssues, 0);
+    assert.equal(audit.issues.length, 0);
+    assert.equal(audit.pending.length, 2);
+    assert.equal(audit.skipped.length, 0);
+    const evaluationInput = await requestJson<{ transcriptHash: string; messageCount: number }>(
+      baseUrl,
+      `/api/worker/evaluation-input/${codexSessionId}`,
+    );
+    assert.match(evaluationInput.transcriptHash, /^[0-9a-f]{64}$/);
+    assert.equal(evaluationInput.messageCount, 2);
 
     const hubOnlyRequests: Array<[string, RequestInit | undefined]> = [
       ['/', undefined],
       ['/api/knowledge/search?q=test', undefined],
+      ['/api/knowledge/proposals', undefined],
       ['/api/hermes/knowledge-document?path=knowledge%2FINDEX.md', undefined],
       ['/api/context-pack?q=test', undefined],
       ['/api/analysis-runs', undefined],
@@ -136,6 +152,8 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
       ['/api/commander-actions', undefined],
       ['/api/hermes/dispatch', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
       ['/api/remote-agents', undefined],
+      ['/api/audit/fleet', undefined],
+      ['/api/sessions/ai-search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"query":"test"}' }],
     ];
     for (const [path, init] of hubOnlyRequests) {
       const response = await fetch(`${baseUrl}${path}`, init);

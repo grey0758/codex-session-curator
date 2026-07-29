@@ -28,6 +28,14 @@ const MAX_COLS = 240;
 const MIN_ROWS = 12;
 const MAX_ROWS = 100;
 const SHELL_ENV_CACHE_MS = 60_000;
+const INHERITED_CODEX_AUTH_ENV_NAMES = [
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'API_KEY',
+  'OPENAI_BASE_URL',
+  'CODEX_BASE_URL',
+  'BASE_URL',
+] as const;
 
 let cachedUserShellEnv: { loadedAt: number; env: NodeJS.ProcessEnv } | null = null;
 
@@ -46,8 +54,23 @@ function envNameForMachine(prefix: string, machineId: string | null | undefined)
   return normalized ? `${prefix}_${normalized}` : null;
 }
 
-function terminalTransport(): TerminalTransport {
-  const configured = process.env.CURATOR_TERMINAL_TRANSPORT?.trim().toLowerCase();
+function envEntryForMachine(
+  prefix: string,
+  machineId: string | null | undefined,
+  env: NodeJS.ProcessEnv
+): { name: string; value: string } | null {
+  const machineName = envNameForMachine(prefix, machineId);
+  const machineValue = machineName ? env[machineName]?.trim() : '';
+  if (machineName && machineValue) return { name: machineName, value: machineValue };
+  const value = env[prefix]?.trim();
+  return value ? { name: prefix, value } : null;
+}
+
+export function terminalTransportForSession(
+  session: CodexSession,
+  env: NodeJS.ProcessEnv = process.env
+): TerminalTransport {
+  const configured = envEntryForMachine('CURATOR_TERMINAL_TRANSPORT', session.machineId, env)?.value.toLowerCase();
   return configured === 'ssh' || configured === 'local' || configured === 'auto' ? configured : 'auto';
 }
 
@@ -97,9 +120,15 @@ function findClaudeBin(env: NodeJS.ProcessEnv): string | null {
 }
 
 export function getCodexBin(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = process.env.CODEX_BIN || env.CODEX_BIN;
+  const found = findCodexBin(env);
+  if (found && canRunCommand(found, env)) return found;
+  return 'codex';
+}
+
+export function getCodexWorkerBin(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.CODEX_BIN?.trim();
   if (configured && canRunCommand(configured, env)) return configured;
-  return findCodexBin(env) ?? configured ?? 'codex';
+  return getCodexBin(env);
 }
 
 export function getClaudeBin(env: NodeJS.ProcessEnv = process.env): string {
@@ -134,12 +163,14 @@ function loadUserShellEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-export function createTerminalEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...loadUserShellEnv(),
-  };
+export function sanitizeCodexTerminalEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...source };
+  for (const name of INHERITED_CODEX_AUTH_ENV_NAMES) delete env[name];
+  return env;
+}
 
+export function normalizeCodexWorkerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...source };
   if (!env.CODEX_API_KEY && env.API_KEY) env.CODEX_API_KEY = env.API_KEY;
   if (!env.CODEX_BASE_URL && env.BASE_URL) env.CODEX_BASE_URL = env.BASE_URL;
   env.TERM = 'xterm-256color';
@@ -147,9 +178,44 @@ export function createTerminalEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+export function mergeCodexWorkerEnv(
+  shellEnv: NodeJS.ProcessEnv,
+  serviceEnv: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+  return normalizeCodexWorkerEnv({
+    ...shellEnv,
+    ...serviceEnv,
+  });
+}
+
+export function createWorkerEnv(): NodeJS.ProcessEnv {
+  return mergeCodexWorkerEnv(loadUserShellEnv(), process.env);
+}
+
+export function createTerminalEnv(): NodeJS.ProcessEnv {
+  const env = sanitizeCodexTerminalEnv({
+    ...process.env,
+    ...loadUserShellEnv(),
+  });
+  env.TERM = 'xterm-256color';
+  env.COLORTERM = env.COLORTERM || 'truecolor';
+  return env;
+}
+
+export function createCodexResumeArgs(session: CodexSession): string[] {
+  return [
+    'resume',
+    '--include-non-interactive',
+    '--no-alt-screen',
+    '-C',
+    session.cwd || process.cwd(),
+    session.id,
+  ];
+}
+
 export function createCodexResumeCommand(session: CodexSession, env: NodeJS.ProcessEnv = process.env): string {
-  const cwd = session.cwd || process.cwd();
-  return `${shellCommandWord(getCodexBin(env))} resume --include-non-interactive --no-alt-screen -C ${shellQuote(cwd)} ${shellQuote(session.id)}`;
+  const args = createCodexResumeArgs(session).map(shellCommandWord).join(' ');
+  return `${shellCommandWord(getCodexBin(env))} ${args}`;
 }
 
 export function createAgentResumeCommand(session: CodexSession, env: NodeJS.ProcessEnv = process.env): string {
@@ -157,6 +223,12 @@ export function createAgentResumeCommand(session: CodexSession, env: NodeJS.Proc
     return `${shellCommandWord(getClaudeBin(env))} --resume ${shellQuote(session.id)}`;
   }
   return createCodexResumeCommand(session, env);
+}
+
+export function createTmuxAgentResumeCommand(session: CodexSession, env: NodeJS.ProcessEnv = process.env): string {
+  const command = createAgentResumeCommand(session, env);
+  if (session.agent !== 'codex') return command;
+  return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(`exec ${command}`)}`;
 }
 
 function clampDimension(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -216,7 +288,7 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
   }
 
   const cwd = session.cwd || process.cwd();
-  const command = createAgentResumeCommand(session, env);
+  const command = createTmuxAgentResumeCommand(session, env);
   const created = spawnSync(
     'tmux',
     tmuxArgs(['new-session', '-d', '-s', name, '-c', cwd, '-x', String(cols), '-y', String(rows), command]),
@@ -237,11 +309,9 @@ function ensureTmuxSession(session: CodexSession, cols: number, rows: number, en
 }
 
 function createDirectAgentPty(session: CodexSession, cols: number, rows: number, env: NodeJS.ProcessEnv) {
-  const command = session.agent === 'claude' ? getClaudeBin(env) : getCodexBin(env);
-  const args = session.agent === 'claude'
-    ? ['--resume', session.id]
-    : ['resume', '--include-non-interactive', '--no-alt-screen', '-C', session.cwd || process.cwd(), session.id];
-  return spawnPty(command, args, {
+  const shell = env.SHELL || process.env.SHELL || '/bin/bash';
+  const command = createAgentResumeCommand(session, env);
+  return spawnPty(shell, ['-l', '-c', `exec ${command}`], {
     name: 'xterm-256color',
     cols,
     rows,
@@ -250,13 +320,20 @@ function createDirectAgentPty(session: CodexSession, cols: number, rows: number,
   });
 }
 
-function remoteAgentCommand(session: CodexSession, cols: number, rows: number): string {
+export function remoteAgentCommand(
+  session: CodexSession,
+  cols: number,
+  rows: number
+): string {
   const cwdArg = session.cwd ? shellQuote(session.cwd) : '"$HOME"';
   const tmuxName = tmuxSessionName(session);
   const socketName = shellQuote(tmuxSocketName());
   const resumeCommand = session.agent === 'claude'
     ? `claude --resume ${shellQuote(session.id)}`
     : `codex resume --include-non-interactive --no-alt-screen -C ${cwdArg} ${shellQuote(session.id)}`;
+  const tmuxResumeCommand = session.agent === 'codex'
+    ? `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(`exec ${resumeCommand}`)}`
+    : resumeCommand;
   const script = [
     'set -e',
     'export TERM=xterm-256color',
@@ -266,7 +343,7 @@ function remoteAgentCommand(session: CodexSession, cols: number, rows: number): 
     `  TMUX_SOCKET=${socketName}`,
     '  tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }',
     `  if ! tmux_cmd has-session -t ${shellQuote(tmuxName)} 2>/dev/null; then`,
-    `    tmux_cmd new-session -d -s ${shellQuote(tmuxName)} -c ${cwdArg} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} ${shellQuote(resumeCommand)}`,
+    `    tmux_cmd new-session -d -s ${shellQuote(tmuxName)} -c ${cwdArg} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} ${shellQuote(tmuxResumeCommand)}`,
     '  fi',
     `  tmux_cmd set-option -t ${shellQuote(tmuxName)} status off >/dev/null 2>&1 || true`,
     `  tmux_cmd set-option -t ${shellQuote(tmuxName)} prefix None >/dev/null 2>&1 || true`,
@@ -356,7 +433,7 @@ export function startCodexTerminal(
   const cols = clampDimension(options.cols, DEFAULT_COLS, MIN_COLS, MAX_COLS);
   const rows = clampDimension(options.rows, DEFAULT_ROWS, MIN_ROWS, MAX_ROWS);
   const env = createTerminalEnv();
-  const transport = terminalTransport();
+  const transport = terminalTransportForSession(session, process.env);
   const sshTarget = sshTargetForSession(session);
   const sshCommand = sshCommandForSession(session);
   const sshHostFirst = sshHostFirstForSession(session);

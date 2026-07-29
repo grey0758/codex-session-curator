@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { spawn as spawnPty, type IPty } from 'node-pty';
 import type { CodexSession } from './types.js';
-import { createTerminalEnv, getClaudeBin, getCodexBin } from './terminal.js';
+import { createWorkerEnv, getClaudeBin, getCodexWorkerBin } from './terminal.js';
 
 export type CodexJobStatus = 'running' | 'completed' | 'failed' | 'stopped';
 export type CodexJobMode = 'exec' | 'pty';
@@ -216,8 +216,10 @@ function recordJobEvent(
   return event;
 }
 
+const ANSI_ESCAPE_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
+
 function stripAnsi(value: string): string {
-  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  return value.replace(ANSI_ESCAPE_SEQUENCE, '');
 }
 
 function truncateEventText(value: string, maxBytes = EVENT_TAIL_BYTES): string {
@@ -407,7 +409,7 @@ function stopRuntimeJob(job: CodexJobRuntime, reason: string): void {
   if (wasRunning) recordJobEvent(job, 'status', reason, { status: job.status });
   if (job.process) job.process.kill('SIGTERM');
   if (job.pty) job.pty.kill();
-  if (job.tmuxName) spawnSync('tmux', ['kill-session', '-t', job.tmuxName], { env: createTerminalEnv(), stdio: 'ignore' });
+  if (job.tmuxName) spawnSync('tmux', ['kill-session', '-t', job.tmuxName], { env: createWorkerEnv(), stdio: 'ignore' });
 }
 
 function enforceJobPolicy(job: CodexJobRuntime): void {
@@ -579,12 +581,14 @@ function captureTmuxTail(job: CodexJobRuntime, env: NodeJS.ProcessEnv): void {
 }
 
 function refreshRuntimeJob(job: CodexJobRuntime): void {
-  if (job.mode === 'pty') captureTmuxTail(job, createTerminalEnv());
+  if (job.mode === 'pty') captureTmuxTail(job, createWorkerEnv());
 }
 
 function snapshotJob(job: CodexJobRuntime): CodexResumeJob {
-  const { process: _process, pty: _pty, ...rest } = job;
-  return rest;
+  const snapshot = { ...job };
+  delete snapshot.process;
+  delete snapshot.pty;
+  return snapshot;
 }
 
 export function publicJob(job: CodexJobRuntime): CodexResumeJob {
@@ -634,7 +638,7 @@ function buildInteractiveCommand(input: { session: CodexSession; model?: string 
   const args = ['resume', '--include-non-interactive', '--no-alt-screen', '-C', cwd];
   if (input.model) args.push('-m', input.model);
   args.push(input.session.id);
-  return [shellCommandWord(getCodexBin(env)), ...args.map(shellQuote)].join(' ');
+  return [shellCommandWord(getCodexWorkerBin(env)), ...args.map(shellQuote)].join(' ');
 }
 
 function baseJob(input: {
@@ -696,10 +700,10 @@ export function startCodexResumeJob(input: {
   policy?: CodexJobPolicy;
   onExit?: (job: CodexResumeJob) => void | Promise<void>;
 }): CodexResumeJob {
-  const env = createTerminalEnv();
+  const env = createWorkerEnv();
   const cwd = input.session.cwd || process.cwd();
   const isClaude = (input.session.agent ?? 'codex') === 'claude';
-  const workerBin = isClaude ? getClaudeBin(env) : getCodexBin(env);
+  const workerBin = isClaude ? getClaudeBin(env) : getCodexWorkerBin(env);
   // Claude workers run headless (exec) only; the interactive tmux/pty path is Codex-specific.
   const mode = isClaude ? 'exec' : input.mode ?? 'exec';
   const supervisor = mergeSupervisorInput(input.supervisor, input.supervisorStrategy);
@@ -831,7 +835,7 @@ function startCodexPtyJob(input: {
         cwd: input.cwd,
         env: input.env,
       })
-    : spawnPty(getCodexBin(input.env), ['resume', '--include-non-interactive', '--no-alt-screen', '-C', input.cwd, input.session.id], {
+    : spawnPty(getCodexWorkerBin(input.env), ['resume', '--include-non-interactive', '--no-alt-screen', '-C', input.cwd, input.session.id], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
@@ -889,7 +893,7 @@ function injectPtyText(job: CodexJobRuntime, text: string): boolean {
     return true;
   }
   if (job.tmuxName) {
-    const env = createTerminalEnv();
+    const env = createWorkerEnv();
     spawnSync('tmux', ['send-keys', '-t', job.tmuxName, '-l', text.trim()], { env, stdio: 'ignore' });
     spawnSync('tmux', ['send-keys', '-t', job.tmuxName, 'Enter'], { env, stdio: 'ignore' });
     return true;
@@ -1194,7 +1198,7 @@ function loadPersistedJobs(): void {
   if (!existsSync(path)) return;
   try {
     const payload = JSON.parse(readFileSync(path, 'utf8')) as { jobs?: Partial<CodexResumeJob>[] };
-    const env = createTerminalEnv();
+    const env = createWorkerEnv();
     for (const item of payload.jobs ?? []) {
       const job = normalizePersistedJob(item);
       if (job.status === 'running' && job.mode === 'exec') {

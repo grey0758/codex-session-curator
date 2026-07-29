@@ -199,6 +199,7 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
   const fileStat = await stat(filePath);
   const source: AgentKind = isClaudeSessionPath(filePath) ? 'claude' : 'codex';
   let id = extractSessionId(filePath);
+  let primarySessionMetaSeen = false;
   const stream = createReadStream(filePath, { encoding: 'utf8' });
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -222,14 +223,25 @@ export async function parseSessionFile(filePath: string): Promise<ParsedSessionF
     }
 
     const timestamp = typeof record.timestamp === 'string' ? record.timestamp : null;
-    if (timestamp) updatedAt = timestamp;
+    if (
+      timestamp &&
+      (!updatedAt || !Number.isFinite(Date.parse(updatedAt)) || Date.parse(timestamp) >= Date.parse(updatedAt))
+    ) {
+      updatedAt = timestamp;
+    }
     if (!startedAt && timestamp) startedAt = timestamp;
 
     if (record.type === 'session_meta') {
       const payload = record.payload as Record<string, unknown> | undefined;
-      id = typeof payload?.id === 'string' ? payload.id : id;
-      cwd = typeof payload?.cwd === 'string' ? payload.cwd : cwd;
-      startedAt = typeof payload?.timestamp === 'string' ? payload.timestamp : startedAt;
+      // Newer Codex subagent rollouts append inherited parent-thread records,
+      // including the parent's session_meta. Only the first metadata record
+      // belongs to this file; later metadata must not replace its identity.
+      if (!primarySessionMetaSeen) {
+        id = typeof payload?.id === 'string' ? payload.id : id;
+        cwd = typeof payload?.cwd === 'string' ? payload.cwd : cwd;
+        startedAt = typeof payload?.timestamp === 'string' ? payload.timestamp : startedAt;
+        primarySessionMetaSeen = true;
+      }
       continue;
     }
 

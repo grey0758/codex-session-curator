@@ -83,6 +83,10 @@ interface Evaluation {
   model: string;
   status: 'ok' | 'fallback' | 'failed';
   error: string | null;
+  evaluationOrigin?: 'local-llm' | 'worker-fast' | 'hub-remote' | 'rule-fallback' | null;
+  evaluatedByMachineId?: string | null;
+  evaluationRunId?: string | null;
+  transcriptHash?: string | null;
 }
 
 interface SessionMessagePreview {
@@ -134,6 +138,46 @@ interface ApiPayload {
   pageSize?: number;
 }
 
+interface AiSessionSearchMatch {
+  identity: {
+    key: string;
+    sessionId: string;
+    machineId: string;
+    agent: AgentKind;
+  };
+  confidence: number;
+  reason: string;
+  localScore: number;
+  session: CodexSession;
+}
+
+interface AiSessionSearchPayload {
+  query: string;
+  intent: string;
+  mode: 'deepseek' | 'fallback-local';
+  model: string | null;
+  fallbackReason: string | null;
+  routing: {
+    mode: 'deepseek' | 'user-filter' | 'local-hint' | 'broad';
+    scope: 'focused' | 'broad';
+    machineIds: string[];
+    confidence: number;
+    reason: string;
+    searchTerms: string[];
+    latencyMs: number;
+    fallbackReason: string | null;
+  };
+  phaseLatencyMs: {
+    routing: number;
+    ranking: number;
+  };
+  latencyMs: number;
+  candidateCount: number;
+  candidateMachineCounts: Record<string, number>;
+  count: number;
+  matches: AiSessionSearchMatch[];
+}
+
 interface RecycleArchive {
   sessionId: string;
   agent: AgentKind | null;
@@ -152,6 +196,43 @@ interface RecyclePayload {
   meta: ApiPayload['meta'];
   archives: RecycleArchive[];
   errors?: Array<{ machineId: string; error: string }>;
+}
+
+interface FleetAuditSummary {
+  machines: number;
+  discoveredSessions: number;
+  eligibleSessions: number;
+  fullyEvaluatedSessions: number;
+  pendingEvaluationSessions: number;
+  metadataOnlySessions: number;
+  settledEligibleSessions: number;
+  analysisCoveragePercent: number;
+  settledCoveragePercent: number;
+  localIssues: number;
+  remoteIssues: number;
+  missingFromPanel: number;
+  unhealthyRemotes: number;
+}
+
+interface FleetAuditPayload {
+  generatedAt: string;
+  hubMachineId: string;
+  summary: FleetAuditSummary;
+}
+
+interface SessionAuditEvent {
+  id: string;
+  at: string;
+  event: string;
+  sessionId: string | null;
+  machineId: string;
+  runId: string | null;
+  evaluationOrigin: string | null;
+  transcriptHash: string | null;
+  model: string | null;
+  status: string | null;
+  error: string | null;
+  details: Record<string, string | number | boolean | null>;
 }
 
 function asArray<T>(value: T[] | null | undefined): T[] {
@@ -204,6 +285,10 @@ function normalizeEvaluation(session: Partial<CodexSession>): Evaluation {
     model: evaluation.model ?? flat.model ?? 'none',
     status: evaluation.status ?? flat.status ?? 'fallback',
     error: evaluation.error ?? flat.error ?? null,
+    evaluationOrigin: evaluation.evaluationOrigin ?? null,
+    evaluatedByMachineId: evaluation.evaluatedByMachineId ?? null,
+    evaluationRunId: evaluation.evaluationRunId ?? null,
+    transcriptHash: evaluation.transcriptHash ?? null,
   };
 }
 
@@ -258,7 +343,7 @@ interface HistoryPayload {
 }
 
 interface RecentUserMessagesState {
-  sessionId: string | null;
+  sessionKey: string | null;
   messages: HistoryMessage[];
   loading: boolean;
   error: boolean;
@@ -576,6 +661,14 @@ function readTerminalSessionId(): string | null {
   }
 }
 
+function readTerminalMachineId(): string | null {
+  try {
+    return new URL(window.location.href).searchParams.get('machine');
+  } catch {
+    return null;
+  }
+}
+
 function readFilesSessionId(): string | null {
   try {
     return new URL(window.location.href).searchParams.get('files');
@@ -584,11 +677,12 @@ function readFilesSessionId(): string | null {
   }
 }
 
-function terminalPageUrl(sessionId: string): string {
+function terminalPageUrl(sessionId: string, machineId: string): string {
   const url = new URL(window.location.href);
   url.search = '';
   url.hash = '';
   url.searchParams.set('terminal', sessionId);
+  url.searchParams.set('machine', machineId);
   return url.toString();
 }
 
@@ -600,11 +694,11 @@ function filesPageUrl(sessionId: string): string {
   return url.toString();
 }
 
-function terminalPlaceholderSession(sessionId: string): TerminalSessionTarget {
+function terminalPlaceholderSession(sessionId: string, machineId: string | null): TerminalSessionTarget {
   return {
     id: sessionId,
     agent: 'codex',
-    machineId: 'unknown',
+    machineId: machineId || 'unknown',
     cwd: null,
     title: `SSH 终端 ${sessionId}`,
   };
@@ -905,6 +999,10 @@ function machineKey(machineId: string | null | undefined, baseUrl: string | null
   return `${machineId || 'unknown'}|||${baseUrl || 'local'}`;
 }
 
+function sessionKey(session: Pick<CodexSession, 'id' | 'agent' | 'machineId'>): string {
+  return `${session.machineId || 'unknown'}|||${session.agent}|||${session.id}`;
+}
+
 function LoginPanel({ busy, message, onLogin }: LoginPanelProps) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -1193,6 +1291,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       cols: String(terminal.cols || 120),
       rows: String(terminal.rows || 40),
     });
+    if (session.machineId && session.machineId !== 'unknown') terminalParams.set('machineId', session.machineId);
     const socket = new WebSocket(
       `${protocol}://${window.location.host}/api/sessions/${encodeURIComponent(session.id)}/terminal?${terminalParams.toString()}`
     );
@@ -1478,8 +1577,9 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
   }, [onUnauthorized, sessionId]);
 
   useEffect(() => {
-    void loadFiles('');
-  }, [loadFiles, sessionId]);
+    const handle = window.setTimeout(() => void loadFiles(''), 0);
+    return () => window.clearTimeout(handle);
+  }, [loadFiles]);
 
   const uploadFile = useCallback(async (file: File) => {
     setUploading(true);
@@ -1592,11 +1692,12 @@ function SessionFileBrowser({ sessionId, onUnauthorized }: { sessionId: string; 
 
 function App() {
   const [terminalOnlySessionId] = useState(readTerminalSessionId);
+  const [terminalOnlyMachineId] = useState(readTerminalMachineId);
   const [filesOnlySessionId] = useState(readFilesSessionId);
   const isTerminalOnlyPage = Boolean(terminalOnlySessionId);
   const isFilesOnlyPage = Boolean(filesOnlySessionId);
   const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(() =>
-    terminalOnlySessionId ? terminalPlaceholderSession(terminalOnlySessionId) : null
+    terminalOnlySessionId ? terminalPlaceholderSession(terminalOnlySessionId, terminalOnlyMachineId) : null
   );
   const [terminalOnlyLoading, setTerminalOnlyLoading] = useState(Boolean(terminalOnlySessionId));
   const [terminalOnlyError, setTerminalOnlyError] = useState<string | null>(null);
@@ -1610,7 +1711,11 @@ function App() {
   const [agentFilter, setAgentFilter] = useState<AgentFilter>(readStoredAgentFilter);
   const [listViewMode, setListViewMode] = useState<SessionListViewMode>('folder');
   const [query, setQuery] = useState('');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [aiSearchQuery, setAiSearchQuery] = useState('');
+  const [aiSearchResult, setAiSearchResult] = useState<AiSessionSearchPayload | null>(null);
+  const [aiSearchLoading, setAiSearchLoading] = useState(false);
+  const [aiSearchError, setAiSearchError] = useState<string | null>(null);
+  const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1619,7 +1724,7 @@ function App() {
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [copiedResumeId, setCopiedResumeId] = useState<string | null>(null);
-  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
+  const [selectedSessionKeys, setSelectedSessionKeys] = useState<string[]>([]);
   const [openedTerminalIds, setOpenedTerminalIds] = useState<string[]>([]);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
@@ -1627,7 +1732,7 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadedSessionId, setHistoryLoadedSessionId] = useState<string | null>(null);
   const [recentUserMessages, setRecentUserMessages] = useState<RecentUserMessagesState>({
-    sessionId: null,
+    sessionKey: null,
     messages: [],
     loading: false,
     error: false,
@@ -1664,6 +1769,41 @@ function App() {
   const [contextPackLoading, setContextPackLoading] = useState(false);
   const [contextPackError, setContextPackError] = useState<string | null>(null);
   const [contextPromptCopied, setContextPromptCopied] = useState(false);
+  const [fleetAudit, setFleetAudit] = useState<FleetAuditPayload | null>(null);
+  const [fleetAuditLoading, setFleetAuditLoading] = useState(false);
+  const [fleetAuditError, setFleetAuditError] = useState<string | null>(null);
+  const [sessionAuditEvents, setSessionAuditEvents] = useState<SessionAuditEvent[]>([]);
+
+  const loadFleetAudit = useCallback(async (refresh = false) => {
+    setFleetAuditLoading(true);
+    setFleetAuditError(null);
+    try {
+      const response = await fetch(`/api/audit/fleet${refresh ? '?refresh=1' : ''}`);
+      const payload = (await response.json().catch(() => ({}))) as FleetAuditPayload & { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setFleetAudit(payload);
+    } catch (err) {
+      setFleetAuditError(err instanceof Error ? err.message : '会话完整性审计失败');
+    } finally {
+      setFleetAuditLoading(false);
+    }
+  }, []);
+
+  const loadSessionAudit = useCallback(async (session: CodexSession) => {
+    try {
+      const params = new URLSearchParams({
+        sessionId: session.id,
+        machineId: session.machineId,
+        limit: '80',
+      });
+      const response = await fetch(`/api/audit/events?${params.toString()}`);
+      const payload = (await response.json().catch(() => ({}))) as { events?: SessionAuditEvent[] };
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setSessionAuditEvents(Array.isArray(payload.events) ? payload.events.slice().reverse() : []);
+    } catch {
+      setSessionAuditEvents([]);
+    }
+  }, []);
 
   const refreshRemoteStatuses = useCallback(async () => {
     try {
@@ -1741,6 +1881,80 @@ function App() {
     }
   }, [refreshRemoteStatuses]);
 
+  const runAiSessionSearch = useCallback(async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    const searchText = aiSearchQuery.trim();
+    if (searchText.length < 2 || aiSearchLoading) return;
+    setAiSearchLoading(true);
+    setAiSearchError(null);
+    try {
+      const response = await fetch('/api/sessions/ai-search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: searchText,
+          limit: 12,
+          machineId: machineFilter,
+          agent: agentFilter,
+        }),
+      });
+      if (response.status === 401) {
+        setAuthRequired(true);
+        return;
+      }
+      const payload = (await response.json().catch(() => ({}))) as Partial<AiSessionSearchPayload> & { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      const matches = Array.isArray(payload.matches)
+        ? payload.matches.map((match) => ({
+            ...match,
+            session: normalizeSession(match.session),
+          }))
+        : [];
+      const normalized: AiSessionSearchPayload = {
+        query: payload.query ?? searchText,
+        intent: payload.intent ?? searchText,
+        mode: payload.mode === 'fallback-local' ? 'fallback-local' : 'deepseek',
+        model: payload.model ?? null,
+        fallbackReason: payload.fallbackReason ?? null,
+        routing: {
+          mode:
+            payload.routing?.mode === 'deepseek' ||
+            payload.routing?.mode === 'user-filter' ||
+            payload.routing?.mode === 'local-hint'
+              ? payload.routing.mode
+              : 'broad',
+          scope: payload.routing?.scope === 'focused' ? 'focused' : 'broad',
+          machineIds: Array.isArray(payload.routing?.machineIds) ? payload.routing.machineIds : [],
+          confidence: typeof payload.routing?.confidence === 'number' ? payload.routing.confidence : 0,
+          reason: payload.routing?.reason ?? '',
+          searchTerms: Array.isArray(payload.routing?.searchTerms) ? payload.routing.searchTerms : [],
+          latencyMs: typeof payload.routing?.latencyMs === 'number' ? payload.routing.latencyMs : 0,
+          fallbackReason: payload.routing?.fallbackReason ?? null,
+        },
+        phaseLatencyMs: {
+          routing: typeof payload.phaseLatencyMs?.routing === 'number' ? payload.phaseLatencyMs.routing : 0,
+          ranking: typeof payload.phaseLatencyMs?.ranking === 'number' ? payload.phaseLatencyMs.ranking : 0,
+        },
+        latencyMs: typeof payload.latencyMs === 'number' ? payload.latencyMs : 0,
+        candidateCount: typeof payload.candidateCount === 'number' ? payload.candidateCount : 0,
+        candidateMachineCounts:
+          payload.candidateMachineCounts && typeof payload.candidateMachineCounts === 'object'
+            ? payload.candidateMachineCounts
+            : {},
+        count: matches.length,
+        matches,
+      };
+      setAiSearchResult(normalized);
+      setActiveTab('all');
+      setQuery('');
+      setSelectedSessionKey(matches[0] ? sessionKey(matches[0].session) : null);
+    } catch (err) {
+      setAiSearchError(err instanceof Error ? err.message : 'AI 快速检索失败');
+    } finally {
+      setAiSearchLoading(false);
+    }
+  }, [agentFilter, aiSearchLoading, aiSearchQuery, machineFilter]);
+
   const loadTerminalOnlySession = useCallback(async () => {
     if (!terminalOnlySessionId) return;
     setTerminalOnlyLoading(true);
@@ -1748,7 +1962,10 @@ function App() {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 8000);
     try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(terminalOnlySessionId)}`, { signal: controller.signal });
+      const params = new URLSearchParams();
+      if (terminalOnlyMachineId) params.set('machineId', terminalOnlyMachineId);
+      const suffix = params.size ? `?${params.toString()}` : '';
+      const response = await fetch(`/api/sessions/${encodeURIComponent(terminalOnlySessionId)}${suffix}`, { signal: controller.signal });
       if (response.status === 401) {
         setAuthRequired(true);
         return;
@@ -1766,7 +1983,7 @@ function App() {
       window.clearTimeout(timeout);
       setTerminalOnlyLoading(false);
     }
-  }, [terminalOnlySessionId]);
+  }, [terminalOnlyMachineId, terminalOnlySessionId]);
 
   const upsertWorkerJob = useCallback((job: CodexWorkerJob) => {
     setWorkerJobs((current) => sortWorkerJobs([job, ...current.filter((item) => item.id !== job.id)]));
@@ -1972,7 +2189,8 @@ function App() {
         await loadTerminalOnlySession();
         return;
       }
-      await Promise.all([loadSessions(), loadCommanderActions()]);
+      await loadSessions();
+      void Promise.all([loadCommanderActions(), loadFleetAudit()]);
     } catch (err) {
       setAuthMessage(err instanceof Error ? err.message : '登录失败');
     } finally {
@@ -1987,20 +2205,31 @@ function App() {
     setSessionDetails({});
     setRecycleArchives([]);
     setCommanderActions([]);
-    setSelectedId(null);
+    setFleetAudit(null);
+    setSessionAuditEvents([]);
+    setAiSearchResult(null);
+    setAiSearchError(null);
+    setSelectedSessionKey(null);
   }
 
   useEffect(() => {
     if (isTerminalOnlyPage || isFilesOnlyPage) return;
+    let cancelled = false;
     const handle = window.setTimeout(() => {
-      void Promise.all([loadSessions(), loadCommanderActions()]);
+      void Promise.all([loadSessions(), loadCommanderActions()]).finally(() => {
+        if (!cancelled) void loadFleetAudit();
+      });
     }, 150);
-    return () => window.clearTimeout(handle);
-  }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadSessions]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadFleetAudit, loadSessions]);
 
   useEffect(() => {
     if (!terminalOnlySessionId || authRequired) return;
-    void loadTerminalOnlySession();
+    const handle = window.setTimeout(() => void loadTerminalOnlySession(), 0);
+    return () => window.clearTimeout(handle);
   }, [authRequired, loadTerminalOnlySession, terminalOnlySessionId]);
 
   const machineOptions = useMemo(() => ['all', ...Array.from(new Set(allSessions.map((session) => session.machineId))).sort()], [allSessions]);
@@ -2024,34 +2253,46 @@ function App() {
   useEffect(() => {
     if (!allSessions.length) return;
     if (machineOptions.includes(machineFilter)) return;
-    setMachineFilter('all');
+    const handle = window.setTimeout(() => setMachineFilter('all'), 0);
+    return () => window.clearTimeout(handle);
   }, [allSessions.length, machineFilter, machineOptions]);
 
+  const aiSearchSessions = useMemo(() => {
+    if (!aiSearchResult) return [];
+    const currentSessions = new Map(allSessions.map((session) => [sessionKey(session), session]));
+    return aiSearchResult.matches.map((match) => currentSessions.get(sessionKey(match.session)) ?? match.session);
+  }, [aiSearchResult, allSessions]);
+
+  const aiSearchMatchByKey = useMemo(
+    () => new Map((aiSearchResult?.matches ?? []).map((match) => [sessionKey(match.session), match])),
+    [aiSearchResult],
+  );
+
   const agentFilterCounts = useMemo(() => {
-    const sessions = allSessions.filter(
+    const source = aiSearchResult ? aiSearchSessions : allSessions;
+    const sessions = source.filter(
       (session) =>
         filterByTab(session, activeTab) &&
         (machineFilter === 'all' || session.machineId === machineFilter) &&
-        matchesSearch(session, query)
+        (aiSearchResult ? true : matchesSearch(session, query))
     );
     return {
       all: sessions.length,
       codex: sessions.filter((session) => session.agent === 'codex').length,
       claude: sessions.filter((session) => session.agent === 'claude').length,
     };
-  }, [activeTab, allSessions, machineFilter, query]);
+  }, [activeTab, aiSearchResult, aiSearchSessions, allSessions, machineFilter, query]);
 
-  const visibleSessions = useMemo(
-    () =>
-      allSessions.filter(
+  const visibleSessions = useMemo(() => {
+    const source = aiSearchResult ? aiSearchSessions : allSessions;
+    return source.filter(
         (session) =>
           filterByTab(session, activeTab) &&
           (machineFilter === 'all' || session.machineId === machineFilter) &&
           (agentFilter === 'all' || session.agent === agentFilter) &&
-          matchesSearch(session, query)
-      ),
-    [activeTab, agentFilter, allSessions, machineFilter, query]
-  );
+          (aiSearchResult ? true : matchesSearch(session, query))
+      );
+  }, [activeTab, agentFilter, aiSearchResult, aiSearchSessions, allSessions, machineFilter, query]);
 
   const groupedSessions = useMemo(() => {
     const groups = new Map<string, { key: string; label: string; title: string; sortTime: number; sessions: CodexSession[] }>();
@@ -2087,17 +2328,17 @@ function App() {
   }, [listViewMode, visibleSessions]);
 
   const selectedSummary = useMemo(
-    () => visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0] ?? null,
-    [selectedId, visibleSessions]
+    () => visibleSessions.find((session) => sessionKey(session) === selectedSessionKey) ?? visibleSessions[0] ?? null,
+    [selectedSessionKey, visibleSessions]
   );
-  const selected = selectedSummary ? (sessionDetails[selectedSummary.id] ?? selectedSummary) : null;
-  const visibleSessionIds = useMemo(() => visibleSessions.map((session) => session.id), [visibleSessions]);
-  const selectedIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
+  const selected = selectedSummary ? (sessionDetails[sessionKey(selectedSummary)] ?? selectedSummary) : null;
+  const visibleSessionKeys = useMemo(() => visibleSessions.map(sessionKey), [visibleSessions]);
+  const selectedKeySet = useMemo(() => new Set(selectedSessionKeys), [selectedSessionKeys]);
   const selectedVisibleCount = useMemo(
-    () => visibleSessionIds.filter((id) => selectedIdSet.has(id)).length,
-    [selectedIdSet, visibleSessionIds]
+    () => visibleSessionKeys.filter((key) => selectedKeySet.has(key)).length,
+    [selectedKeySet, visibleSessionKeys]
   );
-  const allVisibleSelected = visibleSessionIds.length > 0 && selectedVisibleCount === visibleSessionIds.length;
+  const allVisibleSelected = visibleSessionKeys.length > 0 && selectedVisibleCount === visibleSessionKeys.length;
   const openedTerminalSessions = useMemo(
     () =>
       openedTerminalIds
@@ -2117,9 +2358,9 @@ function App() {
     );
   }, [query, recycleArchives, recycleQuery]);
 
-  const titleDraft = selected ? (titleDrafts[selected.id] ?? selected.customTitle ?? selected.title) : '';
+  const titleDraft = selected ? (titleDrafts[sessionKey(selected)] ?? selected.customTitle ?? selected.title) : '';
   const migrationTarget = selected
-    ? (migrationTargets[selected.id] ??
+    ? (migrationTargets[sessionKey(selected)] ??
       selected.evaluation.recommendedWorkdir ??
       selected.evaluation.actualWorkdirs[0] ??
       selected.cwd ??
@@ -2188,7 +2429,7 @@ function App() {
     } finally {
       setContextPackLoading(false);
     }
-  }, [knowledgeSearchText, selected?.cwd, selected?.evaluation.summary, selected?.title, selectedProjectPath]);
+  }, [knowledgeSearchText, selected, selectedProjectPath]);
 
   const copyContextPrompt = useCallback(async () => {
     if (!contextPack?.workerPromptContext) return;
@@ -2199,7 +2440,7 @@ function App() {
     } catch {
       setContextPackError('复制失败：浏览器阻止访问剪贴板');
     }
-  }, [contextPack?.workerPromptContext]);
+  }, [contextPack]);
 
   const selectedWorkerJobs = useMemo(
     () => (selected ? sortWorkerJobs(workerJobs.filter((job) => job.sessionId === selected.id)) : []),
@@ -2302,29 +2543,29 @@ function App() {
     };
   }, [activeTab, currentWorkerJob?.id, isTerminalOnlyPage, loadWorkerJobEvents]);
 
-  const toggleSessionSelection = useCallback((id: string) => {
-    setSelectedSessionIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  const toggleSessionSelection = useCallback((key: string) => {
+    setSelectedSessionKeys((current) => (current.includes(key) ? current.filter((item) => item !== key) : [...current, key]));
   }, []);
 
   const toggleVisibleSelection = useCallback(() => {
-    setSelectedSessionIds((current) => {
+    setSelectedSessionKeys((current) => {
       const currentSet = new Set(current);
-      const shouldSelect = !visibleSessionIds.every((id) => currentSet.has(id));
-      for (const id of visibleSessionIds) {
-        if (shouldSelect) currentSet.add(id);
-        else currentSet.delete(id);
+      const shouldSelect = !visibleSessionKeys.every((key) => currentSet.has(key));
+      for (const key of visibleSessionKeys) {
+        if (shouldSelect) currentSet.add(key);
+        else currentSet.delete(key);
       }
       return [...currentSet];
     });
-  }, [visibleSessionIds]);
+  }, [visibleSessionKeys]);
 
-  const toggleGroupSelection = useCallback((ids: string[]) => {
-    setSelectedSessionIds((current) => {
+  const toggleGroupSelection = useCallback((keys: string[]) => {
+    setSelectedSessionKeys((current) => {
       const currentSet = new Set(current);
-      const shouldSelect = !ids.every((id) => currentSet.has(id));
-      for (const id of ids) {
-        if (shouldSelect) currentSet.add(id);
-        else currentSet.delete(id);
+      const shouldSelect = !keys.every((key) => currentSet.has(key));
+      for (const key of keys) {
+        if (shouldSelect) currentSet.add(key);
+        else currentSet.delete(key);
       }
       return [...currentSet];
     });
@@ -2332,8 +2573,8 @@ function App() {
 
   const openTerminal = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
-    setSelectedId(session.id);
-    const opened = window.open(terminalPageUrl(session.id), '_blank');
+    setSelectedSessionKey(sessionKey(session));
+    const opened = window.open(terminalPageUrl(session.id, session.machineId), '_blank');
     if (opened) opened.opener = null;
     opened?.focus();
     if (!opened) setActionMessage('浏览器阻止了新终端页面，请允许弹出窗口后重试');
@@ -2341,7 +2582,7 @@ function App() {
 
   const openSessionFiles = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
-    setSelectedId(session.id);
+    setSelectedSessionKey(sessionKey(session));
     const opened = window.open(filesPageUrl(session.id), '_blank');
     if (opened) opened.opener = null;
     opened?.focus();
@@ -2368,12 +2609,12 @@ function App() {
   const loadHistory = useCallback(async (session: CodexSession, before: number | null = null) => {
     setHistoryLoading(true);
     try {
-      const params = new URLSearchParams({ limit: '60' });
+      const params = new URLSearchParams({ limit: '60', machineId: session.machineId });
       if (before !== null) params.set('before', String(before));
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/history?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = (await response.json()) as HistoryPayload;
-      setHistoryLoadedSessionId(session.id);
+      setHistoryLoadedSessionId(sessionKey(session));
       setHistoryMessages((current) => (before === null ? payload.messages : [...payload.messages, ...current]));
       setHistoryBefore(payload.nextBefore);
       setHistoryHasMore(payload.hasMore);
@@ -2385,11 +2626,11 @@ function App() {
   const loadAllMessages = useCallback(async (session: CodexSession) => {
     setHistoryLoading(true);
     try {
-      const params = new URLSearchParams({ full: '1', preserve: '1' });
+      const params = new URLSearchParams({ full: '1', preserve: '1', machineId: session.machineId });
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/messages?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = (await response.json()) as HistoryPayload;
-      setHistoryLoadedSessionId(session.id);
+      setHistoryLoadedSessionId(sessionKey(session));
       setHistoryMessages(payload.messages);
       setHistoryBefore(null);
       setHistoryHasMore(false);
@@ -2407,24 +2648,29 @@ function App() {
       setHistoryLoadedSessionId(null);
     }, 0);
     return () => window.clearTimeout(handle);
-  }, [activeTab, selected?.id]);
+  }, [activeTab, selected?.id, selected?.machineId]);
 
   useEffect(() => {
     if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedSummary?.id) {
       const resetHandle = window.setTimeout(() => {
-        setRecentUserMessages({ sessionId: null, messages: [], loading: false, error: false });
+        setRecentUserMessages({ sessionKey: null, messages: [], loading: false, error: false });
       }, 0);
       return () => window.clearTimeout(resetHandle);
     }
 
     const sessionId = selectedSummary.id;
+    const selectedKey = sessionKey(selectedSummary);
+    const params = new URLSearchParams({
+      limit: '200',
+      machineId: selectedSummary.machineId,
+    });
     const controller = new AbortController();
     let cancelled = false;
     const loadingHandle = window.setTimeout(() => {
-      if (!cancelled) setRecentUserMessages({ sessionId, messages: [], loading: true, error: false });
+      if (!cancelled) setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: true, error: false });
     }, 0);
 
-    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history?limit=200`, { signal: controller.signal })
+    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history?${params.toString()}`, { signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json() as Promise<HistoryPayload>;
@@ -2436,12 +2682,12 @@ function App() {
           .filter((message) => message.role === 'user')
           .slice(-4)
           .reverse();
-        setRecentUserMessages({ sessionId, messages, loading: false, error: false });
+        setRecentUserMessages({ sessionKey: selectedKey, messages, loading: false, error: false });
       })
       .catch(() => {
         if (cancelled) return;
         window.clearTimeout(loadingHandle);
-        setRecentUserMessages({ sessionId, messages: [], loading: false, error: true });
+        setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: false, error: true });
       });
 
     return () => {
@@ -2449,19 +2695,22 @@ function App() {
       window.clearTimeout(loadingHandle);
       controller.abort();
     };
-  }, [activeTab, isTerminalOnlyPage, selectedSummary?.bytes, selectedSummary?.id, selectedSummary?.updatedAt]);
+  }, [activeTab, isTerminalOnlyPage, selectedSummary]);
 
   useEffect(() => {
-    if (!selectedSummary || activeTab === 'recycle' || sessionDetails[selectedSummary.id]) return;
+    if (!selectedSummary || activeTab === 'recycle') return;
+    const detailKey = sessionKey(selectedSummary);
+    if (sessionDetails[detailKey]) return;
     let cancelled = false;
-    void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}`)
+    const params = new URLSearchParams({ machineId: selectedSummary.machineId });
+    void fetch(`/api/sessions/${encodeURIComponent(selectedSummary.id)}?${params.toString()}`)
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json();
       })
       .then((session) => {
         const normalized = normalizeSession(session);
-        if (!cancelled) setSessionDetails((current) => ({ ...current, [normalized.id]: normalized }));
+        if (!cancelled) setSessionDetails((current) => ({ ...current, [detailKey]: normalized }));
       })
       .catch(() => {
         // Detail loading is opportunistic; the summary row remains usable.
@@ -2471,15 +2720,27 @@ function App() {
     };
   }, [activeTab, selectedSummary, sessionDetails]);
 
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      if (!selected || activeTab === 'recycle') {
+        setSessionAuditEvents([]);
+        return;
+      }
+      void loadSessionAudit(selected);
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [activeTab, loadSessionAudit, selected]);
+
   const stats = useMemo(() => {
-    return allSessions
-      .filter(
-        (session) =>
-          (machineFilter === 'all' || session.machineId === machineFilter) &&
-          (agentFilter === 'all' || session.agent === agentFilter) &&
-          matchesSearch(session, query)
-      )
-      .reduce(
+    const source = aiSearchResult
+      ? visibleSessions
+      : allSessions.filter(
+          (session) =>
+            (machineFilter === 'all' || session.machineId === machineFilter) &&
+            (agentFilter === 'all' || session.agent === agentFilter) &&
+            matchesSearch(session, query)
+        );
+    return source.reduce(
       (acc, session) => {
         acc[session.evaluation.recommendation] += 1;
         if (session.kept) acc.kept += 1;
@@ -2491,7 +2752,7 @@ function App() {
         active: number;
       }
       );
-  }, [agentFilter, allSessions, machineFilter, query]);
+  }, [agentFilter, aiSearchResult, allSessions, machineFilter, query, visibleSessions]);
 
   async function setKept(session: CodexSession, kept: boolean) {
     setBusyId(session.id);
@@ -2502,28 +2763,74 @@ function App() {
         body: JSON.stringify({ kept }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      setAllSessions((current) => current.map((item) => (item.id === session.id ? { ...item, kept } : item)));
+      const targetKey = sessionKey(session);
+      setAllSessions((current) => current.map((item) => (sessionKey(item) === targetKey ? { ...item, kept } : item)));
       setSessionDetails((current) => {
-        const detail = current[session.id];
-        return detail ? { ...current, [session.id]: { ...detail, kept } } : current;
+        const detailKey = sessionKey(session);
+        const detail = current[detailKey];
+        return detail ? { ...current, [detailKey]: { ...detail, kept } } : current;
       });
     } finally {
       setBusyId(null);
     }
   }
 
-  function removeSessionsFromPanel(ids: string[]) {
-    const removedIds = new Set(ids);
-    if (!removedIds.size) return;
-    setAllSessions((current) => current.filter((item) => !removedIds.has(item.id)));
+  async function refreshEvaluation(session: CodexSession) {
+    setBusyId(`${session.id}:refresh`);
+    setActionMessage(null);
+    try {
+      const response = await fetch(`/api/evaluations/${encodeURIComponent(session.id)}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId: session.machineId }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { job?: { id?: string }; error?: string };
+      if (!response.ok || !payload.job?.id) throw new Error(payload.error || `HTTP ${response.status}`);
+      setActionMessage(`AI 重算已排队：${session.machineId}/${session.id}`);
+      let completed = false;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const statusResponse = await fetch(`/api/evaluations/refresh-jobs/${encodeURIComponent(payload.job.id)}`);
+        const statusPayload = (await statusResponse.json().catch(() => ({}))) as {
+          job?: { status?: string; error?: string | null };
+        };
+        if (!statusResponse.ok) throw new Error(`重算状态 HTTP ${statusResponse.status}`);
+        if (statusPayload.job?.status === 'completed') {
+          setActionMessage(`AI 重算完成：${session.machineId}/${session.id}`);
+          completed = true;
+          break;
+        }
+        if (statusPayload.job?.status === 'failed') {
+          throw new Error(statusPayload.job.error || 'AI 重算失败');
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+      }
+      if (!completed) throw new Error('AI 重算等待超时');
+      setSessionDetails((current) => {
+        const next = { ...current };
+        delete next[sessionKey(session)];
+        return next;
+      });
+      await Promise.all([loadSessions(), loadFleetAudit(true), loadSessionAudit(session)]);
+    } catch (err) {
+      setActionMessage(`AI 重算失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  function removeSessionsFromPanel(keys: string[]) {
+    const removedKeys = new Set(keys);
+    if (!removedKeys.size) return;
+    const removedIds = new Set(allSessions.filter((item) => removedKeys.has(sessionKey(item))).map((item) => item.id));
+    setAllSessions((current) => current.filter((item) => !removedKeys.has(sessionKey(item))));
     setSessionDetails((current) => {
       const next = { ...current };
-      for (const id of removedIds) delete next[id];
+      for (const key of removedKeys) delete next[key];
       return next;
     });
-    setSelectedSessionIds((current) => current.filter((id) => !removedIds.has(id)));
+    setSelectedSessionKeys((current) => current.filter((key) => !removedKeys.has(key)));
     setOpenedTerminalIds((current) => current.filter((id) => !removedIds.has(id)));
-    setSelectedId((current) => (current && removedIds.has(current) ? null : current));
+    setSelectedSessionKey((current) => current && removedKeys.has(current) ? null : current);
   }
 
   async function deleteSession(session: CodexSession) {
@@ -2539,7 +2846,7 @@ function App() {
       });
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      removeSessionsFromPanel([session.id]);
+      removeSessionsFromPanel([sessionKey(session)]);
       setActionMessage(`已将 ${session.machineId} 上的 ${agentLabel(session.agent)} 会话移入回收站`);
       void loadSessions();
     } catch (err) {
@@ -2550,27 +2857,38 @@ function App() {
   }
 
   async function deleteSelectedSessions() {
-    if (!selectedSessionIds.length) return;
-    if (!window.confirm(`将已选中的 ${selectedSessionIds.length} 个会话移入回收站？原位置会被清除。`)) return;
+    const selectedSessions = allSessions.filter((session) => selectedKeySet.has(sessionKey(session)));
+    if (!selectedSessions.length) return;
+    if (!window.confirm(`将已选中的 ${selectedSessions.length} 个会话移入回收站？原位置会被清除。`)) return;
     setBusyId('bulk-delete');
     setActionMessage(null);
     try {
       const response = await fetch('/api/sessions/bulk-delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true, ids: selectedSessionIds }),
+        body: JSON.stringify({
+          confirm: true,
+          sessions: selectedSessions.map((session) => ({ id: session.id, machineId: session.machineId })),
+        }),
       });
       const payload = (await response.json()) as {
         deleted?: number;
         failed?: number;
         error?: string;
-        results?: Array<{ id: string; ok: boolean }>;
+        results?: Array<{ id: string; machineId?: string; ok: boolean }>;
       };
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      const deletedIds = (payload.results ?? []).filter((item) => item.ok).map((item) => item.id);
-      removeSessionsFromPanel(deletedIds);
+      const deletedRoutes = new Set(
+        (payload.results ?? [])
+          .filter((item) => item.ok)
+          .map((item) => `${item.machineId ?? 'unknown'}|||${item.id}`)
+      );
+      const deletedKeys = selectedSessions
+        .filter((session) => deletedRoutes.has(`${session.machineId}|||${session.id}`))
+        .map(sessionKey);
+      removeSessionsFromPanel(deletedKeys);
       setActionMessage(`已移入回收站 ${payload.deleted ?? 0} 个会话，失败 ${payload.failed ?? 0} 个`);
-      setSelectedSessionIds([]);
+      setSelectedSessionKeys([]);
       void loadSessions();
     } catch (err) {
       setActionMessage(`批量删除失败：${err instanceof Error ? err.message : '未知错误'}`);
@@ -2668,9 +2986,9 @@ function App() {
 
   async function migrateSelectedSameDirectory(session: CodexSession) {
     const target = migrationTarget.trim();
-    if (!target || !selectedSessionIds.length) return;
+    if (!target || !selectedSessionKeys.length) return;
     const targetIds = allSessions
-      .filter((item) => selectedSessionIds.includes(item.id) && item.machineId === session.machineId && normalizePath(item.cwd) === normalizePath(session.cwd))
+      .filter((item) => selectedKeySet.has(sessionKey(item)) && item.machineId === session.machineId && normalizePath(item.cwd) === normalizePath(session.cwd))
       .map((item) => item.id);
     if (!targetIds.length) return;
     if (!window.confirm(`将当前目录下已选中的 ${targetIds.length} 个会话批量迁移到：${target}？`)) return;
@@ -2821,8 +3139,63 @@ function App() {
 
         <div className="search-box">
           <Search size={18} />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 key / cwd / 机器 / 技术栈 / 关键词" />
+          <input
+            data-session-filter
+            value={query}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              if (aiSearchResult) setAiSearchResult(null);
+            }}
+            placeholder="即时筛选 key / cwd / 机器 / 关键词"
+          />
         </div>
+
+        <form className="ai-search-box" data-ai-session-search onSubmit={(event) => void runAiSessionSearch(event)}>
+          <label htmlFor="ai-session-search-input">
+            <Sparkles size={16} />
+            <span>DeepSeek 跨机器找对话</span>
+          </label>
+          <div className="ai-search-control">
+            <input
+              id="ai-session-search-input"
+              value={aiSearchQuery}
+              onChange={(event) => setAiSearchQuery(event.target.value)}
+              placeholder="直接描述模糊内容，模型会判断在哪台机器"
+            />
+            <button type="submit" disabled={aiSearchLoading || aiSearchQuery.trim().length < 2}>
+              {aiSearchLoading ? <Loader2 size={15} className="spin" /> : <Search size={15} />}
+              {aiSearchLoading ? '理解中' : 'AI 检索'}
+            </button>
+          </div>
+          {aiSearchResult || aiSearchError ? (
+            <div
+              className={`ai-search-status ${aiSearchResult?.mode === 'fallback-local' || aiSearchError ? 'fallback' : ''}`}
+              data-ai-search-mode={aiSearchResult?.mode ?? 'error'}
+            >
+              <span>
+                {aiSearchError
+                  ? `检索失败：${aiSearchError}`
+                  : aiSearchResult?.mode === 'deepseek'
+                    ? `理解为“${aiSearchResult.intent}” · 机器 ${aiSearchResult.routing.machineIds.join('、') || '全部'} · ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
+                    : aiSearchResult?.routing.mode === 'deepseek'
+                      ? `DeepSeek 已判断机器 ${aiSearchResult.routing.machineIds.join('、') || '全部'}；会话重排超时，增强索引返回 ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
+                      : `DeepSeek 暂不可用，增强本地索引返回 ${aiSearchResult?.count ?? 0} 条 · ${aiSearchResult?.latencyMs ?? 0}ms`}
+              </span>
+              <button
+                type="button"
+                className="ai-search-clear"
+                aria-label="清除 AI 检索结果"
+                title="返回普通会话列表"
+                onClick={() => {
+                  setAiSearchResult(null);
+                  setAiSearchError(null);
+                }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ) : null}
+        </form>
 
         <div className="machine-filter">
           <Server size={16} />
@@ -2932,20 +3305,47 @@ function App() {
           {metricLabel(stats.delete, '删除')}
         </div>
 
-        <div className="filter-note">保留面板是手动标签；推荐保留、复核、建议删除是 AI 分类，可与代理、机器和搜索筛选叠加。</div>
+        <button
+          type="button"
+          className={`audit-summary${
+            fleetAudit && (fleetAudit.summary.missingFromPanel || fleetAudit.summary.localIssues || fleetAudit.summary.remoteIssues || fleetAudit.summary.unhealthyRemotes)
+              ? ' has-issues'
+              : fleetAudit?.summary.pendingEvaluationSessions
+                ? ' has-pending'
+                : ''
+          }`}
+          disabled={fleetAuditLoading}
+          onClick={() => void loadFleetAudit(true)}
+          title="核对原始会话文件、索引、搜索文本、AI 分析和面板可见性"
+        >
+          {fleetAuditLoading ? <Loader2 size={15} className="spin" /> : <ShieldCheck size={15} />}
+          <span>
+            {fleetAudit
+              ? `稳定会话 AI 覆盖 ${fleetAudit.summary.fullyEvaluatedSessions}/${fleetAudit.summary.settledEligibleSessions} (${fleetAudit.summary.settledCoveragePercent}%) · ${fleetAudit.summary.pendingEvaluationSessions} 活跃/等待重算 · ${fleetAudit.summary.localIssues + fleetAudit.summary.remoteIssues} 真正遗漏 · ${fleetAudit.summary.metadataOnlySessions} 元数据文件`
+              : fleetAuditError
+                ? `链路审计失败：${fleetAuditError}`
+                : '加载会话链路审计'}
+          </span>
+        </button>
+
+        <div className="filter-note">
+          {aiSearchResult
+            ? `当前显示 AI 预测列表；DeepSeek ${aiSearchResult.routing.scope === 'focused' ? `优先判断为 ${aiSearchResult.routing.machineIds.join('、')}` : '保留了多台候选机器'}，并保留跨机器纠错候选。${aiSearchResult.mode === 'deepseek' ? '最终在线重排已完成。' : '最终重排超时，本次使用 AI 扩展后的安全降级结果。'}`
+            : '上方即时筛选不调用模型；模糊回忆可直接交给 DeepSeek，它会先判断机器再跨机器检索。Minimax 仍只负责后台会话分析。'}
+        </div>
 
         {activeTab !== 'recycle' ? (
           <div className="bulk-toolbar">
-            <button type="button" className="primary-button" disabled={!visibleSessionIds.length} onClick={toggleVisibleSelection}>
+            <button type="button" className="primary-button" disabled={!visibleSessionKeys.length} onClick={toggleVisibleSelection}>
               {allVisibleSelected ? '取消当前列表' : '选择当前列表'}
             </button>
             <button
               type="button"
               className="danger-button"
-              disabled={!selectedSessionIds.length || busyId === 'bulk-delete'}
+              disabled={!selectedSessionKeys.length || busyId === 'bulk-delete'}
               onClick={() => void deleteSelectedSessions()}
             >
-              删除已选 {selectedSessionIds.length}
+              删除已选 {selectedSessionKeys.length}
             </button>
           </div>
         ) : null}
@@ -2957,7 +3357,9 @@ function App() {
               扫描并评估本机 Codex / Claude 会话
             </div>
           ) : null}
-          {!loading && activeTab !== 'recycle' && visibleSessions.length === 0 ? <div className="empty">没有匹配的会话</div> : null}
+          {!loading && activeTab !== 'recycle' && visibleSessions.length === 0 ? (
+            <div className="empty">{aiSearchResult ? 'AI 没有找到可信的候选会话，请换一种描述' : '没有匹配的会话'}</div>
+          ) : null}
           {!loading && activeTab === 'recycle' ? (
             <div className="recycle-search">
               <Search size={16} />
@@ -2984,10 +3386,10 @@ function App() {
                 </div>
               ))
             : groupedSessions.map((group) => {
-                const collapsed = query.trim() ? false : collapsedGroups[group.key] ?? true;
-                const groupIds = group.sessions.map((session) => session.id);
-                const selectedInGroup = groupIds.filter((id) => selectedIdSet.has(id)).length;
-                const groupChecked = selectedInGroup === groupIds.length && groupIds.length > 0;
+                const collapsed = aiSearchResult || query.trim() ? false : collapsedGroups[group.key] ?? true;
+                const groupKeys = group.sessions.map(sessionKey);
+                const selectedInGroup = groupKeys.filter((key) => selectedKeySet.has(key)).length;
+                const groupChecked = selectedInGroup === groupKeys.length && groupKeys.length > 0;
                 return (
                   <div key={group.key} className="session-group">
                     <div
@@ -3007,9 +3409,9 @@ function App() {
                         className="session-checkbox"
                         checked={groupChecked}
                         onClick={(event) => event.stopPropagation()}
-                        onChange={() => toggleGroupSelection(groupIds)}
+                        onChange={() => toggleGroupSelection(groupKeys)}
                         aria-label={`选择分组 ${group.title}`}
-                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupIds.length}` : '选择这个分组'}
+                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupKeys.length}` : '选择这个分组'}
                       />
                       {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
                       <span>{group.label}</span>
@@ -3018,49 +3420,60 @@ function App() {
                     </div>
                     {collapsed
                       ? null
-                      : group.sessions.map((session) => (
-                          <div
-                            key={session.id}
-                            data-session-id={session.id}
-                            data-agent={session.agent}
-                            className={`session-row ${selected?.id === session.id ? 'selected' : ''}`}
-                            onClick={() => setSelectedId(session.id)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter' || event.key === ' ') {
-                                event.preventDefault();
-                                setSelectedId(session.id);
-                              }
-                            }}
-                            role="button"
-                            tabIndex={0}
-                          >
-                            <input
-                              type="checkbox"
-                              className="session-checkbox"
-                              checked={selectedIdSet.has(session.id)}
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={() => toggleSessionSelection(session.id)}
-                              aria-label={`选择 ${session.title}`}
-                            />
-                            <span className={`dot ${recommendationTone[session.evaluation.recommendation]}`} />
-                            <span className="session-main">
-                              <span className="session-key">{session.title}</span>
-                              <span className="session-summary">{session.evaluation.summary}</span>
-                              <span className="session-preview-line">
-                                <strong>用户</strong>
-                                <span>{previewText(session.lastUserMessage)}</span>
+                      : group.sessions.map((session) => {
+                          const aiMatch = aiSearchMatchByKey.get(sessionKey(session));
+                          return (
+                            <div
+                              key={sessionKey(session)}
+                              data-session-id={session.id}
+                              data-machine-id={session.machineId}
+                              data-agent={session.agent}
+                              className={`session-row ${selectedSessionKey === sessionKey(session) ? 'selected' : ''}`}
+                              onClick={() => setSelectedSessionKey(sessionKey(session))}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.preventDefault();
+                                  setSelectedSessionKey(sessionKey(session));
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                            >
+                              <input
+                                type="checkbox"
+                                className="session-checkbox"
+                                checked={selectedKeySet.has(sessionKey(session))}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={() => toggleSessionSelection(sessionKey(session))}
+                                aria-label={`选择 ${session.title}`}
+                              />
+                              <span className={`dot ${recommendationTone[session.evaluation.recommendation]}`} />
+                              <span className="session-main">
+                                <span className="session-key">{session.title}</span>
+                                <span className="session-summary">{session.evaluation.summary}</span>
+                                {aiMatch ? (
+                                  <span className="ai-match-reason" data-ai-search-result>
+                                    <Sparkles size={13} />
+                                    <strong>{Math.round(aiMatch.confidence * 100)}%</strong>
+                                    <span>{aiMatch.reason}</span>
+                                  </span>
+                                ) : null}
+                                <span className="session-preview-line">
+                                  <strong>用户</strong>
+                                  <span>{previewText(session.lastUserMessage)}</span>
+                                </span>
+                                <span className="session-preview-line agent">
+                                  <strong>Agent</strong>
+                                  <span>{previewText(session.lastAssistantMessage)}</span>
+                                </span>
                               </span>
-                              <span className="session-preview-line agent">
-                                <strong>Agent</strong>
-                                <span>{previewText(session.lastAssistantMessage)}</span>
+                              <span className="session-time">
+                                {agentLabel(session.agent)} · {session.kept ? '已保留 · ' : ''}
+                                {session.activityStatus === 'active' ? '活跃' : '非活跃'} · {formatDate(session.updatedAt)}
                               </span>
-                            </span>
-                            <span className="session-time">
-                              {agentLabel(session.agent)} · {session.kept ? '已保留 · ' : ''}
-                              {session.activityStatus === 'active' ? '活跃' : '非活跃'} · {formatDate(session.updatedAt)}
-                            </span>
-                          </div>
-                        ))}
+                            </div>
+                          );
+                        })}
                   </div>
                 );
               })}
@@ -3084,9 +3497,19 @@ function App() {
                   <FolderOpen size={17} />
                   打开工作目录
                 </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={busyId === `${selected.id}:refresh`}
+                  title="在 Hub 上读取完整 transcript 并执行可追踪的 AI 重算"
+                  onClick={() => void refreshEvaluation(selected)}
+                >
+                  <Sparkles size={17} />
+                  {busyId === `${selected.id}:refresh` ? 'AI 重算中' : 'AI 重算'}
+                </button>
               </>
             ) : null}
-            <button type="button" className="icon-button" title="刷新" onClick={() => void Promise.all([loadSessions(), loadCommanderActions()])}>
+            <button type="button" className="icon-button" title="刷新" onClick={() => void Promise.all([loadSessions(true), loadCommanderActions(), loadFleetAudit(true)])}>
               <RefreshCw size={18} />
             </button>
             <button
@@ -3194,7 +3617,7 @@ function App() {
                     id="session-title"
                     value={titleDraft}
                     onChange={(event) =>
-                      setTitleDrafts((current) => ({ ...current, [selected.id]: event.target.value }))
+                      setTitleDrafts((current) => ({ ...current, [sessionKey(selected)]: event.target.value }))
                     }
                     placeholder="给这个会话起一个标题"
                   />
@@ -3265,24 +3688,24 @@ function App() {
               <div
                 className="recent-dialogue"
                 data-session-id={selected.id}
-                aria-busy={recentUserMessages.sessionId !== selected.id || recentUserMessages.loading}
+                aria-busy={recentUserMessages.sessionKey !== sessionKey(selected) || recentUserMessages.loading}
               >
-                {recentUserMessages.sessionId === selected.id
+                {recentUserMessages.sessionKey === sessionKey(selected)
                   ? recentUserMessages.messages.map((message) => (
                       <RecentUserMessageCard
-                        key={`${selected.id}:${message.index}`}
+                        key={`${sessionKey(selected)}:${message.index}`}
                         sessionId={selected.id}
                         message={message}
                       />
                     ))
                   : null}
-                {recentUserMessages.sessionId !== selected.id || recentUserMessages.loading ? (
+                {recentUserMessages.sessionKey !== sessionKey(selected) || recentUserMessages.loading ? (
                   <div className="empty compact">正在读取最近用户消息...</div>
                 ) : null}
-                {recentUserMessages.sessionId === selected.id && !recentUserMessages.loading && recentUserMessages.error ? (
+                {recentUserMessages.sessionKey === sessionKey(selected) && !recentUserMessages.loading && recentUserMessages.error ? (
                   <div className="empty compact">最近用户消息读取失败</div>
                 ) : null}
-                {recentUserMessages.sessionId === selected.id &&
+                {recentUserMessages.sessionKey === sessionKey(selected) &&
                 !recentUserMessages.loading &&
                 !recentUserMessages.error &&
                 !recentUserMessages.messages.length ? (
@@ -3295,13 +3718,49 @@ function App() {
                 {selected.evaluation.hermesLastUsedAt ? ` · 最近调度：${formatDate(selected.evaluation.hermesLastUsedAt)}` : ''}
                 {selected.evaluation.hermesRecalculatedAt ? ` · 重算完成：${formatDate(selected.evaluation.hermesRecalculatedAt)}` : ''}
                 {selected.evaluation.hermesLastJobId ? ` · job：${selected.evaluation.hermesLastJobId}` : ''}
+                {selected.evaluation.evaluationOrigin ? ` · 来源：${selected.evaluation.evaluationOrigin}` : ''}
+                {selected.evaluation.evaluatedByMachineId ? ` · 执行机器：${selected.evaluation.evaluatedByMachineId}` : ''}
               </div>
+              {selected.evaluation.evaluationRunId || selected.evaluation.transcriptHash ? (
+                <div className="workflow audit-identifiers">
+                  {selected.evaluation.evaluationRunId ? <code>run {selected.evaluation.evaluationRunId}</code> : null}
+                  {selected.evaluation.transcriptHash ? <code>sha256 {selected.evaluation.transcriptHash.slice(0, 16)}…</code> : null}
+                </div>
+              ) : null}
               {selected.evaluation.hermesRefreshError ? (
                 <div className="warning-line">
                   <AlertTriangle size={15} />
                   {selected.evaluation.hermesRefreshError}
                 </div>
               ) : null}
+            </section>
+
+            <section className="primary-panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>会话链路审计</h3>
+                  <span>只记录计数、状态与哈希，不保存新的对话正文副本</span>
+                </div>
+                <button type="button" className="primary-button" onClick={() => void loadSessionAudit(selected)}>
+                  <RefreshCw size={16} />
+                  刷新审计
+                </button>
+              </div>
+              {sessionAuditEvents.length ? (
+                <div className="audit-event-list">
+                  {sessionAuditEvents.slice(0, 12).map((event) => (
+                    <div key={event.id} className={`audit-event ${event.error || event.status === 'failed' ? 'failed' : ''}`}>
+                      <strong>{event.event}</strong>
+                      <span>{formatDate(event.at)} · {event.machineId}{event.model ? ` · ${event.model}` : ''}{event.status ? ` · ${event.status}` : ''}</span>
+                      {event.runId ? <code>run {event.runId}</code> : null}
+                      {event.transcriptHash ? <code>sha256 {event.transcriptHash.slice(0, 16)}…</code> : null}
+                      {event.error ? <em>{event.error}</em> : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty compact">暂无审计事件；运行完整性巡检或 AI 重算后会写入。</div>
+              )}
             </section>
 
             <section className="primary-panel knowledge-plane">
@@ -3870,15 +4329,15 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={historyLoading || historyLoadedSessionId === selected.id}
+                  disabled={historyLoading || historyLoadedSessionId === sessionKey(selected)}
                   onClick={() => void loadHistory(selected)}
                 >
-                  {historyLoadedSessionId === selected.id ? '已加载最近记录' : '加载最近记录'}
+                  {historyLoadedSessionId === sessionKey(selected) ? '已加载最近记录' : '加载最近记录'}
                 </button>
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={historyLoadedSessionId !== selected.id || !historyHasMore || historyLoading || historyBefore === null}
+                  disabled={historyLoadedSessionId !== sessionKey(selected) || !historyHasMore || historyLoading || historyBefore === null}
                   onClick={() => void loadHistory(selected, historyBefore)}
                 >
                   更早记录
@@ -3954,7 +4413,7 @@ function App() {
                 <input
                   value={migrationTarget}
                   onChange={(event) =>
-                    setMigrationTargets((current) => ({ ...current, [selected.id]: event.target.value }))
+                    setMigrationTargets((current) => ({ ...current, [sessionKey(selected)]: event.target.value }))
                   }
                   placeholder="输入本机项目目录"
                 />
@@ -3969,7 +4428,7 @@ function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={busyId === 'bulk-migrate' || !selectedSessionIds.length || !migrationTarget.trim()}
+                  disabled={busyId === 'bulk-migrate' || !selectedSessionKeys.length || !migrationTarget.trim()}
                   onClick={() => void migrateSelectedSameDirectory(selected)}
                 >
                   批量迁移同目录

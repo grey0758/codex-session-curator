@@ -121,6 +121,30 @@ test('fake Codex worker completes normally', async () => {
   assert.ok(listCodexJobEvents(job.id).some((event) => event.type === 'completion'));
 });
 
+test('PTY worker command uses the configured worker binary', async () => {
+  process.env.FAKE_CODEX_SCENARIO = 'waiting-confirmation';
+  const job = startCodexResumeJob({
+    session: sessionFixture('pty-binary'),
+    prompt: 'run PTY binary selection check',
+    mode: 'pty',
+  });
+  startedJobIds.push(job.id);
+
+  try {
+    assert.equal(job.mode, 'pty');
+    const startedEvent = listCodexJobEvents(job.id).find((event) => event.type === 'started');
+    assert.match(
+      JSON.stringify(startedEvent?.data ?? {}),
+      new RegExp(fakeCodexBin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    );
+    await waitForJob(job.id, (item) => item.status === 'running' || item.status === 'completed');
+  } finally {
+    const current = getCodexResumeJob(job.id);
+    if (current?.status === 'running') stopCodexResumeJob(job.id);
+    delete process.env.FAKE_CODEX_SCENARIO;
+  }
+});
+
 test('fake Codex worker with no output is stopped by supervisor', async () => {
   const job = startFakeJob('stuck', {
     supervisor: { enabled: true, autoStop: true, idleTimeoutMs: 10 },

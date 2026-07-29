@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH production tunnel to cnal002 thin Curator worker and back to gpl001 Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT -L 127.0.0.1:54179:127.0.0.1:55177 -R 127.0.0.1:54176:127.0.0.1:54177 -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 cnal002-ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

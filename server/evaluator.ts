@@ -1,7 +1,15 @@
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
 import { recordAnalysisRun } from './analysis-log.js';
 import { EVALUATOR_WORKFLOW } from './evaluation-workflow.js';
-import type { Evaluation, ParsedMessage, Recommendation, RemoteMachine, ReviewPriority, UpdateCadence } from './types.js';
+import type {
+  Evaluation,
+  EvaluationOrigin,
+  ParsedMessage,
+  Recommendation,
+  RemoteMachine,
+  ReviewPriority,
+  UpdateCadence,
+} from './types.js';
 
 export { EVALUATOR_WORKFLOW, isEvaluationWorkflowCompatible, isEvaluationWorkflowComplete } from './evaluation-workflow.js';
 
@@ -39,6 +47,12 @@ interface WorkflowState {
   model?: string;
   status?: 'ok' | 'fallback' | 'failed';
   error?: string | null;
+  sessionId?: string | null;
+  machineId?: string | null;
+  evaluatedByMachineId?: string | null;
+  runId?: string | null;
+  evaluationOrigin?: EvaluationOrigin;
+  transcriptHash?: string | null;
 }
 
 interface LlmEvaluation {
@@ -95,7 +109,23 @@ const WorkflowAnnotation = Annotation.Root({
   model: Annotation<string | undefined>(),
   status: Annotation<'ok' | 'fallback' | 'failed' | undefined>(),
   error: Annotation<string | null | undefined>(),
+  sessionId: Annotation<string | null | undefined>(),
+  machineId: Annotation<string | null | undefined>(),
+  evaluatedByMachineId: Annotation<string | null | undefined>(),
+  runId: Annotation<string | null | undefined>(),
+  evaluationOrigin: Annotation<EvaluationOrigin | undefined>(),
+  transcriptHash: Annotation<string | null | undefined>(),
 });
+
+function analysisTrace(state: WorkflowState) {
+  return {
+    sessionId: state.sessionId ?? null,
+    machineId: state.machineId ?? null,
+    runId: state.runId ?? null,
+    source: state.evaluationOrigin === 'hub-remote' ? ('hub-remote' as const) : ('local' as const),
+    transcriptHash: state.transcriptHash ?? null,
+  };
+}
 
 export function getEvaluatorModel(): string {
   return getEvaluatorEndpoints()[0]?.model || 'minimaxai/minimax-m2.7';
@@ -564,16 +594,9 @@ function transcriptForLlm(messages: ParsedMessage[]): string {
   return text.length > transcriptCharLimit ? `${text.slice(0, transcriptCharLimit)}\n\n[已按整段会话抽样截断]` : text;
 }
 
-function parseJsonObject(text: string): LlmEvaluation | null {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  const raw = fenced?.[1] ?? trimmed;
-  const start = raw.indexOf('{');
-  const end = raw.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-
+function parseLlmEvaluationCandidate(raw: string): LlmEvaluation | null {
   try {
-    const parsed = JSON.parse(raw.slice(start, end + 1)) as Partial<LlmEvaluation>;
+    const parsed = JSON.parse(raw) as Partial<LlmEvaluation>;
     if (typeof parsed.summary !== 'string' || !Array.isArray(parsed.reasons)) return null;
     const reasons = parsed.reasons.filter((reason): reason is string => typeof reason === 'string').slice(0, 5);
     const actualWorkdirs = Array.isArray(parsed.actualWorkdirs)
@@ -618,6 +641,55 @@ function parseJsonObject(text: string): LlmEvaluation | null {
   } catch {
     return null;
   }
+}
+
+function jsonObjectCandidates(text: string): string[] {
+  const trimmed = text.trim();
+  const candidates: string[] = [];
+  const fenced = trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi);
+  for (const match of fenced) {
+    if (match[1]?.trim()) candidates.push(match[1].trim());
+  }
+
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (char !== '}' || depth === 0) continue;
+    depth -= 1;
+    if (depth === 0 && start >= 0) {
+      candidates.push(trimmed.slice(start, index + 1));
+      start = -1;
+    }
+  }
+
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) candidates.unshift(trimmed);
+  return [...new Set(candidates)];
+}
+
+export function parseJsonObject(text: string): LlmEvaluation | null {
+  for (const candidate of jsonObjectCandidates(text)) {
+    const parsed = parseLlmEvaluationCandidate(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 function extractChatContent(payload: unknown): string | null {
@@ -687,6 +759,7 @@ async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
 
   const transcript = transcriptForLlm(state.messages);
   if (!transcript.trim()) return null;
+  const callStartedAt = Date.now();
 
   const messages = [
     {
@@ -718,65 +791,144 @@ async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
   ];
 
   let lastError: Error | null = null;
+  let lastEndpoint: LlmEndpoint | null = null;
+  let analysisAttempt = 0;
   for (const endpoint of endpoints) {
-    const body: Record<string, unknown> = {
-      model: endpoint.model,
-      messages,
-      max_tokens: endpoint.maxTokens,
-      temperature: endpoint.temperature,
-      top_p: endpoint.topP,
-      stream: endpoint.stream,
-    };
-    if (endpoint.provider === 'nvidia') {
-      if (endpoint.thinking) body.chat_template_kwargs = { thinking: true };
-    } else if (endpoint.responseFormat) {
-      body.response_format = { type: 'json_object' };
-    }
+    lastEndpoint = endpoint;
+    for (let formatAttempt = 1; formatAttempt <= 2; formatAttempt += 1) {
+      analysisAttempt += 1;
+      const strictRetry = formatAttempt > 1;
+      const requestMessages = strictRetry
+        ? [
+            ...messages,
+            {
+              role: 'system',
+              content: '严格重试：上一次响应无法解析。只输出一个合法 JSON 对象，不要 Markdown、代码围栏、思考过程或额外文字；字符串中的换行和引号必须正确转义。',
+            },
+          ]
+        : messages;
+      const useStream = strictRetry ? false : endpoint.stream;
+      const body: Record<string, unknown> = {
+        model: endpoint.model,
+        messages: requestMessages,
+        max_tokens: endpoint.maxTokens,
+        temperature: strictRetry ? Math.min(endpoint.temperature, 0.2) : endpoint.temperature,
+        top_p: endpoint.topP,
+        stream: useStream,
+      };
+      if (endpoint.provider === 'nvidia') {
+        if (endpoint.thinking || strictRetry) body.chat_template_kwargs = { thinking: strictRetry ? false : endpoint.thinking };
+      } else if (endpoint.responseFormat) {
+        body.response_format = { type: 'json_object' };
+      }
 
-    let response: Response | null = null;
-    const startedAt = Date.now();
-    let httpStatus: number | null = null;
-    let apiKey = nextEvaluatorApiKey(endpoint);
-    if (!apiKey) continue;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      await waitForLlmRateSlot(endpoint.rpmLimit, `${endpoint.baseUrl}:${apiKey}`);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), getLlmTimeoutMs());
-      try {
-        response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: endpoint.stream ? 'text/event-stream' : 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-      } catch (error) {
-        clearTimeout(timer);
-        lastError = error instanceof Error ? error : new Error('LLM request failed');
-        if (attempt < 3) {
+      let response: Response | null = null;
+      const startedAt = Date.now();
+      let httpStatus: number | null = null;
+      let requestError: Error | null = null;
+      let apiKey = nextEvaluatorApiKey(endpoint);
+      if (!apiKey) break;
+      for (let requestAttempt = 1; requestAttempt <= 3; requestAttempt += 1) {
+        requestError = null;
+        await waitForLlmRateSlot(endpoint.rpmLimit, `${endpoint.baseUrl}:${apiKey}`);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), getLlmTimeoutMs());
+        try {
+          response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              Accept: useStream ? 'text/event-stream' : 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } catch (error) {
+          requestError = error instanceof Error ? error : new Error('LLM request failed');
+          if (requestAttempt < 3) {
+            apiKey = nextEvaluatorApiKey(endpoint) ?? apiKey;
+            await new Promise((resolve) => setTimeout(resolve, requestAttempt * 1500));
+            continue;
+          }
+          break;
+        } finally {
+          clearTimeout(timer);
+        }
+        httpStatus = response.status;
+        if (response.ok) break;
+        if (requestAttempt < 3 && (response.status >= 500 || response.status === 429)) {
           apiKey = nextEvaluatorApiKey(endpoint) ?? apiKey;
-          await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+          await new Promise((resolve) => setTimeout(resolve, requestAttempt * 1500));
           continue;
         }
         break;
-      } finally {
-        clearTimeout(timer);
       }
-      httpStatus = response.status;
-      if (response.ok) break;
-      if (attempt < 3 && (response.status >= 500 || response.status === 429)) {
-        apiKey = nextEvaluatorApiKey(endpoint) ?? apiKey;
-        await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+
+      if (!response?.ok) {
+        lastError = requestError ?? new Error(`LLM request failed: ${httpStatus ?? 'no response'}`);
+        await recordAnalysisRun({
+          timestamp: new Date().toISOString(),
+          provider: endpoint.provider,
+          model: endpoint.model,
+          baseUrl: endpoint.baseUrl,
+          status: 'failed',
+          durationMs: Date.now() - startedAt,
+          httpStatus,
+          error: lastError.message,
+          phase: 'request',
+          attempt: analysisAttempt,
+          final: false,
+          ...analysisTrace(state),
+        }).catch(() => undefined);
+        break;
+      }
+
+      let content: string | null = null;
+      try {
+        content = useStream ? await readStreamingContent(response) : extractChatContent(await response.json());
+      } catch {
+        lastError = new Error('LLM response body was not valid JSON');
+      }
+      if (!content) {
+        lastError = lastError ?? new Error('LLM response had no content');
+        await recordAnalysisRun({
+          timestamp: new Date().toISOString(),
+          provider: endpoint.provider,
+          model: endpoint.model,
+          baseUrl: endpoint.baseUrl,
+          status: 'failed',
+          durationMs: Date.now() - startedAt,
+          httpStatus,
+          error: lastError.message,
+          phase: 'content',
+          attempt: analysisAttempt,
+          final: false,
+          ...analysisTrace(state),
+        }).catch(() => undefined);
         continue;
       }
-      break;
-    }
 
-    if (!response?.ok) {
-      lastError = new Error(`LLM request failed: ${httpStatus ?? 'no response'}`);
+      const parsed = parseJsonObject(content);
+      if (parsed) {
+        await recordAnalysisRun({
+          timestamp: new Date().toISOString(),
+          provider: endpoint.provider,
+          model: endpoint.model,
+          baseUrl: endpoint.baseUrl,
+          status: 'ok',
+          durationMs: Date.now() - startedAt,
+          httpStatus,
+          error: null,
+          phase: 'parsed',
+          attempt: analysisAttempt,
+          final: true,
+          ...analysisTrace(state),
+        }).catch(() => undefined);
+        return { ...parsed, model: endpoint.model };
+      }
+
+      lastError = new Error('LLM response was not valid curator JSON');
       await recordAnalysisRun({
         timestamp: new Date().toISOString(),
         provider: endpoint.provider,
@@ -786,41 +938,32 @@ async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
         durationMs: Date.now() - startedAt,
         httpStatus,
         error: lastError.message,
+        phase: 'parse',
+        attempt: analysisAttempt,
+        final: false,
+        ...analysisTrace(state),
       }).catch(() => undefined);
-      continue;
     }
+  }
 
-    const content = endpoint.stream ? await readStreamingContent(response) : extractChatContent(await response.json());
-    await recordAnalysisRun({
-      timestamp: new Date().toISOString(),
-      provider: endpoint.provider,
-      model: endpoint.model,
-      baseUrl: endpoint.baseUrl,
-      status: content ? 'ok' : 'failed',
-      durationMs: Date.now() - startedAt,
-      httpStatus,
-      error: content ? null : 'LLM response had no content',
-    }).catch(() => undefined);
-    if (!content) {
-      lastError = new Error('LLM response had no content');
-      continue;
-    }
-    const parsed = parseJsonObject(content);
-    if (parsed) return { ...parsed, model: endpoint.model };
-    lastError = new Error('LLM response was not valid curator JSON');
+  if (lastError) {
+    const endpoint = lastEndpoint ?? endpoints[0];
     await recordAnalysisRun({
       timestamp: new Date().toISOString(),
       provider: endpoint.provider,
       model: endpoint.model,
       baseUrl: endpoint.baseUrl,
       status: 'failed',
-      durationMs: Date.now() - startedAt,
-      httpStatus,
+      durationMs: Date.now() - callStartedAt,
+      httpStatus: null,
       error: lastError.message,
+      phase: 'final',
+      attempt: analysisAttempt,
+      final: true,
+      ...analysisTrace(state),
     }).catch(() => undefined);
+    throw lastError;
   }
-
-  if (lastError) throw lastError;
   return null;
 }
 
@@ -1040,6 +1183,12 @@ export async function evaluateSession(input: {
   userTurns: number;
   assistantTurns: number;
   cwd: string | null;
+  sessionId?: string | null;
+  machineId?: string | null;
+  evaluatedByMachineId?: string | null;
+  runId?: string | null;
+  evaluationOrigin?: EvaluationOrigin;
+  transcriptHash?: string | null;
 }): Promise<Evaluation> {
   const result = await evaluator.invoke(input);
   const summary = result.summary ?? 'No summary available.';
@@ -1093,5 +1242,9 @@ export async function evaluateSession(input: {
     model: result.model ?? getEvaluatorModel(),
     status: result.status ?? 'fallback',
     error: result.error ?? null,
+    evaluationOrigin: input.evaluationOrigin ?? 'local-llm',
+    evaluatedByMachineId: input.evaluatedByMachineId ?? input.machineId ?? null,
+    evaluationRunId: input.runId ?? null,
+    transcriptHash: input.transcriptHash ?? null,
   };
 }

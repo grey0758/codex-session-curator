@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 const baseUrl = process.env.CURATOR_PANEL_VERIFY_BASE_URL || 'http://127.0.0.1:54177/';
 const query = process.env.CURATOR_PANEL_VERIFY_QUERY || 'codex-session-curator';
+const aiQuery = process.env.CURATOR_PANEL_VERIFY_AI_QUERY || 'cnal002的工作站';
 const chromeBin = process.env.CHROMIUM_BIN || process.env.CHROME_BIN || '/snap/bin/chromium';
 const waitMs = Number(process.env.CURATOR_PANEL_VERIFY_WAIT_MS || 15000);
 const cdpTimeoutMs = Number(process.env.CURATOR_PANEL_VERIFY_CDP_TIMEOUT_MS || 30000);
@@ -131,7 +132,7 @@ async function main() {
 
     async function setSearchQuery(value) {
       await evaluate(`(() => {
-        const input = document.querySelector('input[placeholder*="搜索 key"]');
+        const input = document.querySelector('input[data-session-filter]');
         if (!input) return false;
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
         setter?.call(input, ${JSON.stringify(value)});
@@ -163,13 +164,33 @@ async function main() {
       })()`);
     }
 
+    async function focusSessionIdentity(sessionId, machineId, agent) {
+      await setSearchQuery(sessionId);
+      const selector = `.session-row[data-session-id=${JSON.stringify(sessionId)}][data-machine-id=${JSON.stringify(machineId)}][data-agent=${JSON.stringify(agent)}]`;
+      await waitFor(`Boolean(document.querySelector(${JSON.stringify(selector)}))`, Boolean, `session row ${machineId}/${agent}/${sessionId}`);
+      await evaluate(`(() => {
+        const row = document.querySelector(${JSON.stringify(selector)});
+        row?.click();
+        return Boolean(row);
+      })()`);
+    }
+
+    await waitFor(
+      `document.querySelector('.audit-summary span')?.textContent || ''`,
+      (value) => value.includes('稳定会话 AI 覆盖') || value.includes('链路审计失败'),
+      'fleet audit summary',
+      60000
+    );
+
     const before = await evaluate(`(() => ({
       loginVisible: Boolean(document.querySelector('.login-shell')),
-      searchVisible: Boolean(document.querySelector('input[placeholder*="搜索 key"]')),
+      searchVisible: Boolean(document.querySelector('input[data-session-filter]')),
+      aiSearchVisible: Boolean(document.querySelector('[data-ai-session-search] #ai-session-search-input')),
       sessionRows: document.querySelectorAll('.session-row').length,
       sessionGroups: document.querySelectorAll('.session-group').length,
       loadingVisible: document.body.innerText.includes('正在加载'),
-      loadErrorVisible: document.body.innerText.includes('加载失败')
+      loadErrorVisible: document.body.innerText.includes('加载失败'),
+      auditSummaryText: document.querySelector('.audit-summary span')?.textContent || ''
     }))()`);
 
     const agentCandidates = await evaluate(`(async () => {
@@ -184,11 +205,21 @@ async function main() {
         agents.add(session.agent);
         byMachine.set(session.machineId, agents);
       }
+      const sessionsById = new Map();
+      for (const session of sessions) {
+        const identities = sessionsById.get(session.id) || [];
+        identities.push({ id: session.id, machineId: session.machineId, agent: session.agent });
+        sessionsById.set(session.id, identities);
+      }
+      const duplicateIdentities = [...sessionsById.values()]
+        .find((identities) => new Set(identities.map((entry) => entry.machineId + '|||' + entry.agent)).size > 1)
+        ?.slice(0, 2) || [];
       const sharedMachine = [...byMachine.entries()].find(([, agents]) => agents.has('codex') && agents.has('claude'))?.[0] || null;
       return {
         sharedMachine,
         codexId: sessions.find((session) => session.agent === 'codex')?.id || null,
-        claudeId: sessions.find((session) => session.agent === 'claude')?.id || null
+        claudeId: sessions.find((session) => session.agent === 'claude')?.id || null,
+        duplicateIdentities
       };
     })()`);
     if (!agentCandidates?.sharedMachine || !agentCandidates.codexId || !agentCandidates.claudeId) {
@@ -234,6 +265,45 @@ async function main() {
       allAgents.counts.claude > 0 &&
       codexAgents.agents.every((agent) => agent === 'codex') &&
       claudeAgents.agents.every((agent) => agent === 'claude');
+
+    let duplicateIdentityOk = agentCandidates.duplicateIdentities.length < 2;
+    if (agentCandidates.duplicateIdentities.length >= 2) {
+      const [firstIdentity, secondIdentity] = agentCandidates.duplicateIdentities;
+      await selectAgentFilter('all');
+      await focusSessionIdentity(firstIdentity.id, firstIdentity.machineId, firstIdentity.agent);
+      const firstSelection = await evaluate(`(() => {
+        const selected = [...document.querySelectorAll('.session-row.selected')];
+        const target = [...document.querySelectorAll('.session-row')].find((row) =>
+          row.dataset.sessionId === ${JSON.stringify(firstIdentity.id)} &&
+          row.dataset.machineId === ${JSON.stringify(firstIdentity.machineId)} &&
+          row.dataset.agent === ${JSON.stringify(firstIdentity.agent)}
+        );
+        target?.querySelector('input.session-checkbox')?.click();
+        return {
+          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId]),
+          checked: [...document.querySelectorAll('.session-row input.session-checkbox:checked')].length
+        };
+      })()`);
+      await focusSessionIdentity(secondIdentity.id, secondIdentity.machineId, secondIdentity.agent);
+      const secondSelection = await evaluate(`(() => {
+        const selected = [...document.querySelectorAll('.session-row.selected')];
+        const checked = [...document.querySelectorAll('.session-row input.session-checkbox:checked')];
+        checked.forEach((input) => input.click());
+        return {
+          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId]),
+          checked: checked.length
+        };
+      })()`);
+      duplicateIdentityOk =
+        firstSelection.selected.length === 1 &&
+        firstSelection.selected[0][0] === firstIdentity.machineId &&
+        firstSelection.selected[0][1] === firstIdentity.agent &&
+        firstSelection.checked === 1 &&
+        secondSelection.selected.length === 1 &&
+        secondSelection.selected[0][0] === secondIdentity.machineId &&
+        secondSelection.selected[0][1] === secondIdentity.agent &&
+        secondSelection.checked === 1;
+    }
 
     await setSearchQuery(query);
     await delay(700);
@@ -288,6 +358,10 @@ async function main() {
       return {
         sessionId: section?.dataset.sessionId || null,
         busy: section?.getAttribute('aria-busy') === 'true',
+        selectedRows: [...document.querySelectorAll('.session-row.selected')].map((row) => ({
+          sessionId: row.dataset.sessionId || null,
+          machineId: row.dataset.machineId || null
+        })),
         messages: cards.map((card) => card.querySelector('p')?.textContent || ''),
         roles: cards.map((card) => card.dataset.role || ''),
         lineClamps: cards.map((card) => getComputedStyle(card.querySelector('p')).webkitLineClamp),
@@ -376,6 +450,8 @@ async function main() {
       firstRecent.messages.length >= 1 &&
       firstRecent.messages.length <= 4 &&
       firstRecent.roles.every((role) => role === 'user') &&
+      firstRecent.selectedRows.length === 1 &&
+      firstRecent.selectedRows[0].sessionId === firstCandidate.sessionId &&
       firstRecent.lineClamps.every((value) => value === '6') &&
       !firstRecent.agentReplyVisible &&
       !firstRecent.refreshStatusVisible &&
@@ -387,22 +463,62 @@ async function main() {
       expansionAfter.ariaExpanded &&
       expansionAfter.fullHeight &&
       transitionRecent.busy &&
+      transitionRecent.selectedRows.length === 1 &&
+      transitionRecent.selectedRows[0].sessionId === secondCandidate.sessionId &&
       transitionRecent.messages.length === 0 &&
       secondRecent.messages.length >= 1 &&
       secondRecent.messages.length <= 4 &&
+      secondRecent.selectedRows.length === 1 &&
+      secondRecent.selectedRows[0].sessionId === secondCandidate.sessionId &&
       secondRecent.roles.every((role) => role === 'user') &&
       !secondRecent.agentReplyVisible;
+
+    await evaluate(`(() => {
+      const input = document.querySelector('#ai-session-search-input');
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      setter?.call(input, ${JSON.stringify(aiQuery)});
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.closest('form')?.requestSubmit();
+      return true;
+    })()`);
+    const aiSearch = await waitFor(
+      `(() => {
+        const status = document.querySelector('[data-ai-search-mode]');
+        const rows = [...document.querySelectorAll('.session-row[data-machine-id]')];
+        return {
+          mode: status?.getAttribute('data-ai-search-mode') || null,
+          text: status?.textContent || '',
+          machines: [...new Set(rows.map((row) => row.dataset.machineId).filter(Boolean))],
+          resultCount: document.querySelectorAll('[data-ai-search-result]').length
+        };
+      })()`,
+      (value) => value.mode === 'deepseek' || value.mode === 'fallback-local' || value.mode === 'error',
+      'AI cross-machine search',
+      20000
+    );
+    const aiSearchOk =
+      aiSearch.mode === 'deepseek' &&
+      aiSearch.text.includes('机器 cnal002') &&
+      aiSearch.resultCount > 0 &&
+      aiSearch.machines.length === 1 &&
+      aiSearch.machines[0] === 'cnal002';
     ws.close();
 
     const ok =
       !before.loginVisible &&
       before.searchVisible &&
+      before.aiSearchVisible &&
       before.sessionGroups > 0 &&
       after.sessionRows > 0 &&
       !before.loadErrorVisible &&
       !after.loadErrorVisible &&
+      before.auditSummaryText.includes('稳定会话 AI 覆盖') &&
+      before.auditSummaryText.includes('真正遗漏') &&
       agentFilterOk &&
+      duplicateIdentityOk &&
       recentOk &&
+      aiSearchOk &&
       exceptions.length === 0 &&
       consoleErrors.length === 0;
     console.log(JSON.stringify({
@@ -418,6 +534,10 @@ async function main() {
         codexRows: codexAgents.agents.length,
         claudeRows: claudeAgents.agents.length,
       },
+      duplicateIdentity: {
+        ok: duplicateIdentityOk,
+        candidates: agentCandidates.duplicateIdentities,
+      },
       recent: {
         ok: recentOk,
         firstSessionId: firstCandidate.sessionId,
@@ -429,6 +549,13 @@ async function main() {
         secondSessionId: secondCandidate.sessionId,
         secondCount: secondRecent.messages.length,
         agentReplyVisible: firstRecent.agentReplyVisible || secondRecent.agentReplyVisible,
+      },
+      aiSearch: {
+        ok: aiSearchOk,
+        query: aiQuery,
+        mode: aiSearch.mode,
+        machines: aiSearch.machines,
+        resultCount: aiSearch.resultCount,
       },
       exceptions,
       consoleErrors,

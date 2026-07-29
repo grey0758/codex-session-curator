@@ -8,6 +8,8 @@ Defaults:
 
 - `CURATOR_BASE_URL`: `http://127.0.0.1:54177`
 - token source: `CURATOR_ADMIN_TOKEN`, then `~/.config/codex-session-curator/auth.env`
+- apply/reject capability: `CURATOR_PROPOSAL_APPLY_TOKEN` from environment or
+  the same auth file; gpl001/promoted DR only, never workers
 
 Common commands:
 
@@ -24,6 +26,27 @@ bin/curator guide <job-id> "只处理当前任务，不要展开旁支"
 bin/curator stop <job-id>
 bin/curator refresh <session-id>
 ```
+
+Thin-worker knowledge proposal overlay:
+
+```bash
+bin/curator knowledge-proposal init knowledge/runbooks/example.md \
+  --reason "Correct verified facts" --session-id "<session-id>"
+# edit only the returned editRoot
+bin/curator knowledge-proposal submit <local-id>
+bin/curator knowledge-proposal list --status pending
+bin/curator knowledge-proposal show <proposal-id>
+```
+
+On gpl001 or explicitly promoted sgp001 DR only:
+
+```bash
+bin/curator knowledge-proposal apply <proposal-id> --publish fleet
+bin/curator knowledge-proposal reject <proposal-id> --reason "<reason>"
+```
+
+Worker mirrors remain immutable; writable overlays live below
+`~/.local/share/curator/knowledge-proposals/`.
 
 Server identity compatibility bridge:
 

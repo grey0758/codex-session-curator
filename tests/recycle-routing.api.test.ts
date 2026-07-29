@@ -111,6 +111,10 @@ test('main panel aggregates and routes remote recycle actions and recommended pr
       response.end(JSON.stringify({ results: ids.map((id: string) => ({ id, ok: true, result: { sessionId: id } })) }));
       return;
     }
+    if (request.method === 'DELETE' && url.pathname === '/api/sessions/remote-routed-target') {
+      response.end(JSON.stringify({ sessionId: 'remote-routed-target' }));
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/recycle-bin/remote-archive/restore') {
       response.end(JSON.stringify({ sessionId: 'remote-archive', restoredFiles: ['fixture'], archiveDir: remoteArchive.archiveDir }));
       return;
@@ -175,6 +179,25 @@ test('main panel aggregates and routes remote recycle actions and recommended pr
       method: 'DELETE',
       body: JSON.stringify({ confirm: true }),
     });
+    const routedDelete = await requestJson<{
+      deleted: number;
+      failed: number;
+      results: Array<{ id: string; machineId: string; ok: boolean }>;
+    }>(baseUrl, '/api/sessions/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify({
+        confirm: true,
+        sessions: [{ id: 'remote-routed-target', machineId: 'us002' }],
+      }),
+    });
+    assert.equal(routedDelete.deleted, 1);
+    assert.equal(routedDelete.failed, 0);
+    assert.deepEqual(routedDelete.results[0], {
+      id: 'remote-routed-target',
+      machineId: 'us002',
+      ok: true,
+      result: { sessionId: 'remote-routed-target' },
+    });
     const prune = await requestJson<{ matched: number; deleted: number; failed: number }>(baseUrl, '/api/sessions/prune', {
       method: 'POST',
       body: JSON.stringify({ confirm: true }),
@@ -185,6 +208,7 @@ test('main panel aggregates and routes remote recycle actions and recommended pr
 
     assert.ok(remoteCalls.some((call) => call.method === 'POST' && call.path === '/api/recycle-bin/remote-archive/restore'));
     assert.ok(remoteCalls.some((call) => call.method === 'DELETE' && call.path === '/api/recycle-bin/remote-archive'));
+    assert.ok(remoteCalls.some((call) => call.method === 'DELETE' && call.path === '/api/sessions/remote-routed-target'));
     const bulkCall = remoteCalls.find((call) => call.method === 'POST' && call.path === '/api/sessions/bulk-delete');
     assert.deepEqual((bulkCall?.body as { ids?: string[] })?.ids, ['remote-delete-target']);
   } finally {

@@ -27,6 +27,8 @@ const HUB_ONLY_API_PREFIXES = [
   '/api/server-identity',
   '/api/evaluations',
   '/api/remote-agents',
+  '/api/audit/fleet',
+  '/api/sessions/ai-search',
 ];
 
 export function getCuratorRole(): CuratorRole {

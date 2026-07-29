@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+settings_file="${CLAUDE_SETTINGS_FILE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}"
+real_bin="${CLAUDE_REAL_BIN:-$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe}"
+token_file="${CLAUDE_PROVIDER_TOKEN_FILE:-$HOME/.config/claude/provider-token}"
+
+token=""
+if [[ -r "$token_file" ]]; then
+  token="$(<"$token_file")"
+elif [[ -z "${ANTHROPIC_API_KEY:-}" && -r "$settings_file" ]] && command -v jq >/dev/null 2>&1; then
+  token="$(jq -er '.env.ANTHROPIC_AUTH_TOKEN // empty' "$settings_file" 2>/dev/null || true)"
+fi
+if [[ -n "$token" ]]; then
+  exec env ANTHROPIC_API_KEY="$token" ANTHROPIC_AUTH_TOKEN= "$real_bin" "$@"
+fi
+unset token
+
+exec "$real_bin" "$@"
