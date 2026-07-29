@@ -473,6 +473,10 @@ test('DeepSeek reranking filters invented IDs and keeps duplicate session IDs is
   assert.equal(new Set(payload.matches.map((match) => match.identity.key)).size, 2);
   assert.equal(deepSeekCalls.length, 1);
   assert.ok(deepSeekCalls.every((call) => call.authorization === 'Bearer test-key'));
+  assert.ok(deepSeekCalls.every((call) => (
+    (call.body.thinking as { type?: string } | undefined)?.type === 'disabled'
+  )));
+  assert.ok(deepSeekCalls.every((call) => call.body.max_tokens === 1600));
 });
 
 test('DeepSeek timeout keeps an explicit registered-machine hint and returns enhanced local matches', async () => {

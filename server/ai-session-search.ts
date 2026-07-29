@@ -545,6 +545,7 @@ async function requestDeepSeekJson(
         temperature: 0.1,
         top_p: 0.9,
         stream: false,
+        thinking: { type: 'disabled' },
         response_format: { type: 'json_object' },
       }),
       signal: controller.signal,
