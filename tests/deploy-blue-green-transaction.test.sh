@@ -402,6 +402,279 @@ lock_fixture="$tmpdir/lock-validation"
 prepare_fixture "$lock_fixture"
 run_lock_validation "$lock_fixture"
 
+run_create_release_validation() (
+  set -euo pipefail
+  local fixture="$1"
+  local first_release second_release
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+
+  mkdir -p \
+    "$SOURCE_DIR/dist" \
+    "$SOURCE_DIR/server" \
+    "$RUNTIME_DIR/node_modules"
+  printf 'runtime\n' > "$RUNTIME_DIR/runtime.txt"
+  printf 'dist\n' > "$SOURCE_DIR/dist/index.html"
+  printf 'server\n' > "$SOURCE_DIR/server/index.js"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+  ensure_layout
+
+  npm() {
+    return 0
+  }
+  date() {
+    printf '20260729T120000Z\n'
+  }
+
+  first_release="$(create_release)"
+  second_release="$(create_release)"
+
+  test "$first_release" != "$second_release"
+  for release in "$first_release" "$second_release"; do
+    test -d "$release"
+    test ! -L "$release"
+    path_is_within "$release" "$RELEASES_DIR"
+    test "$(<"$release/RELEASE_ID")" = "$(basename "$release")"
+    test "$(<"$release/runtime.txt")" = runtime
+    test "$(<"$release/dist/index.html")" = dist
+    test "$(<"$release/server/index.js")" = server
+    test -L "$release/node_modules"
+    test "$(readlink -f "$release/node_modules")" = \
+      "$RUNTIME_DIR/node_modules"
+  done
+)
+
+create_release_fixture="$tmpdir/create-release"
+prepare_fixture "$create_release_fixture"
+run_create_release_validation "$create_release_fixture"
+
+run_create_release_symlink_refusal() (
+  set -euo pipefail
+  local fixture="$1"
+  local outside="$fixture/outside"
+  local malicious="$fixture/root/releases/malicious"
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+
+  mkdir -p "$SOURCE_DIR/dist" "$SOURCE_DIR/server" "$outside"
+  printf 'keep\n' > "$outside/sentinel"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+  ensure_layout
+  ln -s "$outside" "$malicious"
+
+  npm() {
+    return 0
+  }
+  mktemp() {
+    printf '%s\n' "$malicious"
+  }
+  rsync() {
+    printf 'rsync must not run for an invalid release path.\n' >&2
+    return 99
+  }
+
+  if create_release >/dev/null 2>&1; then
+    printf 'Accepted a symlinked release directory.\n' >&2
+    return 1
+  fi
+  test -L "$malicious"
+  test "$(<"$outside/sentinel")" = keep
+  test "$(find "$outside" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+)
+
+create_release_symlink_fixture="$tmpdir/create-release-symlink"
+prepare_fixture "$create_release_symlink_fixture"
+run_create_release_symlink_refusal "$create_release_symlink_fixture"
+
+run_create_release_root_symlink_refusal() (
+  set -euo pipefail
+  local fixture="$1"
+  local outside_releases="$fixture/outside-releases"
+  local before_entries
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+
+  mv "$ROOT_DIR/releases" "$outside_releases"
+  ln -s "$outside_releases" "$ROOT_DIR/releases"
+  printf 'keep\n' > "$outside_releases/sentinel"
+  before_entries="$(
+    find "$outside_releases" -mindepth 1 -maxdepth 1 | wc -l
+  )"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+
+  npm() {
+    printf 'npm-called\n' > "$fixture/npm-called"
+    return 0
+  }
+
+  if create_release >/dev/null 2>&1; then
+    printf 'Accepted a symlinked releases root.\n' >&2
+    return 1
+  fi
+  test -L "$RELEASES_DIR"
+  test ! -e "$fixture/npm-called"
+  test "$(<"$outside_releases/sentinel")" = keep
+  test "$(
+    find "$outside_releases" -mindepth 1 -maxdepth 1 | wc -l
+  )" -eq "$before_entries"
+)
+
+create_release_root_symlink_fixture="$tmpdir/create-release-root-symlink"
+prepare_fixture "$create_release_root_symlink_fixture"
+run_create_release_root_symlink_refusal \
+  "$create_release_root_symlink_fixture"
+
+run_create_release_failure_cleanup() (
+  set -euo pipefail
+  local fixture="$1"
+  local created_file="$fixture/created-release"
+  local failed_release
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+
+  mkdir -p "$SOURCE_DIR/dist" "$SOURCE_DIR/server"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+  ensure_layout
+
+  npm() {
+    return 0
+  }
+  mktemp() {
+    local created
+    created="$(/usr/bin/mktemp "$@")"
+    printf '%s\n' "$created" > "$created_file"
+    printf '%s\n' "$created"
+  }
+  rsync() {
+    return 1
+  }
+
+  if create_release >/dev/null 2>&1; then
+    printf 'Expected release creation to fail when rsync fails.\n' >&2
+    return 1
+  fi
+  failed_release="$(<"$created_file")"
+  path_is_within "$failed_release" "$RELEASES_DIR" || {
+    printf 'Failed release path escaped the release root.\n' >&2
+    return 1
+  }
+  test ! -e "$failed_release"
+)
+
+create_release_failure_fixture="$tmpdir/create-release-failure"
+prepare_fixture "$create_release_failure_fixture"
+run_create_release_failure_cleanup "$create_release_failure_fixture"
+
+run_legacy_rollback_refusal() (
+  set -euo pipefail
+  local fixture="$1"
+  local legacy_release="$fixture/root/releases/legacy"
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+  export SYSTEMCTL_LOG="$fixture/systemctl.log"
+
+  mkdir -p "$legacy_release"
+  ln -s "$legacy_release" "$fixture/root/state/rollback-release"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+
+  systemctl() {
+    printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+    return 0
+  }
+
+  if rollback >/dev/null 2>&1; then
+    printf 'Accepted an unpaired legacy rollback release.\n' >&2
+    return 1
+  fi
+  test ! -e "$ROLLBACK_STATE_LINK"
+  test ! -L "$ROLLBACK_STATE_LINK"
+  cmp "$fixture/old-unit.service" "$SLOT_UNIT_TARGET"
+  test "$(current_slot)" = blue
+  test ! -e "$SLOTS_DIR/green/current"
+  test "$(readlink -f "$ROLLBACK_RELEASE_LINK")" = "$legacy_release"
+)
+
+legacy_rollback_refusal_fixture="$tmpdir/legacy-rollback-refusal"
+prepare_fixture "$legacy_rollback_refusal_fixture"
+run_legacy_rollback_refusal "$legacy_rollback_refusal_fixture"
+
+run_deploy_upgrades_legacy_rollback() (
+  set -euo pipefail
+  local fixture="$1"
+  local legacy_release="$fixture/root/releases/legacy"
+  local rollback_record
+  export SOURCE_DIR="$fixture/source"
+  export RUNTIME_DIR="$fixture/runtime"
+  export ROOT_DIR="$fixture/root"
+  export XDG_CONFIG_HOME="$fixture/config"
+  export SYSTEMCTL_LOG="$fixture/systemctl.log"
+
+  mkdir -p "$legacy_release"
+  ln -s "$legacy_release" "$fixture/root/state/rollback-release"
+
+  set -- help
+  # shellcheck disable=SC1090
+  source "$DEPLOY_SCRIPT" >/dev/null
+
+  systemctl() {
+    printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+    return 0
+  }
+  create_release() {
+    local release="$RELEASES_DIR/new"
+    mkdir -p "$release"
+    printf '%s\n' "$release"
+  }
+  healthcheck_port() {
+    return 0
+  }
+  healthcheck_public() {
+    return 0
+  }
+
+  deploy >/dev/null
+  rollback_record="$(readlink -f "$ROLLBACK_STATE_LINK")"
+  test "$(readlink -f "$rollback_record/release")" = \
+    "$RELEASES_DIR/old"
+  test "$(readlink -f "$rollback_record/release")" != \
+    "$legacy_release"
+  cmp "$fixture/old-unit.service" \
+    "$rollback_record/$SLOT_UNIT_NAME"
+  cmp "$fixture/source/deploy/$SLOT_UNIT_NAME" "$SLOT_UNIT_TARGET"
+  test "$(current_slot)" = green
+  test "$(readlink -f "$ROLLBACK_RELEASE_LINK")" = \
+    "$RELEASES_DIR/old"
+)
+
+legacy_deploy_fixture="$tmpdir/legacy-deploy"
+prepare_fixture "$legacy_deploy_fixture"
+run_deploy_upgrades_legacy_rollback "$legacy_deploy_fixture"
+
 success_fixture="$tmpdir/success"
 prepare_fixture "$success_fixture"
 run_success_and_rollback "$success_fixture"

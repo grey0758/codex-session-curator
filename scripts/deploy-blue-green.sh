@@ -423,22 +423,45 @@ healthcheck_public() {
 }
 
 create_release() {
-  local stamp release
+  local stamp release release_id
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  release="$RELEASES_DIR/$stamp"
+
+  if [[ ! -d "$RELEASES_DIR" || -L "$RELEASES_DIR" ]]; then
+    printf 'Refusing invalid or symlinked releases directory: %s\n' \
+      "$RELEASES_DIR" >&2
+    return 1
+  fi
 
   (cd "$SOURCE_DIR" && npm run build >&2)
 
-  mkdir -p "$release"
-  rsync -a --delete \
+  release="$(mktemp -d "$RELEASES_DIR/${stamp}.XXXXXX")"
+  if [[ -z "$release" || ! -d "$release" || -L "$release" ]] ||
+    ! path_is_within "$release" "$RELEASES_DIR"; then
+    printf 'Refusing invalid release directory returned by mktemp: %s\n' \
+      "${release:-empty}" >&2
+    return 1
+  fi
+  release_id="$(basename "$release")"
+
+  if ! rsync -a --delete \
     --exclude '.git' \
     --exclude 'node_modules' \
     --exclude 'session-recycle-bin' \
-    "$RUNTIME_DIR/" "$release/"
-  rsync -a --delete "$SOURCE_DIR/dist/" "$release/dist/"
-  rsync -a --delete "$SOURCE_DIR/server/" "$release/server/"
-  ln -s "$RUNTIME_DIR/node_modules" "$release/node_modules"
-  printf '%s\n' "$stamp" > "$release/RELEASE_ID"
+    "$RUNTIME_DIR/" "$release/" ||
+    ! rsync -a --delete "$SOURCE_DIR/dist/" "$release/dist/" ||
+    ! rsync -a --delete "$SOURCE_DIR/server/" "$release/server/" ||
+    ! ln -s "$RUNTIME_DIR/node_modules" "$release/node_modules" ||
+    ! printf '%s\n' "$release_id" > "$release/RELEASE_ID" ||
+    ! chmod 0755 "$release"; then
+    if [[ -d "$release" && ! -L "$release" ]] &&
+      path_is_within "$release" "$RELEASES_DIR"; then
+      rm -rf -- "$release"
+    else
+      printf 'Preserving invalid failed release path for manual inspection: %s\n' \
+        "$release" >&2
+    fi
+    return 1
+  fi
   printf '%s\n' "$release"
 }
 
@@ -534,6 +557,11 @@ rollback() {
   next="$(other_slot "$active")"
   record="$(resolve_rollback_record 2>/dev/null || true)"
   if [[ -z "$record" ]]; then
+    if [[ -L "$ROLLBACK_RELEASE_LINK" ]]; then
+      printf 'Refusing unpaired legacy rollback release; complete one successful deploy to create a release and slot-unit pair.\n' \
+        >&2
+      return 1
+    fi
     printf 'No rollback release with a matching slot unit is available.\n' >&2
     return 1
   fi
