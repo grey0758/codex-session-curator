@@ -14,6 +14,7 @@
     "test:worker-role": "node --import tsx --test tests/worker-role.api.test.ts",
     "test:remote-evaluation": "node --import tsx --test tests/remote-evaluation-audit.api.test.ts",
     "test:ai-search": "node --import tsx --test --test-concurrency=1 tests/ai-session-search.api.test.ts",
+    "test:deploy-blue-green": "bash tests/deploy-blue-green-transaction.test.sh",
     "test:knowledge-federation": "node --import tsx --test tests/knowledge-federation.api.test.ts",
     "test:knowledge-proposals": "node --import tsx --test tests/knowledge-proposals.api.test.ts",
     "build:worker": "node scripts/build-worker-package.mjs",
