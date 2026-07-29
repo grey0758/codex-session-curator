@@ -12,6 +12,7 @@ NGINX_DIR="$ROOT_DIR/nginx"
 BLUE_PORT="${BLUE_PORT:-54187}"
 GREEN_PORT="${GREEN_PORT:-54188}"
 PUBLIC_PORT="${PUBLIC_PORT:-54177}"
+USER_SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 usage() {
   cat <<'EOF'
@@ -52,6 +53,13 @@ current_slot() {
 
 ensure_layout() {
   mkdir -p "$RELEASES_DIR" "$SLOTS_DIR/blue" "$SLOTS_DIR/green" "$STATE_DIR" "$NGINX_DIR/logs" "$NGINX_DIR/client-body"
+}
+
+install_slot_unit() {
+  mkdir -p "$USER_SYSTEMD_DIR"
+  install -m 0644 \
+    "$SOURCE_DIR/deploy/codex-session-curator-slot@.service" \
+    "$USER_SYSTEMD_DIR/codex-session-curator-slot@.service"
 }
 
 write_upstream() {
@@ -124,6 +132,7 @@ switch_to_slot() {
 
 deploy() {
   ensure_layout
+  install_slot_unit
   local active next old_release release port old_slot
   active="$(current_slot)"
   next="$(other_slot "$active")"
