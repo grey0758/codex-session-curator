@@ -10,6 +10,7 @@ const chromeBin = process.env.CHROMIUM_BIN || process.env.CHROME_BIN || '/snap/b
 const windowSize = process.env.CURATOR_TERMINAL_VERIFY_WINDOW || '2100,960';
 const screenshotPath = process.env.CURATOR_TERMINAL_VERIFY_SCREENSHOT || '/tmp/curator-terminal-browser-e2e.png';
 const agent = process.env.CURATOR_TERMINAL_VERIFY_AGENT === 'claude' ? 'claude' : 'codex';
+const machineId = process.env.CURATOR_TERMINAL_VERIFY_MACHINE_ID || 'gpl001';
 const sshTarget = process.env.CURATOR_TERMINAL_VERIFY_SSH_TARGET || '';
 const sshCommand = process.env.CURATOR_TERMINAL_VERIFY_SSH_COMMAND || 'ssh';
 const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
@@ -117,6 +118,8 @@ async function main() {
   const userDataDir = mkdtempSync(join(tmpdir(), 'curator-terminal-e2e-'));
   const targetUrl = new URL(baseUrl);
   targetUrl.searchParams.set('terminal', sessionId);
+  targetUrl.searchParams.set('machineId', machineId);
+  targetUrl.searchParams.set('agent', agent);
   targetUrl.searchParams.set('admin_token', token);
 
   detachSessionClients();
@@ -338,8 +341,9 @@ async function main() {
     const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
-      sessionId,
-      agent,
+    sessionId,
+    machineId,
+    agent,
       sshTarget: sshTarget || null,
       sshCommand: sshTarget ? sshCommand : null,
       baseUrl,
