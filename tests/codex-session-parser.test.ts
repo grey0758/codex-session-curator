@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import {
   classifyInjectedUserContext,
   parseRecentUserMessages,
+  parseSessionHistory,
   parseSessionFile,
   readCodexSessionLineage,
 } from '../server/session-parser.js';
@@ -107,7 +108,7 @@ test('Codex subagent rollouts keep their own identity when parent metadata is em
   }
 });
 
-test('recent conversation keeps user text verbatim and folds only whole injected records', async () => {
+test('recent conversation keeps user text verbatim and folds complete injected blocks', async () => {
   const root = await mkdtemp(join(tmpdir(), 'curator-codex-recent-'));
   const sessionId = '019fb123-7524-71f1-97de-cd7b384adfe9';
   const sessionPath = join(root, 'sessions', `rollout-2026-07-30T00-00-00-${sessionId}.jsonl`);
@@ -124,6 +125,12 @@ test('recent conversation keeps user text verbatim and folds only whole injected
     'Keep this exact spacing.',
     '',
     'The literal <environment_context> marker and "This sub-agent is controlled by its parent" are user text.',
+  ].join('\n');
+  const inlineEnvironmentUserText =
+    `Before the injected block.${environmentContext}After the injected block.`;
+  const inlineEnvironmentVisibleText = [
+    'Before the injected block.',
+    'After the injected block.',
   ].join('\n');
   const quotedAgentsText = `${agentsContext}\n\nPlease treat the block above as quoted user text.`;
 
@@ -176,6 +183,11 @@ test('recent conversation keeps user text verbatim and folds only whole injected
         timestamp: '2026-07-30T07:00:07.000Z',
         payload: { role: 'user', content: 'continue\non the next line' },
       }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-07-30T07:00:08.000Z',
+        payload: { role: 'user', content: inlineEnvironmentUserText },
+      }),
     ].join('\n') + '\n', 'utf8');
 
     assert.equal(classifyInjectedUserContext(quotedUserText), null);
@@ -185,9 +197,9 @@ test('recent conversation keeps user text verbatim and folds only whole injected
       'agents_instructions',
     );
     const recent = await parseRecentUserMessages({ filePath: sessionPath, limit: 4 });
-    assert.equal(recent.totalUserMessages, 2);
+    assert.equal(recent.totalUserMessages, 3);
     assert.equal(recent.hiddenContextMessages, 4);
-    assert.equal(recent.messages.length, 2);
+    assert.equal(recent.messages.length, 3);
     assert.equal(recent.messages[0].text, quotedUserText);
     assert.deepEqual(
       recent.messages[0].precedingContext?.map((item) => item.kind),
@@ -196,6 +208,18 @@ test('recent conversation keeps user text verbatim and folds only whole injected
     assert.equal(recent.messages[1].text, 'continue\non the next line');
     assert.deepEqual(
       recent.messages[1].precedingContext?.map((item) => item.kind),
+      ['environment_context'],
+    );
+    assert.equal(recent.messages[2].text, inlineEnvironmentVisibleText);
+    assert.deepEqual(
+      recent.messages[2].precedingContext?.map((item) => item.kind),
+      ['environment_context'],
+    );
+    assert.equal(recent.messages[2].precedingContext?.[0].text, environmentContext);
+    const history = await parseSessionHistory({ filePath: sessionPath, limit: 20 });
+    assert.equal(history.messages.at(-1)?.text, 'Before the injected block. After the injected block.');
+    assert.deepEqual(
+      history.messages.at(-1)?.precedingContext?.map((item) => item.kind),
       ['environment_context'],
     );
     assert.deepEqual(await readCodexSessionLineage(sessionPath), {

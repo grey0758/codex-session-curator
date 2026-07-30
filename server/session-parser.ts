@@ -152,7 +152,7 @@ function injectedContextLabel(kind: InjectedContextKind): string {
 export function classifyInjectedUserContext(text: string): InjectedContextBlock | null {
   const trimmed = text.trim();
   let kind: InjectedContextKind | null = null;
-  if (wholeXmlBlock(trimmed, 'skill')) {
+  if (wholeXmlBlock(trimmed, 'skill') || wholeXmlBlock(trimmed, 'skills_instructions')) {
     kind = 'skill';
   } else if (wholeXmlBlock(trimmed, 'environment_context')) {
     kind = 'environment_context';
@@ -166,6 +166,55 @@ export function classifyInjectedUserContext(text: string): InjectedContextBlock 
     text,
     characterCount: text.length,
   };
+}
+
+function extractInlineInjectedUserContexts(text: string): {
+  text: string;
+  contexts: InjectedContextBlock[];
+} {
+  const tags: Array<{ tag: string; kind: InjectedContextKind }> = [
+    { tag: 'environment_context', kind: 'environment_context' },
+    { tag: 'skills_instructions', kind: 'skill' },
+    { tag: 'skill', kind: 'skill' },
+  ];
+  const contexts: InjectedContextBlock[] = [];
+  let output = '';
+  let cursor = 0;
+  let searchFrom = 0;
+
+  while (searchFrom < text.length) {
+    const candidate = tags
+      .map((item) => ({ ...item, index: text.indexOf(`<${item.tag}>`, searchFrom) }))
+      .filter((item) => item.index >= 0)
+      .sort((left, right) => left.index - right.index)[0];
+    if (!candidate) break;
+
+    const closingTag = `</${candidate.tag}>`;
+    const closingIndex = text.indexOf(closingTag, candidate.index + candidate.tag.length + 2);
+    if (closingIndex < 0) {
+      searchFrom = candidate.index + candidate.tag.length + 2;
+      continue;
+    }
+
+    const blockEnd = closingIndex + closingTag.length;
+    const block = text.slice(candidate.index, blockEnd);
+    output += text.slice(cursor, candidate.index);
+    const before = output.at(-1);
+    const after = text[blockEnd];
+    if (before && after && !/\s/.test(before) && !/\s/.test(after)) output += '\n';
+    contexts.push({
+      kind: candidate.kind,
+      label: injectedContextLabel(candidate.kind),
+      text: block,
+      characterCount: block.length,
+    });
+    cursor = blockEnd;
+    searchFrom = blockEnd;
+  }
+
+  if (!contexts.length) return { text, contexts };
+  output += text.slice(cursor);
+  return { text: output, contexts };
 }
 
 // Normalize a raw JSONL record from either agent into a role + content turn.
@@ -218,13 +267,18 @@ async function collectSessionMessages(input: {
     if (!turn) continue;
     const text = textFromContent(turn.content);
     if (!text) continue;
+    const injectedContext = turn.role === 'user' ? classifyInjectedUserContext(text) : null;
+    const inline = turn.role === 'user' && !injectedContext
+      ? extractInlineInjectedUserContexts(text)
+      : { text, contexts: [] };
 
     const current: HistoryMessage = {
       index: messageIndex,
       role: turn.role,
-      text: normalizeMessageText(text, preserveWhitespace),
+      text: normalizeMessageText(inline.text, preserveWhitespace),
       timestamp: turn.timestamp,
-      injectedContext: turn.role === 'user' ? classifyInjectedUserContext(text) : null,
+      injectedContext,
+      ...(inline.contexts.length ? { precedingContext: inline.contexts } : {}),
     };
     messageIndex += 1;
 
@@ -285,9 +339,13 @@ export async function parseRecentUserMessages(input: {
       }
 
       totalUserMessages += 1;
+      const contexts = [
+        ...pendingContext.splice(0),
+        ...(message.precedingContext ?? []),
+      ];
       messages.push({
         ...message,
-        ...(pendingContext.length ? { precedingContext: pendingContext.splice(0) } : {}),
+        ...(contexts.length ? { precedingContext: contexts } : {}),
       });
       if (messages.length > limit) messages.shift();
     },

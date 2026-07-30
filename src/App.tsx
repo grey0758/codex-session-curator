@@ -4801,7 +4801,22 @@ function App() {
                         <pre>{message.injectedContext.text}</pre>
                       </details>
                     ) : (
-                      <p>{message.text}</p>
+                      <>
+                        <p>{message.text}</p>
+                        {message.precedingContext?.length ? (
+                          <details className="history-context-details">
+                            <summary>系统上下文 ({message.precedingContext.length})</summary>
+                            <div className="recent-context-content">
+                              {message.precedingContext.map((context, index) => (
+                                <section key={`${context.kind}:${index}`}>
+                                  <strong>{context.label}</strong>
+                                  <pre>{context.text}</pre>
+                                </section>
+                              ))}
+                            </div>
+                          </details>
+                        ) : null}
+                      </>
                     )}
                   </div>
                 ))}
