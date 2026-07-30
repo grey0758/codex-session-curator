@@ -16,6 +16,7 @@ export type KnowledgeItemType =
   | 'note';
 
 export type MessageRole = 'user' | 'assistant';
+export type InjectedContextKind = 'agents_instructions' | 'environment_context' | 'skill';
 
 // Which agent CLI produced a session. Codex sessions live under ~/.codex/sessions;
 // Claude Code sessions live under ~/.claude/projects. Derived from the file path.
@@ -27,8 +28,17 @@ export interface ParsedMessage {
   timestamp: string | null;
 }
 
+export interface InjectedContextBlock {
+  kind: InjectedContextKind;
+  label: string;
+  text: string;
+  characterCount: number;
+}
+
 export interface HistoryMessage extends ParsedMessage {
   index: number;
+  injectedContext?: InjectedContextBlock | null;
+  precedingContext?: InjectedContextBlock[];
 }
 
 export interface SessionMessagesPage {
@@ -38,6 +48,15 @@ export interface SessionMessagesPage {
   nextAfter: number | null;
   hasMoreBefore: boolean;
   hasMoreAfter: boolean;
+}
+
+export interface RecentUserMessagesPage {
+  messages: HistoryMessage[];
+  totalUserMessages: number;
+  hiddenContextMessages: number;
+  fileSize: number;
+  fileMtimeMs: number;
+  cached: boolean;
 }
 
 export interface Evaluation {

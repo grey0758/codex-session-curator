@@ -5450,6 +5450,62 @@ app.get('/api/sessions/:id/history', async (request, reply) => {
   }
 });
 
+app.get('/api/sessions/:id/recent-user-messages', async (request, reply) => {
+  const params = sessionIdSchema.parse(request.params);
+  const query = z
+    .object({
+      limit: z.coerce.number().int().min(1).max(20).optional(),
+      machineId: z.string().min(1).max(300).optional(),
+      agent: z.enum(['codex', 'claude']).optional(),
+      remote: z.enum(['0', '1', 'true', 'false']).optional(),
+    })
+    .parse(request.query);
+  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  try {
+    const includeRemote = query.remote !== '0' && query.remote !== 'false';
+    routed = await findRoutableSession(params.id, query.machineId, query.agent, includeRemote);
+  } catch (error) {
+    return sendSessionRoutingError(reply, error, 'Recent conversation lookup failed');
+  }
+  if (!routed) return reply.code(404).send({ error: 'Session not found' });
+
+  if (routed.kind === 'local') {
+    try {
+      const payload = await service.getRecentUserMessages(routed.session.filePath, query.limit ?? 4);
+      const etag = `"${payload.fileSize.toString(16)}-${Math.floor(payload.fileMtimeMs).toString(16)}-${query.limit ?? 4}"`;
+      reply.header('Cache-Control', 'private, no-cache');
+      reply.header('ETag', etag);
+      if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+      return payload;
+    } catch (error) {
+      return reply.code(404).send({
+        error: error instanceof Error ? error.message : 'Recent conversation failed',
+      });
+    }
+  }
+
+  const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
+  if (!remoteAgent) {
+    return reply.code(404).send({ error: `Remote machine not configured: ${routed.session.machineId}` });
+  }
+  const remoteQuery = new URLSearchParams({
+    limit: String(query.limit ?? 4),
+    machineId: routed.session.machineId,
+    agent: routed.session.agent,
+    remote: '0',
+  });
+  try {
+    return await fetchAgentJson(
+      remoteAgent,
+      `/api/sessions/${encodeURIComponent(params.id)}/recent-user-messages?${remoteQuery.toString()}`,
+    );
+  } catch (error) {
+    return reply.code(404).send({
+      error: error instanceof Error ? error.message : 'Recent conversation failed',
+    });
+  }
+});
+
 app.get('/api/sessions/:id/messages', async (request, reply) => {
   const params = sessionIdSchema.parse(request.params);
   const query = z

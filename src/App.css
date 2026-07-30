@@ -927,6 +927,7 @@
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 6;
   overflow: hidden;
+  white-space: pre-wrap;
 }
 
 .recent-dialogue article.expanded .recent-message-text {
@@ -970,6 +971,64 @@
 
 .recent-message-toggle[aria-expanded='true'] svg {
   transform: rotate(180deg);
+}
+
+.recent-context-details,
+.history-context-details {
+  margin-top: 10px;
+  border-top: 1px solid rgba(60, 60, 67, 0.12);
+  padding-top: 9px;
+}
+
+.recent-context-details > summary,
+.history-context-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.recent-context-details > summary::-webkit-details-marker,
+.history-context-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.recent-context-content {
+  max-height: 320px;
+  margin-top: 10px;
+  overflow: auto;
+}
+
+.recent-context-content section + section {
+  margin-top: 12px;
+  border-top: 1px solid rgba(60, 60, 67, 0.1);
+  padding-top: 12px;
+}
+
+.recent-context-content strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #3a3a3c;
+  font-size: 12px;
+}
+
+.recent-context-content pre,
+.history-context-details pre {
+  margin: 0;
+  color: #3a3a3c;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.history-context-details pre {
+  max-height: 360px;
+  margin-top: 10px;
+  overflow: auto;
 }
 
 .index-section {

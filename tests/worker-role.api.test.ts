@@ -48,8 +48,10 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
   const claudeHome = join(testRoot, '.claude');
   const projectDir = join(testRoot, 'project');
   const codexSessionId = 'worker-codex-session';
+  const codexSubagentSessionId = 'worker-codex-subagent-session';
   const claudeSessionId = 'worker-claude-session';
   const codexSessionPath = join(codexHome, 'sessions', `${codexSessionId}.jsonl`);
+  const codexSubagentSessionPath = join(codexHome, 'sessions', `${codexSubagentSessionId}.jsonl`);
   const claudeSessionPath = join(claudeHome, 'projects', '-worker-project', `${claudeSessionId}.jsonl`);
   const statePath = join(codexHome, 'session-curator-state.json');
   const knowledgeDb = join(testRoot, 'must-not-exist.sqlite');
@@ -66,6 +68,32 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
     JSON.stringify({ type: 'session_meta', timestamp: now, payload: { id: codexSessionId, cwd: projectDir, timestamp: now } }),
     JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'user', content: 'CODEX_WORKER_USER' } }),
     JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'assistant', content: 'CODEX_WORKER_ASSISTANT' } }),
+    JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'user', content: '<environment_context>\n<cwd>/tmp/project</cwd>\n</environment_context>' } }),
+    JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'user', content: 'CODEX_WORKER_RECENT\nSECOND_LINE' } }),
+  ].join('\n') + '\n', 'utf8');
+  await writeFile(codexSubagentSessionPath, [
+    JSON.stringify({
+      type: 'session_meta',
+      timestamp: now,
+      payload: {
+        id: codexSubagentSessionId,
+        cwd: projectDir,
+        timestamp: now,
+        thread_source: 'subagent',
+        parent_thread_id: codexSessionId,
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: codexSessionId,
+              depth: 1,
+              agent_path: '/root/reviewer',
+            },
+          },
+        },
+      },
+    }),
+    JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'user', content: 'COPIED_PARENT_USER' } }),
+    JSON.stringify({ type: 'response_item', timestamp: now, payload: { role: 'assistant', content: 'SUBAGENT_REPLY' } }),
   ].join('\n') + '\n', 'utf8');
   await writeFile(claudeSessionPath, [
     JSON.stringify({ type: 'user', sessionId: claudeSessionId, cwd: projectDir, timestamp: now, message: { role: 'user', content: [{ type: 'text', text: 'CLAUDE_WORKER_USER' }] } }),
@@ -113,15 +141,33 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
 
     const sessions = await requestJson<{ sessions: JsonRecord[]; meta: JsonRecord }>(baseUrl, '/api/sessions?detail=0&remote=0');
     assert.deepEqual(new Set(sessions.sessions.map((session) => session.agent)), new Set(['codex', 'claude']));
+    assert.equal(sessions.sessions.some((session) => session.id === codexSubagentSessionId), false);
     assert.deepEqual(sessions.meta.remoteAgents, []);
 
     const index = await requestJson<{ sessions: JsonRecord[] }>(baseUrl, '/api/hermes/session-index?limit=10&remote=0');
     assert.deepEqual(new Set(index.sessions.map((session) => session.agent)), new Set(['codex', 'claude']));
+    assert.equal(index.sessions.some((session) => session.id === codexSubagentSessionId), false);
 
     const files = await requestJson<{ cwd: string; entries: JsonRecord[] }>(baseUrl, `/api/sessions/${codexSessionId}/files`);
     assert.equal(files.cwd, projectDir);
     const history = await requestJson<{ messages: JsonRecord[] }>(baseUrl, `/api/sessions/${claudeSessionId}/history?limit=5`);
     assert.equal(history.messages.length, 2);
+    const recent = await requestJson<{
+      messages: Array<{ text: string; precedingContext?: Array<{ kind: string }> }>;
+      totalUserMessages: number;
+      hiddenContextMessages: number;
+      cached: boolean;
+    }>(baseUrl, `/api/sessions/${codexSessionId}/recent-user-messages?limit=4`);
+    assert.equal(recent.cached, false);
+    assert.equal(recent.totalUserMessages, 2);
+    assert.equal(recent.hiddenContextMessages, 1);
+    assert.equal(recent.messages.at(-1)?.text, 'CODEX_WORKER_RECENT\nSECOND_LINE');
+    assert.deepEqual(recent.messages.at(-1)?.precedingContext?.map((item) => item.kind), ['environment_context']);
+    const recentCached = await requestJson<{ cached: boolean }>(
+      baseUrl,
+      `/api/sessions/${codexSessionId}/recent-user-messages?limit=4`,
+    );
+    assert.equal(recentCached.cached, true);
     await requestJson<JsonRecord>(baseUrl, '/api/hermes/jobs');
     await requestJson<JsonRecord>(baseUrl, '/api/recycle-bin?remote=0');
     const audit = await requestJson<{ counts: JsonRecord; issues: JsonRecord[]; pending: JsonRecord[]; skipped: JsonRecord[] }>(baseUrl, '/api/audit/completeness');
@@ -138,7 +184,7 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
       `/api/worker/evaluation-input/${codexSessionId}`,
     );
     assert.match(evaluationInput.transcriptHash, /^[0-9a-f]{64}$/);
-    assert.equal(evaluationInput.messageCount, 2);
+    assert.equal(evaluationInput.messageCount, 4);
 
     const hubOnlyRequests: Array<[string, RequestInit | undefined]> = [
       ['/', undefined],
@@ -164,6 +210,7 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
     const state = JSON.parse(await readFile(statePath, 'utf8')) as { evaluations: Record<string, JsonRecord> };
     assert.match(String(state.evaluations[`codex|||${codexSessionId}`].workflow), /:fast-list$/);
     assert.match(String(state.evaluations[`claude|||${claudeSessionId}`].workflow), /:fast-list$/);
+    assert.equal(state.evaluations[`codex|||${codexSubagentSessionId}`], undefined);
   } finally {
     if (worker) await stopServer(worker);
     await rm(testRoot, { recursive: true, force: true });

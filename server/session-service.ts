@@ -27,7 +27,14 @@ import {
 } from './evaluation-workflow.js';
 import { getCuratorRole } from './runtime-role.js';
 import { hashTranscript, recordSessionAuditEvent } from './session-audit.js';
-import { extractSessionId, parseSessionFile, parseSessionHistory, parseSessionMessages } from './session-parser.js';
+import {
+  extractSessionId,
+  parseRecentUserMessages,
+  parseSessionFile,
+  parseSessionHistory,
+  parseSessionMessages,
+  readCodexSessionLineage,
+} from './session-parser.js';
 import { CuratorStore } from './store.js';
 import type {
   ActivityStatus,
@@ -43,6 +50,7 @@ import type {
   RemoteMachine,
   ReviewPriority,
   RemoteEvaluationInput,
+  RecentUserMessagesPage,
   SessionCompletenessIssue,
   SessionCompletenessReport,
   StoredEvaluation,
@@ -550,6 +558,15 @@ export class SessionService {
   private store: CuratorStore;
   private lastAuditFindingFingerprints = new Map<string, string>();
   private legacyStateMigrationPromise: Promise<PersistedState> | null = null;
+  private codexSessionLineageCache = new Map<string, Promise<Awaited<ReturnType<typeof readCodexSessionLineage>>>>();
+  private recentUserMessagesCache = new Map<
+    string,
+    {
+      fileSize: number;
+      fileMtimeMs: number;
+      promise: Promise<Omit<RecentUserMessagesPage, 'fileSize' | 'fileMtimeMs' | 'cached'>>;
+    }
+  >();
 
   constructor(store: CuratorStore) {
     this.store = store;
@@ -570,7 +587,34 @@ export class SessionService {
   // Session files come from two roots: the Codex sessions root and the Claude
   // Code projects root. Both hold *.jsonl transcripts; parseSessionFile detects
   // the schema per file, so search / index / context-pack cover both agents.
-  private async discoverSessionFiles(): Promise<string[]> {
+  private async codexSessionIsPrimary(filePath: string): Promise<boolean> {
+    let lineage = this.codexSessionLineageCache.get(filePath);
+    if (!lineage) {
+      lineage = readCodexSessionLineage(filePath);
+      this.codexSessionLineageCache.set(filePath, lineage);
+      while (this.codexSessionLineageCache.size > 4096) {
+        const oldestKey = this.codexSessionLineageCache.keys().next().value;
+        if (typeof oldestKey !== 'string') break;
+        this.codexSessionLineageCache.delete(oldestKey);
+      }
+    } else {
+      this.codexSessionLineageCache.delete(filePath);
+      this.codexSessionLineageCache.set(filePath, lineage);
+    }
+    try {
+      const result = await lineage;
+      if (!result) {
+        this.codexSessionLineageCache.delete(filePath);
+        return true;
+      }
+      return !result.isSubagent;
+    } catch {
+      this.codexSessionLineageCache.delete(filePath);
+      return true;
+    }
+  }
+
+  private async discoverSessionFiles(options: { includeSubagents?: boolean } = {}): Promise<string[]> {
     const [codexFiles, claudeFiles] = await Promise.all([
       findJsonlFiles(this.sessionsRoot),
       findJsonlFiles(this.claudeProjectsRoot),
@@ -579,7 +623,10 @@ export class SessionService {
       const segments = relative(this.claudeProjectsRoot, filePath).split(sep);
       return !segments.includes('subagents');
     });
-    return [...codexFiles, ...primaryClaudeFiles];
+    if (options.includeSubagents) return [...codexFiles, ...primaryClaudeFiles];
+    const primaryCodexFlags = await mapLimit(codexFiles, 32, (filePath) => this.codexSessionIsPrimary(filePath));
+    const primaryCodexFiles = codexFiles.filter((_, index) => primaryCodexFlags[index]);
+    return [...primaryCodexFiles, ...primaryClaudeFiles];
   }
 
   private sessionStateIdentities(files: string[]): Array<{
@@ -626,7 +673,7 @@ export class SessionService {
     sessionId: string,
     agent?: AgentKind | null,
   ): Promise<{ sessionId: string; filePath: string; agent: AgentKind } | null> {
-    const matches = (await this.discoverSessionFiles())
+    const matches = (await this.discoverSessionFiles({ includeSubagents: true }))
       .filter((filePath) => extractSessionId(filePath) === sessionId)
       .map((filePath) => ({
         sessionId,
@@ -998,6 +1045,55 @@ export class SessionService {
     });
   }
 
+  async getRecentUserMessages(
+    filePath: string,
+    limit = 4,
+  ): Promise<RecentUserMessagesPage> {
+    const boundedLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+    const fileStat = await stat(filePath);
+    const cacheKey = `${filePath}|||${boundedLimit}`;
+    const cached = this.recentUserMessagesCache.get(cacheKey);
+    if (
+      cached &&
+      cached.fileSize === fileStat.size &&
+      cached.fileMtimeMs === fileStat.mtimeMs
+    ) {
+      this.recentUserMessagesCache.delete(cacheKey);
+      this.recentUserMessagesCache.set(cacheKey, cached);
+      return {
+        ...(await cached.promise),
+        fileSize: cached.fileSize,
+        fileMtimeMs: cached.fileMtimeMs,
+        cached: true,
+      };
+    }
+
+    const entry = {
+      fileSize: fileStat.size,
+      fileMtimeMs: fileStat.mtimeMs,
+      promise: parseRecentUserMessages({ filePath, limit: boundedLimit }),
+    };
+    this.recentUserMessagesCache.set(cacheKey, entry);
+    while (this.recentUserMessagesCache.size > 128) {
+      const oldestKey = this.recentUserMessagesCache.keys().next().value;
+      if (typeof oldestKey !== 'string') break;
+      this.recentUserMessagesCache.delete(oldestKey);
+    }
+    try {
+      return {
+        ...(await entry.promise),
+        fileSize: entry.fileSize,
+        fileMtimeMs: entry.fileMtimeMs,
+        cached: false,
+      };
+    } catch (error) {
+      if (this.recentUserMessagesCache.get(cacheKey) === entry) {
+        this.recentUserMessagesCache.delete(cacheKey);
+      }
+      throw error;
+    }
+  }
+
   async getSessionMessages(
     id: string,
     options: {
@@ -1170,7 +1266,10 @@ export class SessionService {
     const machineId = getMachineId();
     const quietMs = evaluationQuietMs();
     const pendingGraceMs = Math.max(quietMs, auditPendingGraceMs());
-    const files = await this.discoverSessionFiles();
+    const [files, allFiles] = await Promise.all([
+      this.discoverSessionFiles(),
+      this.discoverSessionFiles({ includeSubagents: true }),
+    ]);
     const state = await this.migrateLegacyStateForFiles(files);
     const parsedResults = await mapLimit(files, 4, async (filePath) => {
       try {
@@ -1323,8 +1422,9 @@ export class SessionService {
     }
 
     if (stateChanged) await this.store.save(state);
+    const existingStateKeys = new Set(this.sessionStateIdentities(allFiles).map((item) => item.stateKey));
     const orphanedEvaluationIds = Object.keys(state.evaluations)
-      .filter((stateKey) => parseSessionStateKey(stateKey) && !parsedStateKeys.has(stateKey));
+      .filter((stateKey) => parseSessionStateKey(stateKey) && !existingStateKeys.has(stateKey));
     const report: SessionCompletenessReport = {
       generatedAt,
       machineId,

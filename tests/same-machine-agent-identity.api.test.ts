@@ -238,6 +238,14 @@ test('same-machine Codex and Claude duplicate IDs route and mutate by agent', as
       ((await ambiguous.json()) as { code?: string }).code,
       'AMBIGUOUS_SESSION_IDENTITY',
     );
+    const ambiguousRecent = await fetch(
+      `${baseUrl}/api/sessions/${sessionId}/recent-user-messages`,
+    );
+    assert.equal(ambiguousRecent.status, 409);
+    assert.equal(
+      ((await ambiguousRecent.json()) as { code?: string }).code,
+      'AMBIGUOUS_SESSION_IDENTITY',
+    );
 
     const codexQuery = 'machineId=same-machine&agent=codex';
     const claudeQuery = 'machineId=same-machine&agent=claude';
@@ -253,6 +261,16 @@ test('same-machine Codex and Claude duplicate IDs route and mutate by agent', as
     assert.equal(codexDetail.agent, 'codex');
     assert.equal(claudeDetail.cwd, claudeProject);
     assert.equal(claudeDetail.agent, 'claude');
+    const codexRecent = await requestJson<{ messages: Array<{ text: string }> }>(
+      baseUrl,
+      `/api/sessions/${sessionId}/recent-user-messages?${codexQuery}`,
+    );
+    const claudeRecent = await requestJson<{ messages: Array<{ text: string }> }>(
+      baseUrl,
+      `/api/sessions/${sessionId}/recent-user-messages?${claudeQuery}`,
+    );
+    assert.deepEqual(codexRecent.messages.map((message) => message.text), ['CODEX_SHARED_ID_USER']);
+    assert.deepEqual(claudeRecent.messages.map((message) => message.text), ['CLAUDE_SHARED_ID_USER']);
 
     const codexJobQuery = `${codexQuery}&sessionId=${encodeURIComponent(sessionId)}`;
     const claudeJobQuery = `${claudeQuery}&sessionId=${encodeURIComponent(sessionId)}`;

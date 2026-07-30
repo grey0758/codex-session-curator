@@ -480,20 +480,37 @@ async function main() {
     const recentCandidates = await evaluate(`(async () => {
       const rows = [...document.querySelectorAll('.session-row[data-session-id]')];
       const inactiveRows = rows.filter((row) => row.querySelector('.session-time')?.textContent?.includes('非活跃'));
-      const visibleIds = [...inactiveRows, ...rows].map((row) => row.dataset.sessionId).filter(Boolean);
-      const sessionIds = [...new Set(visibleIds)].slice(0, 2);
+      const visibleIdentities = [...inactiveRows, ...rows]
+        .map((row) => ({
+          sessionId: row.dataset.sessionId,
+          machineId: row.dataset.machineId,
+          agent: row.dataset.agent
+        }))
+        .filter((identity) => identity.sessionId && identity.machineId && identity.agent);
+      const identities = [...new Map(
+        visibleIdentities.map((identity) => [
+          identity.machineId + '|||' + identity.agent + '|||' + identity.sessionId,
+          identity
+        ])
+      ).values()].slice(0, 10);
       const candidates = [];
-      const histories = await Promise.all(sessionIds.map(async (sessionId) => {
+      const histories = await Promise.all(identities.map(async (identity) => {
         try {
-          const historyResponse = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/history?limit=200');
+          const params = new URLSearchParams({
+            limit: '4',
+            machineId: identity.machineId,
+            agent: identity.agent
+          });
+          const historyResponse = await fetch(
+            '/api/sessions/' + encodeURIComponent(identity.sessionId) +
+            '/recent-user-messages?' + params.toString()
+          );
           if (!historyResponse.ok) return null;
           const history = await historyResponse.json();
           const messages = (history.messages || [])
-            .filter((message) => message.role === 'user')
-            .slice(-4)
             .reverse()
             .map((message) => message.text);
-          return messages.length ? { sessionId, messages } : null;
+          return messages.length ? { ...identity, messages } : null;
         } catch {
           return null;
         }
@@ -529,6 +546,7 @@ async function main() {
         roles: cards.map((card) => card.dataset.role || ''),
         lineClamps: cards.map((card) => getComputedStyle(card.querySelector('p')).webkitLineClamp),
         expandableCount: cards.filter((card) => card.querySelector('.recent-message-toggle')).length,
+        contextCount: cards.filter((card) => card.querySelector('.recent-context-details')).length,
         agentReplyVisible: document.body.innerText.includes('Agent 最后回复'),
         refreshStatusVisible: Boolean(heading?.textContent?.includes('已 AI 重算')),
         refreshButtonVisible: [...(heading?.querySelectorAll('button') || [])]
@@ -536,7 +554,7 @@ async function main() {
       };
     })()`;
 
-    await focusSession(firstCandidate.sessionId);
+    await focusSessionIdentity(firstCandidate.sessionId, firstCandidate.machineId, firstCandidate.agent);
     const firstRecent = await waitFor(
       recentSnapshotExpression,
       (value) =>
@@ -591,7 +609,11 @@ async function main() {
       window.__curatorPanelOriginalFetch = originalFetch;
       window.fetch = (input, init) => {
         const url = typeof input === 'string' ? input : input?.url || '';
-        if (url.includes(${JSON.stringify(`/api/sessions/${encodeURIComponent(secondCandidate.sessionId)}/history?limit=200`)})) {
+        if (
+          url.includes(${JSON.stringify(`/api/sessions/${encodeURIComponent(secondCandidate.sessionId)}/recent-user-messages?`)}) &&
+          url.includes(${JSON.stringify(`machineId=${encodeURIComponent(secondCandidate.machineId)}`)}) &&
+          url.includes(${JSON.stringify(`agent=${encodeURIComponent(secondCandidate.agent)}`)})
+        ) {
           return new Promise((resolve) => setTimeout(resolve, 1200)).then(() => originalFetch(input, init));
         }
         return originalFetch(input, init);
@@ -599,7 +621,7 @@ async function main() {
       return true;
     })()`);
 
-    await focusSession(secondCandidate.sessionId);
+    await focusSessionIdentity(secondCandidate.sessionId, secondCandidate.machineId, secondCandidate.agent);
     const transitionRecent = await waitFor(
       recentSnapshotExpression,
       (value) => value.sessionId === secondCandidate.sessionId,

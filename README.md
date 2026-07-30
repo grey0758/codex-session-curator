@@ -11,7 +11,10 @@ It is designed for people who use Codex heavily and end up with many saved sessi
 - Generates Chinese AI summaries, titles, directory hints, tech stack tags, and searchable keywords.
 - Groups sessions by machine, project directory, or activity date.
 - Copies agent-specific resume commands such as `codex resume <session-id>` and `claude --resume <session-id>`.
-- Shows session history on demand instead of loading every transcript into the panel.
+- Keeps parent conversations in normal lists and indexes while hiding Codex/Claude sub-agent threads using session lineage metadata.
+- Shows only the latest real user turns through a file-signature LRU cache instead of loading a full transcript for the recent-conversation panel.
+- Preserves user whitespace and folds whole AGENTS, skill, and environment injection records into optional context details.
+- Shows full session history on demand instead of loading every transcript into the panel.
 - Opens an xterm.js web terminal backed by `node-pty`, SSH, and tmux for continuing real Codex or Claude sessions.
 - Supports remote agents so each machine manages its own local Codex files.
 - Archives deleted sessions into a recycle bin before removing them from active Codex directories.

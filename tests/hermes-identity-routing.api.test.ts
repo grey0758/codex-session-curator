@@ -187,6 +187,25 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
       response.end(JSON.stringify({ sessions: [remoteSession] }));
       return;
     }
+    if (
+      incoming.method === 'GET' &&
+      url.pathname === `/api/sessions/${sessionId}/recent-user-messages`
+    ) {
+      response.end(JSON.stringify({
+        messages: [{
+          index: 0,
+          role: 'user',
+          text: 'REMOTE_RECENT_USER',
+          timestamp: now,
+        }],
+        totalUserMessages: 1,
+        hiddenContextMessages: 0,
+        fileSize: 120,
+        fileMtimeMs: Date.parse(now),
+        cached: true,
+      }));
+      return;
+    }
     if (incoming.method === 'GET' && url.pathname === `/api/hermes/sessions/${sessionId}/context`) {
       response.end(JSON.stringify({
         session: remoteSession,
@@ -376,6 +395,7 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
         body: JSON.stringify({ query: 'identity routing', sessionId, prompt: 'dispatch duplicate' }),
       }],
       [`/api/sessions/${sessionId}/outcome`, undefined],
+      [`/api/sessions/${sessionId}/recent-user-messages`, undefined],
     ] as const) {
       const ambiguous = await request(baseUrl, path, init);
       assert.equal(ambiguous.status, 409, `${path} should reject an ambiguous raw sessionId`);
@@ -403,6 +423,35 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
     );
     assert.equal(context.status, 200);
     assert.equal(context.payload.contextText, 'REMOTE_CONTEXT_MARKER');
+    const recent = await request(
+      baseUrl,
+      `/api/sessions/${sessionId}/recent-user-messages?${identityQuery}`,
+    );
+    assert.equal(recent.status, 200);
+    assert.equal(
+      ((recent.payload.messages as JsonRecord[])[0]?.text),
+      'REMOTE_RECENT_USER',
+    );
+    const recentCall = remoteCalls.find(
+      (call) => call.path.endsWith('/recent-user-messages'),
+    );
+    const forwardedRecentQuery = new URLSearchParams(recentCall?.query ?? '');
+    assert.equal(forwardedRecentQuery.get('machineId'), 'sgp001');
+    assert.equal(forwardedRecentQuery.get('agent'), 'claude');
+    assert.equal(forwardedRecentQuery.get('remote'), '0');
+
+    const recentCallsBeforeFence = remoteCalls.filter(
+      (call) => call.path.endsWith('/recent-user-messages'),
+    ).length;
+    const fencedRecent = await request(
+      baseUrl,
+      `/api/sessions/${sessionId}/recent-user-messages?${identityQuery}&remote=0`,
+    );
+    assert.equal(fencedRecent.status, 404);
+    assert.equal(
+      remoteCalls.filter((call) => call.path.endsWith('/recent-user-messages')).length,
+      recentCallsBeforeFence,
+    );
 
     const resume = await request(baseUrl, '/api/hermes/jobs/resume', {
       method: 'POST',

@@ -346,6 +346,15 @@ interface HistoryMessage {
   role: 'user' | 'assistant';
   text: string;
   timestamp: string | null;
+  injectedContext?: InjectedContextBlock | null;
+  precedingContext?: InjectedContextBlock[];
+}
+
+interface InjectedContextBlock {
+  kind: 'agents_instructions' | 'environment_context' | 'skill';
+  label: string;
+  text: string;
+  characterCount: number;
 }
 
 interface HistoryPayload {
@@ -355,12 +364,24 @@ interface HistoryPayload {
   totalMessages?: number;
 }
 
+interface RecentUserMessagesPayload {
+  messages: HistoryMessage[];
+  totalUserMessages: number;
+  hiddenContextMessages: number;
+  fileSize: number;
+  fileMtimeMs: number;
+  cached: boolean;
+}
+
 interface RecentUserMessagesState {
   sessionKey: string | null;
   messages: HistoryMessage[];
   loading: boolean;
   error: boolean;
 }
+
+const recentUserMessageCache = new Map<string, RecentUserMessagesPayload>();
+const recentUserMessageRequests = new Map<string, Promise<RecentUserMessagesPayload>>();
 
 interface CodexWorkerGuidance {
   at?: string | null;
@@ -859,6 +880,22 @@ function RecentUserMessageCard({ sessionId, message }: { sessionId: string; mess
     >
       <span>用户发送</span>
       <p className="recent-message-text" ref={textRef}>{message.text}</p>
+      {message.precedingContext?.length ? (
+        <details className="recent-context-details">
+          <summary>
+            <FileText size={14} />
+            系统上下文 ({message.precedingContext.length})
+          </summary>
+          <div className="recent-context-content">
+            {message.precedingContext.map((context, index) => (
+              <section key={`${context.kind}:${index}`}>
+                <strong>{context.label}</strong>
+                <pre>{context.text}</pre>
+              </section>
+            ))}
+          </div>
+        </details>
+      ) : null}
       <div className="recent-message-footer">
         {message.timestamp ? <em>{formatDate(message.timestamp)}</em> : <span />}
         {canExpand ? (
@@ -2880,29 +2917,61 @@ function App() {
 
     const sessionId = selectedSummary.id;
     const selectedKey = sessionKey(selectedSummary);
+    const cacheKey = [
+      selectedKey,
+      selectedSummary.updatedAt ?? '',
+      selectedSummary.messageCount,
+    ].join('|||');
     const params = new URLSearchParams({
-      limit: '200',
+      limit: '4',
       machineId: selectedSummary.machineId,
       agent: selectedSummary.agent,
     });
-    const controller = new AbortController();
     let cancelled = false;
+    const cached = recentUserMessageCache.get(cacheKey);
     const loadingHandle = window.setTimeout(() => {
-      if (!cancelled) setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: true, error: false });
+      if (cancelled) return;
+      if (cached) {
+        setRecentUserMessages({
+          sessionKey: selectedKey,
+          messages: [...cached.messages].reverse(),
+          loading: false,
+          error: false,
+        });
+      } else {
+        setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: true, error: false });
+      }
     }, 0);
 
-    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}/history?${params.toString()}`, { signal: controller.signal })
-      .then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<HistoryPayload>;
+    let request = recentUserMessageRequests.get(cacheKey);
+    if (!request) {
+      request = fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/recent-user-messages?${params.toString()}`,
+      )
+      .then((payload) => {
+        if (!payload.ok) throw new Error(`HTTP ${payload.status}`);
+        return payload.json() as Promise<RecentUserMessagesPayload>;
       })
+      .then((payload) => {
+        recentUserMessageCache.set(cacheKey, payload);
+        while (recentUserMessageCache.size > 64) {
+          const oldestKey = recentUserMessageCache.keys().next().value;
+          if (typeof oldestKey !== 'string') break;
+          recentUserMessageCache.delete(oldestKey);
+        }
+        return payload;
+      })
+      .finally(() => {
+        recentUserMessageRequests.delete(cacheKey);
+      });
+      recentUserMessageRequests.set(cacheKey, request);
+    }
+
+    void request
       .then((payload) => {
         if (cancelled) return;
         window.clearTimeout(loadingHandle);
-        const messages = payload.messages
-          .filter((message) => message.role === 'user')
-          .slice(-4)
-          .reverse();
+        const messages = [...payload.messages].reverse();
         setRecentUserMessages({ sessionKey: selectedKey, messages, loading: false, error: false });
       })
       .catch(() => {
@@ -2914,7 +2983,6 @@ function App() {
     return () => {
       cancelled = true;
       window.clearTimeout(loadingHandle);
-      controller.abort();
     };
   }, [activeTab, isTerminalOnlyPage, selectedSummary]);
 
@@ -4727,7 +4795,14 @@ function App() {
                 {historyMessages.map((message) => (
                   <div className={`history-message ${message.role}`} key={message.index}>
                     <span>{message.role === 'user' ? '用户' : agentLabel(selected.agent)} · {formatDate(message.timestamp)}</span>
-                    <p>{message.text}</p>
+                    {message.injectedContext ? (
+                      <details className="history-context-details">
+                        <summary>{message.injectedContext.label}</summary>
+                        <pre>{message.injectedContext.text}</pre>
+                      </details>
+                    ) : (
+                      <p>{message.text}</p>
+                    )}
                   </div>
                 ))}
                 {!historyMessages.length ? (
