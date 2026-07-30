@@ -15,6 +15,7 @@ import {
   FolderOpen,
   KeyRound,
   Loader2,
+  LogOut,
   Maximize2,
   Minimize2,
   RefreshCw,
@@ -39,7 +40,6 @@ import {
   sessionFilesDetailUrl,
   sessionFilesListUrl,
   sessionFileUploadUrl,
-  terminalPageUrl,
 } from './session-files-routing';
 
 type Recommendation = 'keep' | 'review' | 'delete';
@@ -736,25 +736,12 @@ async function writeClipboardText(text: string, preferLegacy = false): Promise<v
 }
 
 const tabs: Array<{ id: TabId; label: string }> = [
-  { id: 'all', label: '全部' },
-  { id: 'kept', label: '保留面板' },
-  { id: 'keep', label: '推荐保留' },
-  { id: 'review', label: '复核' },
-  { id: 'delete', label: '建议删除' },
+  { id: 'all', label: '会话' },
+  { id: 'kept', label: '已保留' },
   { id: 'recycle', label: '回收站' },
 ];
 
-const recommendationLabel: Record<Recommendation, string> = {
-  keep: '推荐保留',
-  review: '需要复核',
-  delete: '建议删除',
-};
-
-const recommendationTone: Record<Recommendation, string> = {
-  keep: 'tone-keep',
-  review: 'tone-review',
-  delete: 'tone-delete',
-};
+const SHOW_ADVANCED_UI = import.meta.env.VITE_CURATOR_ADVANCED_UI === '1';
 
 const workerStatusLabel: Record<string, string> = {
   running: '运行中',
@@ -1816,7 +1803,6 @@ function App() {
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [copiedResumeKey, setCopiedResumeKey] = useState<string | null>(null);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<string[]>([]);
-  const [openedTerminalKeys, setOpenedTerminalKeys] = useState<string[]>([]);
   const [historyMessages, setHistoryMessages] = useState<HistoryMessage[]>([]);
   const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
@@ -2360,7 +2346,7 @@ function App() {
         return;
       }
       await loadSessions();
-      void Promise.all([loadCommanderActions(), loadFleetAudit()]);
+      if (SHOW_ADVANCED_UI) void Promise.all([loadCommanderActions(), loadFleetAudit()]);
     } catch (err) {
       setAuthMessage(err instanceof Error ? err.message : '登录失败');
     } finally {
@@ -2386,9 +2372,13 @@ function App() {
     if (isTerminalOnlyPage || isFilesOnlyPage) return;
     let cancelled = false;
     const handle = window.setTimeout(() => {
-      void Promise.all([loadSessions(), loadCommanderActions()]).finally(() => {
-        if (!cancelled) void loadFleetAudit();
-      });
+      if (SHOW_ADVANCED_UI) {
+        void Promise.all([loadSessions(), loadCommanderActions()]).finally(() => {
+          if (!cancelled) void loadFleetAudit();
+        });
+      } else {
+        void loadSessions();
+      }
     }, 150);
     return () => {
       cancelled = true;
@@ -2538,18 +2528,6 @@ function App() {
     [selectedKeySet, visibleSessionKeys]
   );
   const allVisibleSelected = visibleSessionKeys.length > 0 && selectedVisibleCount === visibleSessionKeys.length;
-  const openedTerminalSessions = useMemo(
-    () =>
-      openedTerminalKeys
-        .map((key) => allSessions.find((session) => sessionKey(session) === key))
-        .filter((session): session is CodexSession => Boolean(session)),
-    [allSessions, openedTerminalKeys]
-  );
-  const selectedTerminalSession = selected
-    ? openedTerminalSessions.find(
-        (session) => sessionKey(session) === sessionKey(selected)
-      ) ?? null
-    : null;
   const visibleRecycleArchives = useMemo(() => {
     const needle = (recycleQuery || query).trim().toLowerCase();
     if (!needle) return recycleArchives;
@@ -2744,6 +2722,8 @@ function App() {
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
+      setActionMessage(null);
+      setCopiedResumeKey(null);
       setWorkerActionMessage(null);
       setSelectedWorkerJobKey(null);
     }, 0);
@@ -2751,7 +2731,7 @@ function App() {
   }, [selectedIdentityKey]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedIdentityKey) return;
+    if (!SHOW_ADVANCED_UI || isTerminalOnlyPage || activeTab === 'recycle' || !selectedIdentityKey) return;
     const firstLoad = window.setTimeout(() => {
       void loadWorkerJobs();
     }, 0);
@@ -2770,7 +2750,7 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob) return;
+    if (!SHOW_ADVANCED_UI || isTerminalOnlyPage || activeTab === 'recycle' || !currentWorkerJob) return;
     const firstLoad = window.setTimeout(() => {
       void loadWorkerJobEvents(currentWorkerJob);
     }, 0);
@@ -2811,18 +2791,6 @@ function App() {
     });
   }, []);
 
-  const openTerminal = useCallback((session: CodexSession) => {
-    setMachineFilter(session.machineId);
-    setSelectedSessionKey(sessionKey(session));
-    const opened = window.open(
-      terminalPageUrl(session.id, session.machineId, session.agent),
-      '_blank'
-    );
-    if (opened) opened.opener = null;
-    opened?.focus();
-    if (!opened) setActionMessage('浏览器阻止了新终端页面，请允许弹出窗口后重试');
-  }, []);
-
   const openSessionFiles = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
     setSelectedSessionKey(sessionKey(session));
@@ -2833,10 +2801,6 @@ function App() {
     if (opened) opened.opener = null;
     opened?.focus();
     if (!opened) setActionMessage('浏览器阻止了新目录页面，请允许弹出窗口后重试');
-  }, []);
-
-  const closeTerminal = useCallback((key: string) => {
-    setOpenedTerminalKeys((current) => current.filter((item) => item !== key));
   }, []);
 
   const copyResumeCommand = useCallback(async (session: CodexSession) => {
@@ -2985,7 +2949,7 @@ function App() {
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
-      if (!selected || activeTab === 'recycle') {
+      if (!SHOW_ADVANCED_UI || !selected || activeTab === 'recycle') {
         setSessionAuditEvents([]);
         return;
       }
@@ -3100,7 +3064,6 @@ function App() {
       return next;
     });
     setSelectedSessionKeys((current) => current.filter((key) => !removedKeys.has(key)));
-    setOpenedTerminalKeys((current) => current.filter((key) => !removedKeys.has(key)));
     setSelectedSessionKey((current) => current && removedKeys.has(current) ? null : current);
   }
 
@@ -3516,49 +3479,49 @@ function App() {
     );
   }
 
-  return (
-    <main className="shell">
-      <aside className="rail">
-        <div className="brand">
-          <div className="brand-mark">
-            <KeyRound size={22} />
+    return (
+      <main className="shell">
+        <aside className="rail">
+          <div className="brand">
+            <div className="brand-mark">
+              <KeyRound size={22} />
+            </div>
+            <div>
+              <h1>Curator</h1>
+              <p>会话</p>
+            </div>
           </div>
-          <div>
-            <h1>Agent 会话清理服务</h1>
-            <p>评估、保留、删除 Codex / Claude 记录</p>
-          </div>
-        </div>
 
-        <div className="search-box">
-          <Search size={18} />
+          <div className="search-box">
+            <Search size={18} />
           <input
             data-session-filter
             value={query}
             onChange={(event) => {
-              setQuery(event.target.value);
-              if (aiSearchResult) setAiSearchResult(null);
-            }}
-            placeholder="即时筛选 key / cwd / 机器 / 关键词"
-          />
-        </div>
-
-        <form className="ai-search-box" data-ai-session-search onSubmit={(event) => void runAiSessionSearch(event)}>
-          <label htmlFor="ai-session-search-input">
-            <Sparkles size={16} />
-            <span>DeepSeek 跨机器找对话</span>
-          </label>
-          <div className="ai-search-control">
-            <input
-              id="ai-session-search-input"
-              value={aiSearchQuery}
-              onChange={(event) => setAiSearchQuery(event.target.value)}
-              placeholder="直接描述模糊内容，模型会判断在哪台机器"
+                setQuery(event.target.value);
+                if (aiSearchResult) setAiSearchResult(null);
+              }}
+              placeholder="搜索会话"
             />
-            <button type="submit" disabled={aiSearchLoading || aiSearchQuery.trim().length < 2}>
-              {aiSearchLoading ? <Loader2 size={15} className="spin" /> : <Search size={15} />}
-              {aiSearchLoading ? '理解中' : 'AI 检索'}
-            </button>
           </div>
+
+          <form className="ai-search-box" data-ai-session-search onSubmit={(event) => void runAiSessionSearch(event)}>
+            <label htmlFor="ai-session-search-input">
+              <Sparkles size={16} />
+              <span>智能搜索</span>
+            </label>
+            <div className="ai-search-control">
+              <input
+                id="ai-session-search-input"
+                value={aiSearchQuery}
+                onChange={(event) => setAiSearchQuery(event.target.value)}
+                placeholder="描述你记得的内容"
+              />
+              <button type="submit" disabled={aiSearchLoading || aiSearchQuery.trim().length < 2}>
+                {aiSearchLoading ? <Loader2 size={15} className="spin" /> : <Search size={15} />}
+                {aiSearchLoading ? '搜索中' : '搜索'}
+              </button>
+            </div>
           {aiSearchResult || aiSearchError ? (
             <div
               className={`ai-search-status ${aiSearchResult?.mode === 'fallback-local' || aiSearchError ? 'fallback' : ''}`}
@@ -3589,16 +3552,56 @@ function App() {
           ) : null}
         </form>
 
-        <div className="machine-filter">
-          <Server size={16} />
-          <select value={machineFilter} onChange={(event) => setMachineFilter(event.target.value)}>
-            {machineOptions.map((machine) => (
-              <option key={machine} value={machine}>
-                {machine === 'all' ? '全部机器' : machine}
-              </option>
-            ))}
-          </select>
-        </div>
+          <details
+            className="machine-picker"
+            onToggle={(event) => {
+              if (event.currentTarget.open) void refreshRemoteStatuses();
+            }}
+          >
+            <summary>
+              <Server size={16} />
+              <span>{machineFilter === 'all' ? '全部机器' : machineFilter}</span>
+              <ChevronDown size={15} />
+            </summary>
+            <div className="machine-options">
+              {machineOptions.map((machine) => {
+                const remote = remoteStatuses.find((agent) => agent.machineId === machine);
+                const isLocal = machine !== 'all' && !meta?.remoteAgents?.some((agent) => agent.id === machine);
+                const statusTone = isLocal ? 'online' : remote ? (remote.online ? 'online' : 'offline') : 'unknown';
+                return (
+                  <button
+                    key={machine}
+                    type="button"
+                    className={machineFilter === machine ? 'active' : ''}
+                    onClick={(event) => {
+                      setMachineFilter(machine);
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                    }}
+                  >
+                    {machine === 'all' ? (
+                      <Server size={14} />
+                    ) : (
+                      <span className={`remote-dot ${statusTone}`} />
+                    )}
+                    <strong>{machine === 'all' ? '全部机器' : machine}</strong>
+                    {machine === 'all' ? null : (
+                      <em>
+                        {isLocal
+                          ? '本机'
+                          : remote
+                          ? remote.online
+                            ? remote.latencyMs === null
+                              ? '在线'
+                              : `${remote.latencyMs}ms`
+                            : '离线'
+                          : '状态未知'}
+                      </em>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </details>
 
         {activeTab !== 'recycle' ? (
           <div className="agent-switch" role="group" aria-label="会话代理筛选">
@@ -3657,79 +3660,50 @@ function App() {
           </button>
         </div>
 
-        {remoteStatuses.length ? (
-          <div className="remote-status-list">
-            {remoteStatuses.map((agent) => (
+          <div className="tabs" role="tablist" aria-label="session filters">
+            {tabs.map((tab) => (
               <button
+                key={tab.id}
                 type="button"
-                key={agent.id}
-                onClick={() => {
-                  if (agent.machineId) setMachineFilter(agent.machineId);
-                  void refreshRemoteStatuses();
-                }}
-                title={agent.machineId ? `查看 ${agent.machineId} 的会话` : '刷新远端机器状态'}
+                className={activeTab === tab.id ? 'active' : ''}
+                onClick={() => setActiveTab(tab.id)}
               >
-                <span className={`remote-dot ${agent.online ? 'online' : 'offline'}`} />
-                <strong>{agent.machineId ?? agent.id}</strong>
-                <em>{agent.online ? `${agent.latencyMs ?? '?'}ms` : `${agent.id} 暂不可用`}</em>
+                {tab.id === 'all' ? <Clock3 size={14} /> : tab.id === 'kept' ? <ShieldCheck size={14} /> : <Trash2 size={14} />}
+                {tab.label}
               </button>
             ))}
           </div>
-        ) : null}
 
-        <div className="tabs" role="tablist" aria-label="session filters">
-          {tabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              className={activeTab === tab.id ? 'active' : ''}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
+          {SHOW_ADVANCED_UI ? (
+            <>
+              <div className="summary-strip">
+                {metricLabel(activeTab === 'recycle' ? visibleRecycleArchives.length : visibleSessions.length, '当前列表')}
+                {metricLabel(stats.kept, '手动保留')}
+                {metricLabel(stats.active, '三天活跃')}
+                {metricLabel(stats.delete, '删除')}
+              </div>
+              <button
+                type="button"
+                className={`audit-summary${
+                  fleetAudit && (fleetAudit.summary.missingFromPanel || fleetAudit.summary.localIssues || fleetAudit.summary.remoteIssues || fleetAudit.summary.unhealthyRemotes)
+                    ? ' has-issues'
+                    : fleetAudit?.summary.pendingEvaluationSessions
+                      ? ' has-pending'
+                      : ''
+                }`}
+                disabled={fleetAuditLoading}
+                onClick={() => void loadFleetAudit(true)}
+              >
+                {fleetAuditLoading ? <Loader2 size={15} className="spin" /> : <ShieldCheck size={15} />}
+                <span>{fleetAuditError ?? '会话链路审计'}</span>
+              </button>
+            </>
+          ) : null}
 
-        <div className="summary-strip">
-          {metricLabel(activeTab === 'recycle' ? visibleRecycleArchives.length : visibleSessions.length, '当前列表')}
-          {metricLabel(stats.kept, '手动保留')}
-          {metricLabel(stats.active, '三天活跃')}
-          {metricLabel(stats.delete, '删除')}
-        </div>
-
-        <button
-          type="button"
-          className={`audit-summary${
-            fleetAudit && (fleetAudit.summary.missingFromPanel || fleetAudit.summary.localIssues || fleetAudit.summary.remoteIssues || fleetAudit.summary.unhealthyRemotes)
-              ? ' has-issues'
-              : fleetAudit?.summary.pendingEvaluationSessions
-                ? ' has-pending'
-                : ''
-          }`}
-          disabled={fleetAuditLoading}
-          onClick={() => void loadFleetAudit(true)}
-          title="核对原始会话文件、索引、搜索文本、AI 分析和面板可见性"
-        >
-          {fleetAuditLoading ? <Loader2 size={15} className="spin" /> : <ShieldCheck size={15} />}
-          <span>
-            {fleetAudit
-              ? `稳定会话 AI 覆盖 ${fleetAudit.summary.fullyEvaluatedSessions}/${fleetAudit.summary.settledEligibleSessions} (${fleetAudit.summary.settledCoveragePercent}%) · ${fleetAudit.summary.pendingEvaluationSessions} 活跃/等待重算 · ${fleetAudit.summary.localIssues + fleetAudit.summary.remoteIssues} 真正遗漏 · ${fleetAudit.summary.metadataOnlySessions} 元数据文件`
-              : fleetAuditError
-                ? `链路审计失败：${fleetAuditError}`
-                : '加载会话链路审计'}
-          </span>
-        </button>
-
-        <div className="filter-note">
-          {aiSearchResult
-            ? `当前显示 AI 预测列表；DeepSeek ${aiSearchResult.routing.scope === 'focused' ? `优先判断为 ${aiSearchResult.routing.machineIds.join('、')}` : '保留了多台候选机器'}，并保留跨机器纠错候选。${aiSearchResult.mode === 'deepseek' ? '最终在线重排已完成。' : '最终重排超时，本次使用 AI 扩展后的安全降级结果。'}`
-            : '上方即时筛选不调用模型；模糊回忆可直接交给 DeepSeek，它会先判断机器再跨机器检索。Minimax 仍只负责后台会话分析。'}
-        </div>
-
-        {activeTab !== 'recycle' ? (
-          <div className="bulk-toolbar">
-            <button type="button" className="primary-button" disabled={!visibleSessionKeys.length} onClick={toggleVisibleSelection}>
-              {allVisibleSelected ? '取消当前列表' : '选择当前列表'}
+          {SHOW_ADVANCED_UI && activeTab !== 'recycle' ? (
+            <div className="bulk-toolbar">
+              <button type="button" className="primary-button" disabled={!visibleSessionKeys.length} onClick={toggleVisibleSelection}>
+                {allVisibleSelected ? '取消当前列表' : '选择当前列表'}
             </button>
             <button
               type="button"
@@ -3759,8 +3733,8 @@ function App() {
             </div>
           ) : null}
           {!loading && activeTab === 'recycle' && visibleRecycleArchives.length === 0 ? <div className="empty">回收站为空</div> : null}
-          {activeTab === 'recycle'
-            ? visibleRecycleArchives.map((archive) => (
+            {activeTab === 'recycle'
+              ? visibleRecycleArchives.map((archive) => (
                 <div key={`${archive.machineId}:${archive.archiveDir}`} className="archive-row">
                   <span className="session-key">{archive.sessionId}</span>
                   <span className="session-summary">
@@ -3776,12 +3750,12 @@ function App() {
                     </button>
                   </span>
                 </div>
-              ))
-            : groupedSessions.map((group) => {
-                const collapsed = aiSearchResult || query.trim() ? false : collapsedGroups[group.key] ?? true;
-                const groupKeys = group.sessions.map(sessionKey);
-                const selectedInGroup = groupKeys.filter((key) => selectedKeySet.has(key)).length;
-                const groupChecked = selectedInGroup === groupKeys.length && groupKeys.length > 0;
+                ))
+              : groupedSessions.map((group) => {
+                  const collapsed = aiSearchResult || query.trim() ? false : collapsedGroups[group.key] ?? false;
+                  const groupKeys = group.sessions.map(sessionKey);
+                  const selectedInGroup = groupKeys.filter((key) => selectedKeySet.has(key)).length;
+                  const groupChecked = selectedInGroup === groupKeys.length && groupKeys.length > 0;
                 return (
                   <div key={group.key} className="session-group">
                     <div
@@ -3793,19 +3767,21 @@ function App() {
                           setCollapsedGroups((current) => ({ ...current, [group.key]: !collapsed }));
                         }
                       }}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <input
-                        type="checkbox"
-                        className="session-checkbox"
-                        checked={groupChecked}
-                        onClick={(event) => event.stopPropagation()}
-                        onChange={() => toggleGroupSelection(groupKeys)}
-                        aria-label={`选择分组 ${group.title}`}
-                        title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupKeys.length}` : '选择这个分组'}
-                      />
-                      {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        {SHOW_ADVANCED_UI ? (
+                          <input
+                            type="checkbox"
+                            className="session-checkbox"
+                            checked={groupChecked}
+                            onClick={(event) => event.stopPropagation()}
+                            onChange={() => toggleGroupSelection(groupKeys)}
+                            aria-label={`选择分组 ${group.title}`}
+                            title={selectedInGroup ? `已选择 ${selectedInGroup}/${groupKeys.length}` : '选择这个分组'}
+                          />
+                        ) : null}
+                        {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
                       <span>{group.label}</span>
                       <strong>{group.title}</strong>
                       <em>{group.sessions.length}</em>
@@ -3828,21 +3804,22 @@ function App() {
                                   setSelectedSessionKey(sessionKey(session));
                                 }
                               }}
-                              role="button"
-                              tabIndex={0}
-                            >
-                              <input
-                                type="checkbox"
-                                className="session-checkbox"
-                                checked={selectedKeySet.has(sessionKey(session))}
-                                onClick={(event) => event.stopPropagation()}
-                                onChange={() => toggleSessionSelection(sessionKey(session))}
-                                aria-label={`选择 ${session.title}`}
-                              />
-                              <span className={`dot ${recommendationTone[session.evaluation.recommendation]}`} />
-                              <span className="session-main">
-                                <span className="session-key">{session.title}</span>
-                                <span className="session-summary">{session.evaluation.summary}</span>
+                                role="button"
+                                tabIndex={0}
+                              >
+                                {SHOW_ADVANCED_UI ? (
+                                  <input
+                                    type="checkbox"
+                                    className="session-checkbox"
+                                    checked={selectedKeySet.has(sessionKey(session))}
+                                    onClick={(event) => event.stopPropagation()}
+                                    onChange={() => toggleSessionSelection(sessionKey(session))}
+                                    aria-label={`选择 ${session.title}`}
+                                  />
+                                ) : null}
+                                <span className="session-main">
+                                  <span className="session-key">{session.title}</span>
+                                  <span className="session-summary">{session.evaluation.summary}</span>
                                 {aiMatch ? (
                                   <span className="ai-match-reason" data-ai-search-result>
                                     <Sparkles size={13} />
@@ -3850,15 +3827,19 @@ function App() {
                                     <span>{aiMatch.reason}</span>
                                   </span>
                                 ) : null}
-                                <span className="session-preview-line">
-                                  <strong>用户</strong>
-                                  <span>{previewText(session.lastUserMessage)}</span>
+                                  {SHOW_ADVANCED_UI ? (
+                                    <>
+                                      <span className="session-preview-line">
+                                        <strong>用户</strong>
+                                        <span>{previewText(session.lastUserMessage)}</span>
+                                      </span>
+                                      <span className="session-preview-line agent">
+                                        <strong>Agent</strong>
+                                        <span>{previewText(session.lastAssistantMessage)}</span>
+                                      </span>
+                                    </>
+                                  ) : null}
                                 </span>
-                                <span className="session-preview-line agent">
-                                  <strong>Agent</strong>
-                                  <span>{previewText(session.lastAssistantMessage)}</span>
-                                </span>
-                              </span>
                               <span className="session-time">
                                 {agentLabel(session.agent)} · {session.kept ? '已保留 · ' : ''}
                                 {session.activityStatus === 'active' ? '活跃' : '非活跃'} · {formatDate(session.updatedAt)}
@@ -3872,87 +3853,77 @@ function App() {
         </div>
       </aside>
 
-      <section className="detail">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">Local Codex / Claude Records</p>
-            <h2>{selected ? selected.title : '未选择会话'}</h2>
-          </div>
-          <div className="topbar-actions">
-            {selected ? (
-              <>
-                <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
-                  <TerminalIcon size={17} />
-                  打开 SSH 终端
-                </button>
-                <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
-                  <FolderOpen size={17} />
-                  打开工作目录
-                </button>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busyId === `${sessionKey(selected)}:refresh`}
-                  title="在 Hub 上读取完整 transcript 并执行可追踪的 AI 重算"
-                  onClick={() => void refreshEvaluation(selected)}
-                >
-                  <Sparkles size={17} />
-                  {busyId === `${sessionKey(selected)}:refresh` ? 'AI 重算中' : 'AI 重算'}
-                </button>
-              </>
-            ) : null}
-            <button type="button" className="icon-button" title="刷新" onClick={() => void Promise.all([loadSessions(true), loadCommanderActions(), loadFleetAudit(true)])}>
-              <RefreshCw size={18} />
-            </button>
-            <button
-              type="button"
-              className="danger-button"
-              disabled={busyId === 'prune'}
-              onClick={() => void pruneRecommended()}
-            >
-              <Trash2 size={17} />
-              清理建议删除
-            </button>
-            <button
-              type="button"
-              className="danger-button strong-danger"
-              disabled={busyId === 'prune-non-kept'}
-              onClick={() => void pruneNonKept()}
-            >
-              <Archive size={17} />
-              清理非保留
-            </button>
-            <button type="button" className="icon-button" title="退出登录" onClick={() => void logout()}>
-              <KeyRound size={18} />
-            </button>
-          </div>
-        </header>
+        <section className="detail">
+          <header className="topbar">
+            <div className="topbar-title">
+              <p className="eyebrow">
+                {selected ? `${selected.machineId} · ${agentLabel(selected.agent)}` : '会话详情'}
+              </p>
+              <h2>{selected ? selected.title : '未选择会话'}</h2>
+            </div>
+            <div className="topbar-actions">
+              {SHOW_ADVANCED_UI && selected ? (
+                <>
+                  <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
+                    <FolderOpen size={17} />
+                    打开工作目录
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={busyId === `${sessionKey(selected)}:refresh`}
+                    title="在 Hub 上读取完整 transcript 并执行可追踪的 AI 重算"
+                    onClick={() => void refreshEvaluation(selected)}
+                  >
+                    <Sparkles size={17} />
+                    {busyId === `${sessionKey(selected)}:refresh` ? 'AI 重算中' : 'AI 重算'}
+                  </button>
+                </>
+              ) : null}
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="刷新"
+                title="刷新"
+                onClick={() => {
+                  if (SHOW_ADVANCED_UI) {
+                    void Promise.all([loadSessions(true), loadCommanderActions(), loadFleetAudit(true)]);
+                  } else {
+                    void loadSessions(true);
+                  }
+                }}
+              >
+                <RefreshCw size={18} />
+              </button>
+              {SHOW_ADVANCED_UI ? (
+                <>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={busyId === 'prune'}
+                    onClick={() => void pruneRecommended()}
+                  >
+                    <Trash2 size={17} />
+                    清理建议删除
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button strong-danger"
+                    disabled={busyId === 'prune-non-kept'}
+                    onClick={() => void pruneNonKept()}
+                  >
+                    <Archive size={17} />
+                    清理非保留
+                  </button>
+                </>
+              ) : null}
+              <button type="button" className="icon-button" aria-label="退出登录" title="退出登录" onClick={() => void logout()}>
+                <LogOut size={18} />
+              </button>
+            </div>
+          </header>
 
-        {error ? <div className="notice danger">加载失败：{error}</div> : null}
-
-        {openedTerminalSessions.length ? (
-          <div className={`detail-grid terminal-dock-grid${selectedTerminalSession ? '' : ' terminal-dock-hidden'}`}>
-            <section className="primary-panel terminal-card">
-              <div className="panel-heading terminal-dock-heading">
-                <h3>当前会话终端</h3>
-                {selectedTerminalSession ? <span>{selectedTerminalSession.resumeCommand}</span> : null}
-              </div>
-              <div className="terminal-stack">
-                {openedTerminalSessions.map((session) => (
-                  <TerminalConsole
-                    key={sessionKey(session)}
-                    session={session}
-                    active={Boolean(
-                      selected &&
-                      sessionKey(selected) === sessionKey(session)
-                    )}
-                    onClose={() => closeTerminal(sessionKey(session))}
-                  />
-                ))}
-              </div>
-            </section>
-          </div>
-        ) : null}
+          {error ? <div className="notice danger">加载失败：{error}</div> : null}
 
         {activeTab === 'recycle' ? (
           <div className="detail-grid">
@@ -3982,20 +3953,20 @@ function App() {
               </div>
             </section>
           </div>
-        ) : selected ? (
-          <div className="detail-grid">
-            <section className="primary-panel">
-              <div className="status-line">
-                <span className={`status-pill ${recommendationTone[selected.evaluation.recommendation]}`}>
-                  {recommendationLabel[selected.evaluation.recommendation]}
-                </span>
-                <span className="status-pill">{agentLabel(selected.agent)}</span>
-                <span className="score">score {selected.evaluation.score}</span>
-                <span className={`activity ${selected.activityStatus}`}>
-                  {selected.activityStatus === 'active' ? '三天内活跃' : `非活跃${selected.inactiveDays ?? '?'}天`}
-                </span>
-                <span className={`activity cadence-${selected.evaluation.updateCadence ?? 'quiet'}`}>
-                  {cadenceLabel[selected.evaluation.updateCadence ?? 'quiet']}
+          ) : selected ? (
+            <div className="detail-grid">
+              <section className="primary-panel focus-card session-overview">
+                <div className="status-line session-meta-line">
+                  <span className="status-pill agent-pill">
+                    {selected.agent === 'codex' ? <TerminalIcon size={14} /> : <Sparkles size={14} />}
+                    {agentLabel(selected.agent)}
+                  </span>
+                  <span className="score">score {selected.evaluation.score}</span>
+                  <span className={`activity ${selected.activityStatus}`}>
+                    {selected.activityStatus === 'active' ? '最近活跃' : `非活跃 ${selected.inactiveDays ?? '?'} 天`}
+                  </span>
+                  <span className={`activity cadence-${selected.evaluation.updateCadence ?? 'quiet'}`}>
+                    {cadenceLabel[selected.evaluation.updateCadence ?? 'quiet']}
                 </span>
                 <span className={`activity priority-${selected.evaluation.reviewPriority ?? 'normal'}`}>
                   {priorityLabel[selected.evaluation.reviewPriority ?? 'normal']}
@@ -4051,34 +4022,33 @@ function App() {
                   <ShieldCheck size={17} />
                   {selected.kept ? '取消保留' : '保留到面板'}
                 </button>
-                <button
-                  type="button"
-                  className="danger-button"
+                  <button
+                    type="button"
+                    className="danger-button"
                   disabled={busyId === sessionKey(selected)}
                   onClick={() => void deleteSession(selected)}
                 >
-                  <Trash2 size={17} />
-                  移入回收站
-                </button>
-                <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
-                  <TerminalIcon size={17} />
-                  打开 SSH 终端
-                </button>
-                <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
-                  <FolderOpen size={17} />
-                  打开工作目录
-                </button>
-              </div>
-            </section>
+                    <Trash2 size={17} />
+                    移入回收站
+                  </button>
+                  <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
+                    <FolderOpen size={17} />
+                    打开工作目录
+                  </button>
+                </div>
+                {actionMessage ? <div className="notice inline-info action-notice">{actionMessage}</div> : null}
+              </section>
 
-            <section className="primary-panel">
-              <h3>整段会话做了什么</h3>
-              <p className="long-summary">{selected.evaluation.detailedSummary || selected.evaluation.summary}</p>
-            </section>
+              {SHOW_ADVANCED_UI ? (
+                <section className="primary-panel">
+                  <h3>整段会话做了什么</h3>
+                  <p className="long-summary">{selected.evaluation.detailedSummary || selected.evaluation.summary}</p>
+                </section>
+              ) : null}
 
-            <section className="primary-panel">
-              <div className="panel-heading">
-                <h3>最近对话</h3>
+              <section className="primary-panel focus-card recent-panel">
+                <div className="panel-heading">
+                  <h3>最近对话</h3>
               </div>
               <div
                 className="recent-dialogue"
@@ -4104,33 +4074,39 @@ function App() {
                 !recentUserMessages.loading &&
                 !recentUserMessages.error &&
                 !recentUserMessages.messages.length ? (
-                  <div className="empty compact">暂无用户消息</div>
+                    <div className="empty compact">暂无用户消息</div>
+                  ) : null}
+                </div>
+                {SHOW_ADVANCED_UI ? (
+                  <>
+                    <div className="workflow">
+                      <Sparkles size={16} />
+                      摘要更新时间：{formatDate(selected.evaluation.evaluatedAt)}
+                      {selected.evaluation.hermesLastUsedAt ? ` · 最近调度：${formatDate(selected.evaluation.hermesLastUsedAt)}` : ''}
+                      {selected.evaluation.hermesRecalculatedAt ? ` · 重算完成：${formatDate(selected.evaluation.hermesRecalculatedAt)}` : ''}
+                      {selected.evaluation.hermesLastJobId ? ` · job：${selected.evaluation.hermesLastJobId}` : ''}
+                      {selected.evaluation.evaluationOrigin ? ` · 来源：${selected.evaluation.evaluationOrigin}` : ''}
+                      {selected.evaluation.evaluatedByMachineId ? ` · 执行机器：${selected.evaluation.evaluatedByMachineId}` : ''}
+                    </div>
+                    {selected.evaluation.evaluationRunId || selected.evaluation.transcriptHash ? (
+                      <div className="workflow audit-identifiers">
+                        {selected.evaluation.evaluationRunId ? <code>run {selected.evaluation.evaluationRunId}</code> : null}
+                        {selected.evaluation.transcriptHash ? <code>sha256 {selected.evaluation.transcriptHash.slice(0, 16)}…</code> : null}
+                      </div>
+                    ) : null}
+                    {selected.evaluation.hermesRefreshError ? (
+                      <div className="warning-line">
+                        <AlertTriangle size={15} />
+                        {selected.evaluation.hermesRefreshError}
+                      </div>
+                    ) : null}
+                  </>
                 ) : null}
-              </div>
-              <div className="workflow">
-                <Sparkles size={16} />
-                摘要更新时间：{formatDate(selected.evaluation.evaluatedAt)}
-                {selected.evaluation.hermesLastUsedAt ? ` · 最近调度：${formatDate(selected.evaluation.hermesLastUsedAt)}` : ''}
-                {selected.evaluation.hermesRecalculatedAt ? ` · 重算完成：${formatDate(selected.evaluation.hermesRecalculatedAt)}` : ''}
-                {selected.evaluation.hermesLastJobId ? ` · job：${selected.evaluation.hermesLastJobId}` : ''}
-                {selected.evaluation.evaluationOrigin ? ` · 来源：${selected.evaluation.evaluationOrigin}` : ''}
-                {selected.evaluation.evaluatedByMachineId ? ` · 执行机器：${selected.evaluation.evaluatedByMachineId}` : ''}
-              </div>
-              {selected.evaluation.evaluationRunId || selected.evaluation.transcriptHash ? (
-                <div className="workflow audit-identifiers">
-                  {selected.evaluation.evaluationRunId ? <code>run {selected.evaluation.evaluationRunId}</code> : null}
-                  {selected.evaluation.transcriptHash ? <code>sha256 {selected.evaluation.transcriptHash.slice(0, 16)}…</code> : null}
-                </div>
-              ) : null}
-              {selected.evaluation.hermesRefreshError ? (
-                <div className="warning-line">
-                  <AlertTriangle size={15} />
-                  {selected.evaluation.hermesRefreshError}
-                </div>
-              ) : null}
-            </section>
+              </section>
 
-            <section className="primary-panel">
+              {SHOW_ADVANCED_UI ? (
+                <>
+              <section className="primary-panel">
               <div className="panel-heading">
                 <div>
                   <h3>会话链路审计</h3>
@@ -4925,27 +4901,31 @@ function App() {
               </div>
             </section>
 
-            <section className="metrics-panel">
-              <div>{metricLabel(selected.userTurns, '用户回合')}</div>
+              <section className="metrics-panel">
+                <div>{metricLabel(selected.userTurns, '用户回合')}</div>
               <div>{metricLabel(selected.assistantTurns, '助手回合')}</div>
               <div>{metricLabel(selected.messageCount, '消息')}</div>
               <div>{metricLabel(Number(formatBytes(selected.bytes).split(' ')[0]), formatBytes(selected.bytes).split(' ')[1])}</div>
               <div className="wide">
                 <Clock3 size={17} />
-                {formatDate(selected.startedAt)} - {formatDate(selected.updatedAt)}
-              </div>
-            </section>
-          </div>
+                  {formatDate(selected.startedAt)} - {formatDate(selected.updatedAt)}
+                </div>
+              </section>
+                </>
+              ) : null}
+            </div>
         ) : (
           <div className="blank-state">没有可显示的 Codex / Claude 会话</div>
         )}
 
-        <footer className="footer">
-          <span>Codex home: {meta?.codexHome ?? 'loading'}</span>
-          <span>Claude projects: {meta?.claudeProjectsRoot ?? 'loading'}</span>
-          <span>回收站: {meta?.recycleRoot ?? 'loading'} · {meta?.recycleRetentionDays ?? 30}天</span>
-          <span>删除模式: {meta?.deleteMode ?? 'archive-then-local-clean'}</span>
-        </footer>
+          {SHOW_ADVANCED_UI ? (
+            <footer className="footer">
+              <span>Codex home: {meta?.codexHome ?? 'loading'}</span>
+              <span>Claude projects: {meta?.claudeProjectsRoot ?? 'loading'}</span>
+              <span>回收站: {meta?.recycleRoot ?? 'loading'} · {meta?.recycleRetentionDays ?? 30}天</span>
+              <span>删除模式: {meta?.deleteMode ?? 'archive-then-local-clean'}</span>
+            </footer>
+          ) : null}
       </section>
     </main>
   );

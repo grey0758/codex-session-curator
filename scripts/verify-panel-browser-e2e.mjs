@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const baseUrl = process.env.CURATOR_PANEL_VERIFY_BASE_URL || 'http://127.0.0.1:54177/';
+const authBaseUrl = process.env.CURATOR_PANEL_VERIFY_AUTH_BASE_URL || baseUrl;
 const query = process.env.CURATOR_PANEL_VERIFY_QUERY || 'codex-session-curator';
 const aiQuery = process.env.CURATOR_PANEL_VERIFY_AI_QUERY || 'cnal002的工作站';
 const chromeBin = process.env.CHROMIUM_BIN || process.env.CHROME_BIN || '/snap/bin/chromium';
 const waitMs = Number(process.env.CURATOR_PANEL_VERIFY_WAIT_MS || 15000);
 const cdpTimeoutMs = Number(process.env.CURATOR_PANEL_VERIFY_CDP_TIMEOUT_MS || 30000);
+const viewportWidth = Number(process.env.CURATOR_PANEL_VERIFY_VIEWPORT_WIDTH || 1600);
+const viewportHeight = Number(process.env.CURATOR_PANEL_VERIFY_VIEWPORT_HEIGHT || 1000);
+const screenshotPath = process.env.CURATOR_PANEL_VERIFY_SCREENSHOT || '';
 
 function readAdminToken() {
   const authEnv = readFileSync(join(homedir(), '.config/codex-session-curator/auth.env'), 'utf8');
@@ -53,8 +57,8 @@ async function main() {
   const token = readAdminToken();
   const remoteDebuggingPort = 24000 + Math.floor(Math.random() * 1000);
   const userDataDir = mkdtempSync(join(tmpdir(), 'curator-panel-e2e-'));
-  const targetUrl = new URL(baseUrl);
-  targetUrl.searchParams.set('admin_token', token);
+  const authUrl = new URL(authBaseUrl);
+  authUrl.searchParams.set('admin_token', token);
   const chrome = spawn(
     chromeBin,
     [
@@ -64,7 +68,7 @@ async function main() {
       '--disable-dev-shm-usage',
       `--remote-debugging-port=${remoteDebuggingPort}`,
       '--remote-debugging-address=127.0.0.1',
-      '--window-size=1600,1000',
+      `--window-size=${viewportWidth},${viewportHeight}`,
       `--user-data-dir=${userDataDir}`,
       '--no-first-run',
       'about:blank',
@@ -84,7 +88,7 @@ async function main() {
     }
 
     const targetResponse = await fetch(
-      `http://127.0.0.1:${remoteDebuggingPort}/json/new?${encodeURIComponent(targetUrl.toString())}`,
+      `http://127.0.0.1:${remoteDebuggingPort}/json/new?${encodeURIComponent(authUrl.toString())}`,
       { method: 'PUT' }
     );
     const target = await targetResponse.json();
@@ -109,6 +113,18 @@ async function main() {
 
     await cdpCall(ws, id++, 'Runtime.enable');
     await cdpCall(ws, id++, 'Page.enable');
+    await cdpCall(ws, id++, 'Emulation.setDeviceMetricsOverride', {
+      width: viewportWidth,
+      height: viewportHeight,
+      deviceScaleFactor: 1,
+      mobile: viewportWidth <= 560,
+      screenWidth: viewportWidth,
+      screenHeight: viewportHeight,
+    });
+    if (authBaseUrl !== baseUrl) {
+      await delay(800);
+      await cdpCall(ws, id++, 'Page.navigate', { url: baseUrl });
+    }
     await delay(waitMs);
 
     async function evaluate(expression) {
@@ -129,6 +145,12 @@ async function main() {
       }
       throw new Error(`${label}: timed out after ${timeoutMs}ms`);
     }
+
+    const actualViewport = await waitFor(
+      `({ innerWidth: window.innerWidth, innerHeight: window.innerHeight, devicePixelRatio: window.devicePixelRatio })`,
+      (value) => value.innerWidth === viewportWidth && value.innerHeight === viewportHeight,
+      'viewport metrics'
+    );
 
     async function setSearchQuery(value) {
       await evaluate(`(() => {
@@ -176,9 +198,9 @@ async function main() {
     }
 
     await waitFor(
-      `document.querySelector('.audit-summary span')?.textContent || ''`,
-      (value) => value.includes('稳定会话 AI 覆盖') || value.includes('链路审计失败'),
-      'fleet audit summary',
+      `document.querySelectorAll('.session-row[data-session-id]').length`,
+      (value) => value > 0,
+      'session rows',
       60000
     );
 
@@ -190,8 +212,161 @@ async function main() {
       sessionGroups: document.querySelectorAll('.session-group').length,
       loadingVisible: document.body.innerText.includes('正在加载'),
       loadErrorVisible: document.body.innerText.includes('加载失败'),
-      auditSummaryText: document.querySelector('.audit-summary span')?.textContent || ''
+      tabLabels: [...document.querySelectorAll('.tabs button')].map((button) => button.textContent?.trim() || ''),
+      auditSummaryVisible: Boolean(document.querySelector('.audit-summary')),
+      filterNoteVisible: Boolean(document.querySelector('.filter-note')),
+      sshOpenButtonVisible: Boolean(document.querySelector('.ssh-open-button')),
+      focusCardCount: document.querySelectorAll('.detail section.focus-card').length,
+      detailCardCount: document.querySelectorAll('.detail .detail-grid > section.primary-panel').length,
+      recentParentIsPrimaryPanel: Boolean(document.querySelector('.recent-dialogue')?.closest('section.primary-panel')),
+      recentParentIsFocusCard: Boolean(document.querySelector('.recent-dialogue')?.closest('section.focus-card')),
+      overviewCardHasCoreActions: Boolean(
+        document.querySelector('section.focus-card.session-overview #session-title') &&
+        document.querySelector('section.focus-card.session-overview .key-block') &&
+        document.querySelector('section.focus-card.session-overview .action-row')
+      ),
+      machinePicker: (() => {
+        const picker = document.querySelector('details.machine-picker');
+        const summary = picker?.querySelector(':scope > summary');
+        const menu = picker?.querySelector('.machine-options');
+        return {
+          exists: Boolean(picker && summary && menu),
+          open: picker?.open === true,
+          summaryText: summary?.textContent?.trim() || '',
+          summaryHasLatency: (summary?.textContent || '').includes('ms'),
+          menuVisible: Boolean(menu && menu.getClientRects().length > 0)
+        };
+      })()
     }))()`);
+
+    if (screenshotPath) {
+      if (process.env.CURATOR_PANEL_VERIFY_CAPTURE_ONLY === '1') {
+        await setSearchQuery(query);
+        await waitFor(
+          `document.querySelectorAll('.session-row[data-session-id]').length`,
+          (value) => value > 0,
+          'filtered session rows before screenshot'
+        );
+        await evaluate(`(() => {
+          const row = document.querySelector('.session-row[data-session-id]');
+          row?.click();
+          return Boolean(row);
+        })()`);
+      }
+      await waitFor(
+        `document.querySelector('.recent-dialogue')?.getAttribute('aria-busy') === 'false'`,
+        Boolean,
+        'recent dialogue before screenshot',
+        30000
+      );
+      if (process.env.CURATOR_PANEL_VERIFY_EXPAND_MACHINE_PICKER === '1') {
+        await evaluate(`(() => {
+          const summary = document.querySelector('details.machine-picker > summary');
+          summary?.click();
+          return Boolean(summary);
+        })()`);
+        await waitFor(
+          `document.querySelector('details.machine-picker')?.open === true`,
+          Boolean,
+          'expanded machine picker before screenshot'
+        );
+      }
+      const screenshot = await cdpCall(ws, id++, 'Page.captureScreenshot', {
+        format: 'png',
+        captureBeyondViewport: true,
+      });
+      writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
+      if (process.env.CURATOR_PANEL_VERIFY_CAPTURE_ONLY === '1') {
+        console.log(JSON.stringify({ ok: true, baseUrl, screenshotPath, viewportWidth, viewportHeight, actualViewport }, null, 2));
+        ws.close();
+        return;
+      }
+    }
+
+    await evaluate(`(() => {
+      const summary = document.querySelector('details.machine-picker > summary');
+      summary?.click();
+      return Boolean(summary);
+    })()`);
+    const machineExpanded = await waitFor(
+      `(() => {
+        const picker = document.querySelector('details.machine-picker');
+        const menu = picker?.querySelector('.machine-options');
+        const buttons = [...(menu?.querySelectorAll('button') || [])];
+        const isVisible = (element) => Boolean(element && element.getClientRects().length > 0);
+        const latencyPattern = /^\\d+(?:\\.\\d+)?ms$/i;
+        const details = buttons.map((button) => {
+          const detail = button.querySelector('em');
+          return {
+            machine: button.querySelector('strong')?.textContent?.trim() || '',
+            detail: detail?.textContent?.trim() || '',
+            visible: isVisible(detail),
+            online: Boolean(button.querySelector('.remote-dot.online'))
+          };
+        });
+        const remoteOnline = details.filter((entry) => entry.online && entry.detail !== '本机');
+        return {
+          open: picker?.open === true,
+          menuVisible: isVisible(menu),
+          visibleDetailCount: details.filter((entry) => entry.visible).length,
+          localCount: details.filter((entry) => entry.detail === '本机').length,
+          remoteOnlineCount: remoteOnline.length,
+          remoteOnlineLatenciesValid: remoteOnline.every((entry) => latencyPattern.test(entry.detail)),
+          nonLocalLabelsValid: details
+            .filter((entry) => entry.machine !== '全部机器' && entry.detail !== '本机')
+            .every((entry) => latencyPattern.test(entry.detail) || ['在线', '离线', '状态未知'].includes(entry.detail)),
+          details
+        };
+      })()`,
+      (value) => value.open && value.menuVisible && value.visibleDetailCount > 0,
+      'expanded machine picker'
+    );
+    await evaluate(`(() => {
+      const summary = document.querySelector('details.machine-picker[open] > summary');
+      summary?.click();
+      return Boolean(summary);
+    })()`);
+    await evaluate(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__curatorPanelRemoteStatusFetch = originalFetch;
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : input?.url || '';
+        if (new URL(url, window.location.href).pathname === '/api/remote-agents') {
+          return Promise.resolve(new Response(JSON.stringify({ agents: [] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          }));
+        }
+        return originalFetch(input, init);
+      };
+      document.querySelector('details.machine-picker > summary')?.click();
+      return true;
+    })()`);
+    const machineUnknownFallback = await waitFor(
+      `(() => {
+        const picker = document.querySelector('details.machine-picker');
+        const details = [...(picker?.querySelectorAll('.machine-options button') || [])]
+          .map((button) => ({
+            machine: button.querySelector('strong')?.textContent?.trim() || '',
+            detail: button.querySelector('em')?.textContent?.trim() || ''
+          }))
+          .filter((entry) => entry.machine !== '全部机器');
+        return {
+          open: picker?.open === true,
+          localCount: details.filter((entry) => entry.detail === '本机').length,
+          unknownCount: details.filter((entry) => entry.detail === '状态未知').length,
+          machineCount: details.length
+        };
+      })()`,
+      (value) => value.open && value.localCount === 1 && value.unknownCount === Math.max(0, value.machineCount - 1),
+      'unknown remote status fallback'
+    );
+    await evaluate(`(() => {
+      document.querySelector('details.machine-picker[open] > summary')?.click();
+      if (window.__curatorPanelRemoteStatusFetch) window.fetch = window.__curatorPanelRemoteStatusFetch;
+      delete window.__curatorPanelRemoteStatusFetch;
+      return true;
+    })()`);
 
     const agentCandidates = await evaluate(`(async () => {
       const response = await fetch('/api/sessions?detail=0');
@@ -273,36 +448,24 @@ async function main() {
       await focusSessionIdentity(firstIdentity.id, firstIdentity.machineId, firstIdentity.agent);
       const firstSelection = await evaluate(`(() => {
         const selected = [...document.querySelectorAll('.session-row.selected')];
-        const target = [...document.querySelectorAll('.session-row')].find((row) =>
-          row.dataset.sessionId === ${JSON.stringify(firstIdentity.id)} &&
-          row.dataset.machineId === ${JSON.stringify(firstIdentity.machineId)} &&
-          row.dataset.agent === ${JSON.stringify(firstIdentity.agent)}
-        );
-        target?.querySelector('input.session-checkbox')?.click();
         return {
-          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId]),
-          checked: [...document.querySelectorAll('.session-row input.session-checkbox:checked')].length
+          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId])
         };
       })()`);
       await focusSessionIdentity(secondIdentity.id, secondIdentity.machineId, secondIdentity.agent);
       const secondSelection = await evaluate(`(() => {
         const selected = [...document.querySelectorAll('.session-row.selected')];
-        const checked = [...document.querySelectorAll('.session-row input.session-checkbox:checked')];
-        checked.forEach((input) => input.click());
         return {
-          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId]),
-          checked: checked.length
+          selected: selected.map((row) => [row.dataset.machineId, row.dataset.agent, row.dataset.sessionId])
         };
       })()`);
       duplicateIdentityOk =
         firstSelection.selected.length === 1 &&
         firstSelection.selected[0][0] === firstIdentity.machineId &&
         firstSelection.selected[0][1] === firstIdentity.agent &&
-        firstSelection.checked === 1 &&
         secondSelection.selected.length === 1 &&
         secondSelection.selected[0][0] === secondIdentity.machineId &&
-        secondSelection.selected[0][1] === secondIdentity.agent &&
-        secondSelection.checked === 1;
+        secondSelection.selected[0][1] === secondIdentity.agent;
     }
 
     await setSearchQuery(query);
@@ -383,6 +546,17 @@ async function main() {
       'first recent dialogue'
     );
 
+    await evaluate(`(() => {
+      const button = document.querySelector('section.session-overview .key-block .icon-button');
+      button?.click();
+      return Boolean(button);
+    })()`);
+    const actionMessageBeforeSwitch = await waitFor(
+      `document.querySelector('section.session-overview .action-notice')?.textContent?.trim() || ''`,
+      (value) => value.length > 0,
+      'session action message'
+    );
+
     await waitFor(
       `Boolean(document.querySelector('.recent-dialogue .recent-message-toggle'))`,
       Boolean,
@@ -440,6 +614,11 @@ async function main() {
         JSON.stringify(value.messages) === JSON.stringify(secondCandidate.messages),
       'second recent dialogue'
     );
+    const actionMessageCleared = await waitFor(
+      `!document.querySelector('section.session-overview .action-notice')`,
+      Boolean,
+      'session action message cleared'
+    );
     await evaluate(`(() => {
       if (window.__curatorPanelOriginalFetch) window.fetch = window.__curatorPanelOriginalFetch;
       delete window.__curatorPanelOriginalFetch;
@@ -462,6 +641,8 @@ async function main() {
       expansionAfter.expanded &&
       expansionAfter.ariaExpanded &&
       expansionAfter.fullHeight &&
+      actionMessageBeforeSwitch.length > 0 &&
+      actionMessageCleared &&
       transitionRecent.busy &&
       transitionRecent.selectedRows.length === 1 &&
       transitionRecent.selectedRows[0].sessionId === secondCandidate.sessionId &&
@@ -509,12 +690,32 @@ async function main() {
       !before.loginVisible &&
       before.searchVisible &&
       before.aiSearchVisible &&
+      before.sessionRows > 0 &&
       before.sessionGroups > 0 &&
       after.sessionRows > 0 &&
       !before.loadErrorVisible &&
       !after.loadErrorVisible &&
-      before.auditSummaryText.includes('稳定会话 AI 覆盖') &&
-      before.auditSummaryText.includes('真正遗漏') &&
+      JSON.stringify(before.tabLabels) === JSON.stringify(['会话', '已保留', '回收站']) &&
+      !before.auditSummaryVisible &&
+      !before.filterNoteVisible &&
+      !before.sshOpenButtonVisible &&
+      before.focusCardCount === 2 &&
+      before.detailCardCount === 2 &&
+      before.recentParentIsPrimaryPanel &&
+      before.recentParentIsFocusCard &&
+      before.overviewCardHasCoreActions &&
+      before.machinePicker.exists &&
+      !before.machinePicker.open &&
+      !before.machinePicker.summaryHasLatency &&
+      !before.machinePicker.menuVisible &&
+      machineExpanded.open &&
+      machineExpanded.menuVisible &&
+      machineExpanded.visibleDetailCount > 0 &&
+      machineExpanded.localCount === 1 &&
+      machineExpanded.remoteOnlineLatenciesValid &&
+      machineExpanded.nonLocalLabelsValid &&
+      machineUnknownFallback.localCount === 1 &&
+      machineUnknownFallback.unknownCount === Math.max(0, machineUnknownFallback.machineCount - 1) &&
       agentFilterOk &&
       duplicateIdentityOk &&
       recentOk &&
@@ -525,6 +726,7 @@ async function main() {
       ok,
       baseUrl,
       query,
+      actualViewport,
       before,
       after,
       agentFilter: {
@@ -538,12 +740,18 @@ async function main() {
         ok: duplicateIdentityOk,
         candidates: agentCandidates.duplicateIdentities,
       },
+      machinePicker: {
+        collapsed: before.machinePicker,
+        expanded: machineExpanded,
+        unknownFallback: machineUnknownFallback,
+      },
       recent: {
         ok: recentOk,
         firstSessionId: firstCandidate.sessionId,
         firstCount: firstRecent.messages.length,
         sixLineClamp: expansionBefore.lineClamp === '6',
         expandsFully: expansionAfter.fullHeight,
+        actionMessageCleared,
         refreshControlsVisible: firstRecent.refreshStatusVisible || firstRecent.refreshButtonVisible,
         transitionCleared: transitionRecent.messages.length === 0,
         secondSessionId: secondCandidate.sessionId,
