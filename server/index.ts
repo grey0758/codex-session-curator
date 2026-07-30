@@ -1270,12 +1270,13 @@ function stateSessionActivity(updatedAt: string | null | undefined): {
 }
 
 async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
+  const visibleStateKeys = await service.getVisibleSessionStateKeys();
   const state = await service.ensureLegacyStateMigrated();
   const machineId = service.getMeta().machineId;
   return Object.entries(state.evaluations)
     .flatMap(([stateKey, evaluation]) => {
       const identity = parseSessionStateKey(stateKey);
-      if (!identity || state.deletedIds.includes(stateKey)) return [];
+      if (!identity || state.deletedIds.includes(stateKey) || !visibleStateKeys.has(stateKey)) return [];
       const { sessionId: id, agent } = identity;
       const activity = stateSessionActivity(evaluation.updatedAt ?? evaluation.evaluatedAt);
       return [{

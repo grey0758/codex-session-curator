@@ -99,7 +99,52 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
     JSON.stringify({ type: 'user', sessionId: claudeSessionId, cwd: projectDir, timestamp: now, message: { role: 'user', content: [{ type: 'text', text: 'CLAUDE_WORKER_USER' }] } }),
     JSON.stringify({ type: 'assistant', sessionId: claudeSessionId, cwd: projectDir, timestamp: now, message: { role: 'assistant', content: [{ type: 'text', text: 'CLAUDE_WORKER_ASSISTANT' }] } }),
   ].join('\n') + '\n', 'utf8');
-  await writeFile(statePath, JSON.stringify({ keptIds: [], deletedIds: [], titles: {}, evaluations: {}, commanderActions: {} }), 'utf8');
+  await writeFile(statePath, JSON.stringify({
+    keptIds: [],
+    deletedIds: [],
+    titles: {},
+    evaluations: {
+      [`codex|||${codexSubagentSessionId}`]: {
+        title: 'STALE_SUBAGENT_INDEX',
+        summary: 'Cached by an older Curator release.',
+        detailedSummary: 'This stale evaluation must not make a subagent visible.',
+        recommendation: 'keep',
+        score: 100,
+        reasons: ['stale subagent fixture'],
+        actualWorkdirs: [projectDir],
+        directoryIndex: ['worker-project'],
+        techStack: ['TypeScript'],
+        keywords: ['STALE_SUBAGENT_INDEX'],
+        failureCards: [],
+        jobOutcomes: [],
+        searchText: 'STALE_SUBAGENT_INDEX COPIED_PARENT_USER',
+        updateCadence: 'quiet',
+        reviewPriority: 'normal',
+        reviewSignals: [],
+        cwdMatchesWorkdir: true,
+        recommendedWorkdir: projectDir,
+        remoteMachines: [],
+        evaluatedAt: now,
+        workflow: 'test:complete',
+        model: 'test',
+        status: 'ok',
+        error: null,
+        filePath: codexSubagentSessionPath,
+        mtimeMs: Date.now(),
+        bytes: 1,
+        cwd: projectDir,
+        startedAt: now,
+        updatedAt: now,
+        messageCount: 2,
+        userTurns: 1,
+        assistantTurns: 1,
+        shellSnapshotCount: 0,
+        lastUserMessage: { role: 'user', text: 'COPIED_PARENT_USER', timestamp: now },
+        lastAssistantMessage: { role: 'assistant', text: 'SUBAGENT_REPLY', timestamp: now },
+      },
+    },
+    commanderActions: {},
+  }), 'utf8');
 
   try {
     worker = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
@@ -210,7 +255,10 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
     const state = JSON.parse(await readFile(statePath, 'utf8')) as { evaluations: Record<string, JsonRecord> };
     assert.match(String(state.evaluations[`codex|||${codexSessionId}`].workflow), /:fast-list$/);
     assert.match(String(state.evaluations[`claude|||${claudeSessionId}`].workflow), /:fast-list$/);
-    assert.equal(state.evaluations[`codex|||${codexSubagentSessionId}`], undefined);
+    assert.equal(
+      state.evaluations[`codex|||${codexSubagentSessionId}`].title,
+      'STALE_SUBAGENT_INDEX',
+    );
   } finally {
     if (worker) await stopServer(worker);
     await rm(testRoot, { recursive: true, force: true });

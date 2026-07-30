@@ -669,6 +669,13 @@ export class SessionService {
     return this.migrateLegacyStateForFiles(await this.discoverSessionFiles());
   }
 
+  async getVisibleSessionStateKeys(): Promise<Set<string>> {
+    return new Set(
+      this.sessionStateIdentities(await this.discoverSessionFiles())
+        .map((identity) => identity.stateKey),
+    );
+  }
+
   private async findSessionFileByIdentity(
     sessionId: string,
     agent?: AgentKind | null,
