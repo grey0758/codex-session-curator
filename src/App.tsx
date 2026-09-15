@@ -40,6 +40,7 @@ import {
   sessionFilesDetailUrl,
   sessionFilesListUrl,
   sessionFileUploadUrl,
+  terminalPageUrl,
 } from './session-files-routing';
 
 type Recommendation = 'keep' | 'review' | 'delete';
@@ -2828,6 +2829,18 @@ function App() {
     });
   }, []);
 
+  const openTerminal = useCallback((session: CodexSession) => {
+    setMachineFilter(session.machineId);
+    setSelectedSessionKey(sessionKey(session));
+    const opened = window.open(
+      terminalPageUrl(session.id, session.machineId, session.agent),
+      '_blank'
+    );
+    if (opened) opened.opener = null;
+    opened?.focus();
+    if (!opened) setActionMessage('浏览器阻止了新终端页面，请允许弹出窗口后重试');
+  }, []);
+
   const openSessionFiles = useCallback((session: CodexSession) => {
     setMachineFilter(session.machineId);
     setSelectedSessionKey(sessionKey(session));
@@ -3932,6 +3945,10 @@ function App() {
             <div className="topbar-actions">
               {SHOW_ADVANCED_UI && selected ? (
                 <>
+                  <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
+                    <TerminalIcon size={17} />
+                    打开 SSH 终端
+                  </button>
                   <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
                     <FolderOpen size={17} />
                     打开工作目录
@@ -4102,6 +4119,10 @@ function App() {
                   <button type="button" className="primary-button" title="打开这个会话的 cwd 文件目录" onClick={() => openSessionFiles(selected)}>
                     <FolderOpen size={17} />
                     打开工作目录
+                  </button>
+                  <button type="button" className="primary-button ssh-open-button" title="通过真实 SSH login shell 打开当前会话" onClick={() => openTerminal(selected)}>
+                    <TerminalIcon size={17} />
+                    打开 SSH 终端
                   </button>
                 </div>
                 {actionMessage ? <div className="notice inline-info action-notice">{actionMessage}</div> : null}

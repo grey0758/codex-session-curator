@@ -735,6 +735,12 @@
   background: #effaf4;
 }
 
+.ssh-open-button {
+  color: #12356f;
+  border-color: #9fbdf4;
+  background: #edf4ff;
+}
+
 .danger-button {
   color: #7f1d1d;
   border-color: #fecaca;

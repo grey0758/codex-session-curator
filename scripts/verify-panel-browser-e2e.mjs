@@ -519,13 +519,12 @@ async function main() {
         if (!candidate) continue;
         if (candidates.some((entry) => JSON.stringify(entry.messages) === JSON.stringify(candidate.messages))) continue;
         candidates.push(candidate);
-        if (candidates.length === 2) break;
       }
       candidates.sort((left, right) =>
         Math.max(...right.messages.map((message) => message.length)) -
         Math.max(...left.messages.map((message) => message.length))
       );
-      return candidates;
+      return candidates.slice(0, 2);
     })()`);
     if (recentCandidates.length < 2) throw new Error('recent dialogue verification needs two distinct sessions');
 
@@ -720,7 +719,7 @@ async function main() {
       JSON.stringify(before.tabLabels) === JSON.stringify(['会话', '已保留', '回收站']) &&
       !before.auditSummaryVisible &&
       !before.filterNoteVisible &&
-      !before.sshOpenButtonVisible &&
+      before.sshOpenButtonVisible &&
       before.focusCardCount === 2 &&
       before.detailCardCount === 2 &&
       before.recentParentIsPrimaryPanel &&

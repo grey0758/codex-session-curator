@@ -1,6 +1,6 @@
 # Server Identity Topology
 
-Updated: 2026-07-17
+Updated: 2026-08-17
 
 Use stable `xiannai.me` identity domains before any NewAPI, CLIProxy, OpenCodex, DNS, or data migration work. Do not treat stale descriptive names such as `hongkong002` as source of truth when they conflict with this table.
 
@@ -19,6 +19,7 @@ Use stable `xiannai.me` identity domains before any NewAPI, CLIProxy, OpenCodex,
 | sgp001 | sgp001.ip.xiannai.me | 15.235.145.62 | ns5011860 | grey | Singapore 001 host; public SSH verified; NetBird intentionally not added. `spg001` is a user-spoken alias for the same host, not a separate machine. |
 | us001 | us001.ip.xiannai.me | 192.3.226.177 | us001 | grey | Replaced on 2026-07-17 by the provider-refreshed RackNerd VPS. Public OpenSSH is on port 22 with the 1Password-managed xiannai admin key. Tailscale IPv4 is `100.84.174.43`, stable DNS is `us001.ts.xiannai.me`, and collision-qualified MagicDNS is `us001-1.tail239026.ts.net.`. Existing Remnawave node `us001-remnanode` was reconnected; node API 2222 and `rw-core` 1443 are live, and both us001 hosts publish `192.3.226.177`. NFSv4.2 exports `/srv/us-storage` only to us002 over Tailscale; us002 mounts it at `/mnt/us-storage`. Persistent authenticated HTTPS-proxy 8443 and SSH-forward 22222 compatibility services were rebuilt. The previous `216.36.107.157:53111` machine is offline history. |
 | us002 | us002.ip.xiannai.me | 108.85.205.8 | los001 | root, grey | United States 002 host. Preferred SSH path is `us002.ts.xiannai.me -> 100.79.149.7`. On 2026-07-17 it mounted replacement us001 storage at `/mnt/us-storage` using NFSv4.2 over Tailscale with a hard, nofail systemd automount; read/write, checksum, root-squash, and activation tests passed. |
+| us003 | us003.ip.xiannai.me | 104.62.94.9 | us003 | root, grey | United States 003 replacement target. Preferred SSH path is `us003.ts.xiannai.me -> 100.98.183.38`; public recovery is verified through jp001 and sgp001 jumps. The complete us002 proxy data plane is staged in parallel on us003, with validation ingress ports `18443` and `22223`, hk003 reverse listener `23130`, gpl001 recovery listener `22003`, and three us003 entries after all us002 entries in the dedicated Remnawave template. Production remains on us002 pending explicit cutover authorization. |
 
 Cloudflare records are DNS-only A records with TTL 120. Public DoH verification via Cloudflare returned the expected IPs for hk002-hk006 on 2026-05-19 and sgp001 on 2026-06-01. Local resolver on gpl001 required a temporary `/etc/hosts` compatibility block during propagation.
 

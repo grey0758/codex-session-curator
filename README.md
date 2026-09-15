@@ -231,6 +231,50 @@ The artifact contains backend runtime code plus `bin/curator`. It intentionally
 omits React/Vite assets, the full control-plane workspace, the evaluator,
 knowledge storage, and frontend dependencies. See [docs/thin-worker.md](docs/thin-worker.md).
 
+## Production Topology
+
+The deployed Curator service uses an explicit active-passive topology. `gpl001`
+is the normal Curator Hub writer. `sgp001` is a synchronized, fenced standby
+that is promoted only by the documented DR procedure. `cnal002` and `us002`
+remain thin workers and keep their local `CURATOR_HUB_BASE_URL` at
+`http://127.0.0.1:54176` during either primary or DR operation.
+
+```text
+Browser / Codex / Claude
+          |
+  curator.xiannai.me (Access; CNAME selects one tunnel)
+          |
+  gpl001 Curator Hub (normal writer)
+    - panel, API, knowledge, evaluation, aggregation
+    - blue 54187 / green 54188 -> localhost 54177
+    - SSH forwards: 54179 -> cnal002:55177; 54178 -> us002:55177
+          |
+  cnal002 and us002 thin workers (localhost-only 55177)
+
+  sgp001 DR Hub (stopped until explicitly promoted)
+    - synchronized Hub/knowledge/runtime state
+    - takes over worker tunnels and the browser CNAME only after verification
+```
+
+| Role | Host | Runtime contract |
+| --- | --- | --- |
+| Primary Hub | `gpl001` | Single normal Curator writer; local blue-green slots behind `127.0.0.1:54177`. |
+| DR standby | `sgp001` | Active-passive copy; remains stopped and fenced until promotion, then serves as the only Curator writer. |
+| Thin worker | `cnal002` | Worker API on `127.0.0.1:55177`; Hub tunnel and local client address stay unchanged across failover. |
+| Thin worker | `us002` | Same worker contract as `cnal002`; its SSH tunnel uses the managed `ssh-1p` wrapper. |
+
+Only one Hub may write at a time. Promotion and failback are operator-controlled
+and must prove the other site is fenced before starting writers. The Curator
+browser CNAME is traffic routing, not writer election; do not run both sites as
+writable, auto-promote from a health check, or reuse the shared OpenCodex/NewAPI
+Load Balancer pool. OpenBao writer fencing is a separate control plane.
+
+The implementation details are kept in [docs/primary-standby-architecture.md](docs/primary-standby-architecture.md),
+[docs/blue-green-deploy.md](docs/blue-green-deploy.md), and
+[docs/thin-worker.md](docs/thin-worker.md). DR promotion, worker-tunnel takeover,
+and public-route changes are orchestrated by the upper ops workspace rather than
+by this application repository.
+
 ## Systemd Deployment
 
 Example user service:
