@@ -80,6 +80,7 @@ interface LlmEndpoint {
   temperature: number;
   topP: number;
   thinking: boolean;
+  thinkingParam: string | null;
   responseFormat: boolean;
 }
 
@@ -199,6 +200,7 @@ function endpointFromEnv(prefix: string, defaults: Partial<LlmEndpoint> = {}): L
     temperature: Number(process.env[`${prefix}_TEMPERATURE`] || defaults.temperature || (provider === 'nvidia' ? 1 : 0.2)),
     topP: Number(process.env[`${prefix}_TOP_P`] || defaults.topP || 1),
     thinking: process.env[`${prefix}_THINKING`] === '1',
+    thinkingParam: (process.env[`${prefix}_THINKING_PARAM`] || '').trim().toLowerCase() || null,
     responseFormat: process.env[`${prefix}_RESPONSE_FORMAT`] !== '0',
   };
 }
@@ -818,8 +820,9 @@ async function callLlm(state: WorkflowState): Promise<LlmEvaluation | null> {
       };
       if (endpoint.provider === 'nvidia') {
         if (endpoint.thinking || strictRetry) body.chat_template_kwargs = { thinking: strictRetry ? false : endpoint.thinking };
-      } else if (endpoint.responseFormat) {
-        body.response_format = { type: 'json_object' };
+      } else {
+        if (endpoint.thinkingParam) body.thinking = { type: endpoint.thinkingParam };
+        if (endpoint.responseFormat) body.response_format = { type: 'json_object' };
       }
 
       let response: Response | null = null;

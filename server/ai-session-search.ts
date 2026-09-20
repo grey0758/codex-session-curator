@@ -160,10 +160,15 @@ function resolveDeepSeekEndpoint(): DeepSeekEndpoint {
   }
   const hostname = parsedUrl.hostname.toLowerCase();
   const allowTestEndpoint = process.env.CURATOR_AI_SEARCH_ALLOW_NON_DEEPSEEK_URL === '1';
+  const allowedHosts = (process.env.CURATOR_AI_SEARCH_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
   const isDeepSeek =
     model.toLowerCase().includes('deepseek') &&
     (hostname === 'deepseek.com' || hostname.endsWith('.deepseek.com'));
-  if (!isDeepSeek && !allowTestEndpoint) {
+  const isAllowlistedHost = allowedHosts.includes(hostname);
+  if (!isDeepSeek && !isAllowlistedHost && !allowTestEndpoint) {
     throw new AiSearchUnavailableError('not-deepseek', 'Fast search endpoint is not a verified DeepSeek endpoint');
   }
 
