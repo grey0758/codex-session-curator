@@ -127,7 +127,8 @@ export type SessionAuditEventType =
   | 'completeness-issue'
   | 'completeness-pending'
   | 'completeness-skipped'
-  | 'completeness-recovered';
+  | 'completeness-recovered'
+  | 'session-duplicate-collapsed';
 
 export interface SessionAuditEvent {
   id: string;
@@ -348,6 +349,8 @@ export interface CodexSession {
   customTitle: string | null;
   resumeCommand: string;
   machineId: string;
+  // OS user whose Codex/Claude home holds this session.
+  ownerUser: string;
   activityStatus: ActivityStatus;
   lastActiveAt: string | null;
   inactiveDays: number | null;

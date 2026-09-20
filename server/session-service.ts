@@ -2,7 +2,7 @@ import { stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { relative, sep } from 'node:path';
+import { resolve, relative, sep } from 'node:path';
 import {
   archiveSessionFilesBulk,
   archiveSessionFiles,
@@ -12,13 +12,16 @@ import {
   getClaudeProjectsRoot,
   getCodexHome,
   getRecycleRoot,
+  getSessionRoots,
   getSessionsRoot,
   isClaudeSessionPath,
+  sessionContentFingerprint,
   listRecycleArchives,
   purgeExpiredArchives,
   permanentlyDeleteArchive,
   restoreArchive,
   sameResolvedPath,
+  type SessionRoot,
 } from './file-ops.js';
 import {
   EVALUATOR_WORKFLOW,
@@ -505,9 +508,15 @@ function fastEvaluation(input: {
   };
 }
 
-function enrichSession(base: Omit<CodexSession, 'agent' | 'resumeCommand' | 'machineId' | 'activityStatus' | 'lastActiveAt' | 'inactiveDays'>): CodexSession {
+function enrichSession(
+  base: Omit<
+    CodexSession,
+    'agent' | 'resumeCommand' | 'machineId' | 'ownerUser' | 'activityStatus' | 'lastActiveAt' | 'inactiveDays'
+  >,
+): CodexSession {
   const activity = getActivity(base.updatedAt);
-  const agent: AgentKind = isClaudeSessionPath(base.filePath) ? 'claude' : 'codex';
+  const agent: AgentKind = sessionAgentForFile(base.filePath);
+  const ownerUser = sessionOwnerUser(base.filePath);
   let evaluation = base.evaluation;
   const shouldPromoteToDelete =
     !base.kept &&
@@ -526,10 +535,28 @@ function enrichSession(base: Omit<CodexSession, 'agent' | 'resumeCommand' | 'mac
     ...base,
     agent,
     evaluation,
-    resumeCommand: agent === 'claude' ? `claude --resume ${base.id}` : `codex resume ${base.id}`,
+    resumeCommand: resumeCommandForSession(agent, base.id, ownerUser),
     machineId: getMachineId(),
+    ownerUser,
     ...activity,
   };
+}
+
+// Sessions belonging to another OS user cannot be resumed from the Curator
+// user's shell, so the command is prefixed with the matching sudo hop.
+export function resumeCommandForSession(agent: AgentKind, sessionId: string, ownerUser: string): string {
+  const command = agent === 'claude' ? `claude --resume ${sessionId}` : `codex resume ${sessionId}`;
+  return wrapResumeCommandForOwner(command, ownerUser);
+}
+
+export function wrapResumeCommandForOwner(command: string, ownerUser: string): string {
+  const primaryUser = SESSION_ROOTS[0]?.ownerUser;
+  if (!ownerUser || !command || ownerUser === primaryUser) return command;
+  return `sudo -u ${ownerUser} -H bash -lc ${shellQuote(command)}`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export function sessionStateKey(sessionId: string, agent: AgentKind): string {
@@ -547,8 +574,47 @@ export function parseSessionStateKey(
   return { sessionId, agent };
 }
 
+// Extra Codex/Claude homes on this machine. Sessions from every configured
+// root are indexed; the Curator home stays authoritative for state, recycle
+// bin, and audit logs.
+const SESSION_ROOTS: SessionRoot[] = getSessionRoots();
+
+function isInsideRoot(filePath: string, root: string): boolean {
+  const resolvedRoot = resolve(root);
+  const resolvedFile = resolve(filePath);
+  return resolvedFile === resolvedRoot || resolvedFile.startsWith(`${resolvedRoot}${sep}`);
+}
+
+function sessionRootForFile(filePath: string): SessionRoot | null {
+  for (const root of SESSION_ROOTS) {
+    if (isInsideRoot(filePath, root.claudeProjectsRoot) || isInsideRoot(filePath, root.sessionsRoot)) {
+      return root;
+    }
+  }
+  return null;
+}
+
+export function sessionOwnerUser(filePath: string): string {
+  return sessionRootForFile(filePath)?.ownerUser ?? SESSION_ROOTS[0]?.ownerUser ?? 'primary';
+}
+
 function sessionAgentForFile(filePath: string): AgentKind {
+  const root = sessionRootForFile(filePath);
+  if (root) return isInsideRoot(filePath, root.claudeProjectsRoot) ? 'claude' : 'codex';
   return isClaudeSessionPath(filePath) ? 'claude' : 'codex';
+}
+
+// Shell snapshots live per home, so a session from an extra root must be
+// counted against its own home rather than the Curator home.
+async function countShellSnapshotsForAllRoots(): Promise<Map<string, number>> {
+  const merged = new Map<string, number>();
+  for (const root of SESSION_ROOTS) {
+    const counts = await countShellSnapshots(root.codexHome);
+    for (const [sessionId, count] of counts) {
+      merged.set(sessionId, (merged.get(sessionId) ?? 0) + count);
+    }
+  }
+  return merged;
 }
 
 export class SessionService {
@@ -557,6 +623,7 @@ export class SessionService {
   private claudeProjectsRoot = getClaudeProjectsRoot();
   private store: CuratorStore;
   private lastAuditFindingFingerprints = new Map<string, string>();
+  private lastDuplicateCollapseSignature = '';
   private legacyStateMigrationPromise: Promise<PersistedState> | null = null;
   private codexSessionLineageCache = new Map<string, Promise<Awaited<ReturnType<typeof readCodexSessionLineage>>>>();
   private recentUserMessagesCache = new Map<
@@ -615,18 +682,152 @@ export class SessionService {
   }
 
   private async discoverSessionFiles(options: { includeSubagents?: boolean } = {}): Promise<string[]> {
-    const [codexFiles, claudeFiles] = await Promise.all([
-      findJsonlFiles(this.sessionsRoot),
-      findJsonlFiles(this.claudeProjectsRoot),
-    ]);
-    const primaryClaudeFiles = claudeFiles.filter((filePath) => {
-      const segments = relative(this.claudeProjectsRoot, filePath).split(sep);
-      return !segments.includes('subagents');
+    const perRoot = await Promise.all(
+      SESSION_ROOTS.map(async (root) => {
+        const [codexFiles, claudeFiles] = await Promise.all([
+          findJsonlFiles(root.sessionsRoot),
+          findJsonlFiles(root.claudeProjectsRoot),
+        ]);
+        const primaryClaudeFiles = claudeFiles.filter((filePath) => {
+          const segments = relative(root.claudeProjectsRoot, filePath).split(sep);
+          return !segments.includes('subagents');
+        });
+        return { root, codexFiles, claudeFiles: primaryClaudeFiles };
+      }),
+    );
+
+    const codexCandidates: Array<{ filePath: string; root: SessionRoot }> = [];
+    const claudeFiles: string[] = [];
+    for (const entry of perRoot) {
+      for (const filePath of entry.codexFiles) codexCandidates.push({ filePath, root: entry.root });
+      claudeFiles.push(...entry.claudeFiles);
+    }
+
+    const primaryCodexFiles: Array<{ filePath: string; root: SessionRoot }> = [];
+    if (options.includeSubagents) {
+      primaryCodexFiles.push(...codexCandidates);
+    } else {
+      const flags = await mapLimit(codexCandidates, 32, (item) => this.codexSessionIsPrimary(item.filePath));
+      codexCandidates.forEach((item, index) => {
+        if (flags[index]) primaryCodexFiles.push(item);
+      });
+    }
+
+    const deduped = await this.collapseDuplicateSessions(primaryCodexFiles, claudeFiles);
+    return [...deduped.codex, ...deduped.claude];
+  }
+
+  // Copying a Codex home (for example when provisioning a second OS user)
+  // duplicates whole session trees. Collapse each session id to a single
+  // winner: identical content is deduped silently, and when the copies
+  // diverged the Curator home wins unless another copy is strictly newer.
+  private async collapseDuplicateSessions(
+    codexCandidates: Array<{ filePath: string; root: SessionRoot }>,
+    claudeFiles: string[],
+  ): Promise<{ codex: string[]; claude: string[] }> {
+    const bySessionId = new Map<string, Array<{ filePath: string; root: SessionRoot; bytes: number; mtimeMs: number }>>();
+
+    await mapLimit(codexCandidates, 32, async (candidate) => {
+      let fileStat;
+      try {
+        fileStat = await stat(candidate.filePath);
+      } catch {
+        return;
+      }
+      const id = extractSessionId(candidate.filePath);
+      const list = bySessionId.get(id) ?? [];
+      list.push({
+        filePath: candidate.filePath,
+        root: candidate.root,
+        bytes: fileStat.size,
+        mtimeMs: fileStat.mtimeMs,
+      });
+      bySessionId.set(id, list);
     });
-    if (options.includeSubagents) return [...codexFiles, ...primaryClaudeFiles];
-    const primaryCodexFlags = await mapLimit(codexFiles, 32, (filePath) => this.codexSessionIsPrimary(filePath));
-    const primaryCodexFiles = codexFiles.filter((_, index) => primaryCodexFlags[index]);
-    return [...primaryCodexFiles, ...primaryClaudeFiles];
+
+    const winners: string[] = [];
+    const decisions: Array<{ winner: string; dropped: string[]; reason: string }> = [];
+
+    for (const [, copies] of bySessionId) {
+      if (copies.length === 1) {
+        winners.push(copies[0].filePath);
+        continue;
+      }
+
+      // Rank by completeness first, then the Curator home, then recency, so a
+      // truncated copy never wins over the full transcript.
+      const ranked = [...copies].sort((a, b) => {
+        if (b.bytes !== a.bytes) return b.bytes - a.bytes;
+        if (a.root.primary !== b.root.primary) return a.root.primary ? -1 : 1;
+        return b.mtimeMs - a.mtimeMs;
+      });
+      const winner = ranked[0];
+
+      // Confirm identity cheaply; only fall back to size/mtime when a copy
+      // cannot be fingerprinted.
+      const winnerFingerprint = await sessionContentFingerprint(winner.filePath).catch(() => null);
+      const dropped: string[] = [];
+      for (const copy of ranked.slice(1)) {
+        if (copy.bytes === winner.bytes) {
+          const fingerprint = await sessionContentFingerprint(copy.filePath).catch(() => null);
+          // An unreadable copy cannot be proven distinct, so it is collapsed.
+          if (!winnerFingerprint || !fingerprint || fingerprint === winnerFingerprint) {
+            dropped.push(copy.filePath);
+            continue;
+          }
+          // Same length but different bytes: a genuine fork, keep both.
+          winners.push(copy.filePath);
+          continue;
+        }
+        // Strictly shorter copy of the same session id: stale prefix of the
+        // winner's transcript, so it is collapsed rather than listed twice.
+        dropped.push(copy.filePath);
+      }
+      winners.push(winner.filePath);
+      if (dropped.length) {
+        decisions.push({ winner: winner.filePath, dropped, reason: 'identical-transcript' });
+      }
+    }
+
+    if (decisions.length) {
+      const droppedCount = decisions.reduce((total, item) => total + item.dropped.length, 0);
+      // Discovery runs on every request, so only report a collapse when the
+      // dropped set actually changed instead of spamming the audit log.
+      const signature = `${droppedCount}:${decisions
+        .map((item) => item.dropped.join(','))
+        .sort()
+        .join('|')}`;
+      if (signature === this.lastDuplicateCollapseSignature) return { codex: winners, claude: claudeFiles };
+      this.lastDuplicateCollapseSignature = signature;
+      console.log(
+        `[SessionService] Collapsed ${droppedCount} duplicate session file(s) across ${decisions.length} session id(s)`,
+      );
+      await recordSessionAuditEvent({
+        event: 'session-duplicate-collapsed',
+        sessionId: null,
+        machineId: getMachineId(),
+        agent: 'codex',
+        runId: randomUUID(),
+        evaluationOrigin: null,
+        transcriptHash: null,
+        messageCount: null,
+        userTurns: null,
+        assistantTurns: null,
+        bytes: null,
+        mtimeMs: null,
+        model: null,
+        status: 'collapsed',
+        error: null,
+        details: {
+          collapsedSessionIds: decisions.length,
+          droppedFiles: droppedCount,
+          sampleWinner: decisions[0]?.winner ?? null,
+          sampleDropped: decisions[0]?.dropped[0] ?? null,
+        },
+      }).catch(() => undefined);
+    }
+
+    return { codex: winners, claude: claudeFiles };
   }
 
   private sessionStateIdentities(files: string[]): Array<{
@@ -698,7 +899,7 @@ export class SessionService {
     const curatorRole = getCuratorRole();
     const files = await this.discoverSessionFiles();
     const state = await this.migrateLegacyStateForFiles(files);
-    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const shellSnapshotCounts = await countShellSnapshotsForAllRoots();
     const sessions: CodexSession[] = [];
     const parseQueue: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number }> = [];
     let stateChanged = false;
@@ -1201,7 +1402,7 @@ export class SessionService {
     const state = await this.ensureLegacyStateMigrated();
     const stateKey = sessionStateKey(parsed.id, parsed.source);
     const cached = state.evaluations[stateKey];
-    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const shellSnapshotCounts = await countShellSnapshotsForAllRoots();
     const evaluation: Evaluation = {
       ...input.evaluation,
       evaluationOrigin: 'hub-remote',
@@ -1666,7 +1867,7 @@ export class SessionService {
             reviewSignals: [`AI 重算：${reason}`, ...updateMeta.reviewSignals].slice(0, 6),
           }
         );
-    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const shellSnapshotCounts = await countShellSnapshotsForAllRoots();
     const refreshedAt = new Date().toISOString();
     const refreshedEvaluation: StoredEvaluation = {
       ...evaluation,
@@ -2073,7 +2274,7 @@ export class SessionService {
     const quietMs = evaluationQuietMs();
     const files = await this.discoverSessionFiles();
     const state = await this.migrateLegacyStateForFiles(files);
-    const shellSnapshotCounts = await countShellSnapshots(this.codexHome);
+    const shellSnapshotCounts = await countShellSnapshotsForAllRoots();
     const candidates: Array<{ filePath: string; id: string; bytes: number; mtimeMs: number; sortTimeMs: number }> = [];
     let deferredActive = 0;
 
@@ -2284,11 +2485,15 @@ export class SessionService {
   }
 
   async countExistingSessionFiles(): Promise<number> {
-    try {
-      await stat(this.sessionsRoot);
-    } catch {
-      return 0;
+    let total = 0;
+    for (const root of SESSION_ROOTS) {
+      try {
+        await stat(root.sessionsRoot);
+      } catch {
+        continue;
+      }
+      total += (await findJsonlFiles(root.sessionsRoot)).length;
     }
-    return (await findJsonlFiles(this.sessionsRoot)).length;
+    return total;
   }
 }

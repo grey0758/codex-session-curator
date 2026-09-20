@@ -35,7 +35,10 @@ import {
   SessionService,
   UnsupportedSessionMigrationError,
   parseSessionStateKey,
+  resumeCommandForSession,
+  sessionOwnerUser,
   sessionStateKey,
+  wrapResumeCommandForOwner,
 } from './session-service.js';
 import { compareSessionVisibility, readSessionAuditEvents, recordSessionAuditEvent } from './session-audit.js';
 import { CuratorStore } from './store.js';
@@ -1150,11 +1153,13 @@ function toHermesSession(session: SessionListItem, query = '') {
     machineId: session.machineId,
     updatedAt: session.updatedAt,
     activityStatus: session.activityStatus,
-    resumeCommand: session.agent === 'claude'
-      ? `claude --resume ${session.id}`
-      : session.cwd
-        ? `codex resume -C ${session.cwd} ${session.id}`
-        : session.resumeCommand,
+    resumeCommand: session.cwd
+      ? wrapResumeCommandForOwner(
+          session.agent === 'claude' ? `claude --resume ${session.id}` : `codex resume -C ${session.cwd} ${session.id}`,
+          session.ownerUser,
+        )
+      : session.resumeCommand,
+    ownerUser: session.ownerUser,
     canResume: Boolean(session.cwd && !session.deleted),
     actualWorkdirs: session.evaluation.actualWorkdirs,
     recommendedWorkdir: session.evaluation.recommendedWorkdir,
@@ -1229,7 +1234,10 @@ function withEffectiveHermesSessionCwd<T extends ReturnType<typeof toHermesSessi
   return {
     ...session,
     cwd,
-    resumeCommand: session.agent === 'claude' ? `claude --resume ${session.id}` : `codex resume -C ${cwd} ${session.id}`,
+    resumeCommand: wrapResumeCommandForOwner(
+      session.agent === 'claude' ? `claude --resume ${session.id}` : `codex resume -C ${cwd} ${session.id}`,
+      session.ownerUser,
+    ),
   };
 }
 
@@ -1295,7 +1303,8 @@ async function getStateSessionsForHermes(): Promise<SessionListItem[]> {
         shellSnapshotCount: evaluation.shellSnapshotCount ?? 0,
         title: state.titles[stateKey] || evaluation.title || evaluation.summary || id,
         customTitle: state.titles[stateKey] ?? null,
-        resumeCommand: agent === 'claude' ? `claude --resume ${id}` : `codex resume ${id}`,
+        resumeCommand: resumeCommandForSession(agent, id, sessionOwnerUser(evaluation.filePath)),
+        ownerUser: sessionOwnerUser(evaluation.filePath),
         machineId,
         kept: state.keptIds.includes(stateKey),
         deleted: false,

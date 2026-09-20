@@ -1,6 +1,6 @@
 import { constants as fsConstants, createReadStream } from 'node:fs';
-import { copyFile, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -15,6 +15,95 @@ export function getStatePath(codexHome: string): string {
 
 export function getSessionsRoot(codexHome: string): string {
   return join(codexHome, 'sessions');
+}
+
+export interface SessionRoot {
+  // Label of the OS user that owns this Codex/Claude home.
+  ownerUser: string;
+  codexHome: string;
+  sessionsRoot: string;
+  claudeProjectsRoot: string;
+  // True for the home Curator runs as; used as the duplicate tiebreaker.
+  primary: boolean;
+}
+
+function parseExtraSessionRoots(): SessionRoot[] {
+  const raw = process.env.CURATOR_EXTRA_SESSION_ROOTS?.trim();
+  if (!raw) return [];
+  const roots: SessionRoot[] = [];
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf('=');
+    const label = separator === -1 ? '' : trimmed.slice(0, separator).trim();
+    const homePath = (separator === -1 ? trimmed : trimmed.slice(separator + 1)).trim();
+    if (!homePath) continue;
+    const home = resolve(homePath);
+    roots.push({
+      ownerUser: label || basename(home),
+      codexHome: join(home, '.codex'),
+      sessionsRoot: join(home, '.codex', 'sessions'),
+      claudeProjectsRoot: join(home, '.claude', 'projects'),
+      primary: false,
+    });
+  }
+  return roots;
+}
+
+// Curator reads every configured home so Codex/Claude sessions from other OS
+// users on the same machine appear in the panel. The Curator home is always
+// first and is the only root used for Curator's own state, recycle bin, and
+// audit log.
+export function getSessionRoots(): SessionRoot[] {
+  const codexHome = getCodexHome();
+  const primary: SessionRoot = {
+    ownerUser: process.env.CURATOR_OWNER_USER?.trim() || basename(dirname(codexHome)) || 'primary',
+    codexHome,
+    sessionsRoot: getSessionsRoot(codexHome),
+    claudeProjectsRoot: getClaudeProjectsRoot(),
+    primary: true,
+  };
+  const seen = new Set([resolve(codexHome)]);
+  const extra = parseExtraSessionRoots().filter((root) => {
+    const key = resolve(root.codexHome);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return [primary, ...extra];
+}
+
+// Cheap content identity for duplicate detection: size plus a hash of the
+// first and last chunk. Enough to prove two copies of a session are the same
+// transcript without reading multi-megabyte files in full.
+export async function sessionContentFingerprint(
+  filePath: string,
+  chunkBytes = 64 * 1024,
+): Promise<string> {
+  const fileStat = await stat(filePath);
+  const size = fileStat.size;
+  const length = Math.min(chunkBytes, size);
+  const chunks: Buffer[] = [];
+  if (length > 0) {
+    const head = Buffer.alloc(length);
+    const headHandle = await open(filePath, 'r');
+    try {
+      await headHandle.read(head, 0, length, 0);
+      chunks.push(head);
+      if (size > length) {
+        const tail = Buffer.alloc(length);
+        await headHandle.read(tail, 0, length, size - length);
+        chunks.push(tail);
+      }
+    } finally {
+      await headHandle.close();
+    }
+  }
+  return createHash('sha256')
+    .update(String(size))
+    .update('\0')
+    .update(Buffer.concat(chunks))
+    .digest('hex');
 }
 
 export function getClaudeHome(): string {
@@ -57,6 +146,21 @@ function isInside(childPath: string, parentPath: string): boolean {
   return child === parent || child.startsWith(`${parent}${sep}`);
 }
 
+// Session files may live in another OS user's home. Resolve which configured
+// home owns a transcript so archive/delete/restore act on the right tree.
+export function sessionRootForPath(filePath: string): SessionRoot | null {
+  for (const root of getSessionRoots()) {
+    if (isInside(filePath, root.sessionsRoot) || isInside(filePath, root.claudeProjectsRoot)) {
+      return root;
+    }
+  }
+  return null;
+}
+
+function owningCodexHome(filePath: string, fallbackCodexHome: string): string {
+  return sessionRootForPath(filePath)?.codexHome ?? fallbackCodexHome;
+}
+
 function sessionPathInfo(input: {
   codexHome: string;
   filePath: string;
@@ -72,7 +176,8 @@ function sessionPathInfo(input: {
     };
   }
 
-  const sessionsRoot = resolve(getSessionsRoot(input.codexHome));
+  const owner = sessionRootForPath(filePath);
+  const sessionsRoot = resolve(owner?.sessionsRoot ?? getSessionsRoot(input.codexHome));
   if (isInside(filePath, sessionsRoot)) {
     return {
       agent: 'codex',
@@ -195,17 +300,18 @@ export async function deleteSessionFiles(input: {
   await rm(input.filePath, { force: true });
   deletedFiles.push(input.filePath);
 
+  const ownerCodexHome = owningCodexHome(input.filePath, input.codexHome);
   if (pathInfo.agent === 'codex') {
-    const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
+    const snapshots = await findShellSnapshots(ownerCodexHome, input.sessionId);
     for (const snapshot of snapshots) {
-      assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
+      assertInside(snapshot, getShellSnapshotsRoot(ownerCodexHome));
       await rm(snapshot, { force: true });
       deletedFiles.push(snapshot);
     }
   }
 
   const removedHistoryEntries = pathInfo.agent === 'codex'
-    ? await removeHistoryEntries(input.codexHome, input.sessionId)
+    ? await removeHistoryEntries(ownerCodexHome, input.sessionId)
     : 0;
   return { deletedFiles, removedHistoryEntries };
 }
@@ -267,10 +373,11 @@ export async function archiveSessionFiles(input: {
   archivedFiles.push(archivedSession);
   removedOriginalFiles.push(input.filePath);
 
+  const ownerCodexHome = owningCodexHome(input.filePath, input.codexHome);
   if (pathInfo.agent === 'codex') {
-    const snapshots = await findShellSnapshots(input.codexHome, input.sessionId);
+    const snapshots = await findShellSnapshots(ownerCodexHome, input.sessionId);
     for (const snapshot of snapshots) {
-      assertInside(snapshot, getShellSnapshotsRoot(input.codexHome));
+      assertInside(snapshot, getShellSnapshotsRoot(ownerCodexHome));
       const archivedSnapshot = join(archiveDir, 'shell_snapshots', basename(snapshot));
       await moveFileToArchive(snapshot, archivedSnapshot);
       archivedFiles.push(archivedSnapshot);
@@ -280,7 +387,7 @@ export async function archiveSessionFiles(input: {
 
   const removedHistoryEntries = input.skipHistoryCleanup || pathInfo.agent === 'claude'
     ? 0
-    : await removeHistoryEntries(input.codexHome, input.sessionId);
+    : await removeHistoryEntries(ownerCodexHome, input.sessionId);
   await writeFile(
     join(archiveDir, 'manifest.json'),
     `${JSON.stringify(
@@ -340,10 +447,17 @@ export async function archiveSessionFilesBulk(input: {
     archived.push({ sessionId: session.sessionId, ...result });
   }
 
-  const removedBySessionId = await removeHistoryEntriesBatch(
-    input.codexHome,
-    archived.filter((item) => item.agent === 'codex').map((item) => item.sessionId)
-  );
+  const idsByHome = new Map<string, string[]>();
+  archived.forEach((item, index) => {
+    if (item.agent !== 'codex') return;
+    const home = owningCodexHome(input.sessions[index]?.filePath ?? '', input.codexHome);
+    idsByHome.set(home, [...(idsByHome.get(home) ?? []), item.sessionId]);
+  });
+  const removedBySessionId = new Map<string, number>();
+  for (const [home, sessionIds] of idsByHome) {
+    const removed = await removeHistoryEntriesBatch(home, sessionIds);
+    for (const [sessionId, count] of removed) removedBySessionId.set(sessionId, count);
+  }
   for (const item of archived) {
     item.removedHistoryEntries = removedBySessionId.get(item.sessionId) ?? 0;
     await updateArchiveHistoryCount(item.archiveDir, item.removedHistoryEntries);
@@ -545,9 +659,14 @@ export async function restoreArchive(input: {
   });
   if (!archive) throw new Error(`Recycle archive not found: ${input.sessionId}`);
 
-  const sessionsRoot = getSessionsRoot(input.codexHome);
-  const snapshotsRoot = getShellSnapshotsRoot(input.codexHome);
-  const claudeProjectsRoot = input.claudeProjectsRoot ?? getClaudeProjectsRoot();
+  // Prefer the home the archive was taken from so multi-user transcripts are
+  // restored next to their siblings instead of into the Curator home.
+  const originFile = [archive.originalSessionFile, ...archive.removedOriginalFiles]
+    .find((file): file is string => Boolean(file));
+  const originRoot = originFile ? sessionRootForPath(originFile) : null;
+  const sessionsRoot = originRoot?.sessionsRoot ?? getSessionsRoot(input.codexHome);
+  const snapshotsRoot = getShellSnapshotsRoot(originRoot?.codexHome ?? input.codexHome);
+  const claudeProjectsRoot = originRoot?.claudeProjectsRoot ?? input.claudeProjectsRoot ?? getClaudeProjectsRoot();
   const archiveAgent: SessionArchiveAgent = archive.agent ?? 'codex';
   if (archive.archivedFiles.length === 0) {
     throw new Error(`Recycle archive has no archived files: ${archive.archiveDir}`);
@@ -659,7 +778,7 @@ export async function copySessionToProject(input: {
   resumeCommand: string;
   alreadyInTarget: boolean;
 }> {
-  const sessionsRoot = getSessionsRoot(input.codexHome);
+  const sessionsRoot = sessionRootForPath(input.filePath)?.sessionsRoot ?? getSessionsRoot(input.codexHome);
   assertInside(input.filePath, sessionsRoot);
   const target = resolve(input.targetProjectDir);
   const targetStat = await stat(target);
