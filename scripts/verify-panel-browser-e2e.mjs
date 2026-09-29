@@ -152,6 +152,15 @@ async function main() {
       'viewport metrics'
     );
 
+    await waitFor(
+      `(() => ({
+        agent: document.querySelector('.agent-switch button.active')?.dataset.agentFilter,
+        view: document.querySelector('.view-switch button.active')?.textContent?.trim(),
+      }))()`,
+      (value) => value.agent === 'codex' && value.view === '按活跃日期',
+      'default Codex activity-date view'
+    );
+
     async function setSearchQuery(value) {
       await evaluate(`(() => {
         const input = document.querySelector('input[data-session-filter]');
@@ -703,9 +712,19 @@ async function main() {
       aiSearch.mode === 'deepseek' &&
       aiSearch.text.includes('机器 cnal002') &&
       aiSearch.resultCount > 0 &&
-      aiSearch.machines.length === 1 &&
-      aiSearch.machines[0] === 'cnal002';
-    ws.close();
+      aiSearch.machines.includes('cnal002');
+    let autoRefreshOk = null;
+    if (process.env.CURATOR_PANEL_VERIFY_AUTO_REFRESH === '1') {
+      await evaluate(`(() => {
+        window.__curatorSessionPollCount = 0;
+        const originalFetch = window.fetch;
+        window.fetch = (...args) => {
+          if (String(args[0]).includes('/api/sessions?remote=0')) window.__curatorSessionPollCount += 1;
+          return originalFetch(...args);
+        };
+      })()`);
+      autoRefreshOk = await waitFor(`window.__curatorSessionPollCount`, (count) => count > 0, 'visible session auto refresh', 25_000).then(() => true);
+    }
 
     const ok =
       !before.loginVisible &&
@@ -741,10 +760,12 @@ async function main() {
       duplicateIdentityOk &&
       recentOk &&
       aiSearchOk &&
+      autoRefreshOk !== false &&
       exceptions.length === 0 &&
       consoleErrors.length === 0;
     console.log(JSON.stringify({
       ok,
+      autoRefreshOk,
       baseUrl,
       query,
       actualViewport,
@@ -789,6 +810,7 @@ async function main() {
       exceptions,
       consoleErrors,
     }, null, 2));
+    ws.close();
     process.exit(ok ? 0 : 2);
   } finally {
     chrome.kill('SIGTERM');

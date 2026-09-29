@@ -2016,6 +2016,20 @@
   font-size: 12px;
 }
 
+.terminal-error-log {
+  flex: 0 0 auto;
+  max-height: 140px;
+  overflow: auto;
+  padding: 8px 12px;
+  background: #1b2332;
+  color: #fecaca;
+  font: 12px/1.5 var(--mono);
+}
+
+.terminal-error-log button {
+  margin-bottom: 4px;
+}
+
 .terminal-surface {
   height: clamp(620px, 78vh, 980px);
   padding: 8px;

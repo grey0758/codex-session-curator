@@ -43,6 +43,7 @@ import {
 import { compareSessionVisibility, readSessionAuditEvents, recordSessionAuditEvent } from './session-audit.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
+import { readTerminalErrors, recordTerminalError } from './terminal-error-log.js';
 import type {
   AgentKind,
   CodexSession,
@@ -5585,9 +5586,15 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
     })
     .parse(request.query);
   let routed: Awaited<ReturnType<typeof findRoutableSession>>;
+  const logTerminalError = (code: string, closeCode?: number) => {
+    if (!query.machineId || !query.agent) return;
+    request.log.warn({ sessionId: params.id, machineId: query.machineId, agent: query.agent, code, closeCode }, 'Terminal connection issue');
+    void recordTerminalError({ time: new Date().toISOString(), sessionId: params.id, machineId: query.machineId, agent: query.agent, code, closeCode }).catch(() => {});
+  };
   try {
     routed = await findRoutableSession(params.id, query.machineId, query.agent);
   } catch (error) {
+    logTerminalError('session-lookup-failed');
     socket.send(JSON.stringify({
       type: 'error',
       data: error instanceof Error ? error.message : 'Session lookup failed',
@@ -5596,24 +5603,51 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
     return;
   }
   if (!routed) {
+    logTerminalError('session-not-found');
     socket.send(JSON.stringify({ type: 'error', data: 'Session not found' }));
     socket.close();
     return;
   }
 
   const terminal = startCodexTerminal(routed.session, (message) => {
+    if (message.type === 'error') logTerminalError('pty-error');
+    if (message.type === 'exit' && message.code !== 0) logTerminalError('pty-exit', message.code ?? undefined);
     if (socket.readyState === 1) socket.send(JSON.stringify(message));
   }, query);
 
   socket.on('message', (raw: { toString(): string }) => {
     try {
-      terminal.write(JSON.parse(raw.toString()) as TerminalInput);
+      const input = JSON.parse(raw.toString()) as TerminalInput;
+      if (input.type === 'ping') {
+        socket.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+      terminal.write(input);
     } catch {
+      logTerminalError('invalid-input');
       socket.send(JSON.stringify({ type: 'error', data: 'Invalid terminal input' }));
     }
   });
-  socket.on('close', () => terminal.close());
-  socket.on('error', () => terminal.close());
+  socket.on('close', (code: number) => { if (code !== 1000) logTerminalError('socket-closed', code); terminal.close(); });
+  socket.on('error', () => { logTerminalError('socket-error'); terminal.close(); });
+});
+
+const terminalErrorQuerySchema = z.object({ machineId: z.string().min(1).max(300), agent: z.enum(['codex', 'claude']) });
+const terminalErrorBodySchema = terminalErrorQuerySchema.extend({ code: z.enum(['open-timeout', 'heartbeat-timeout', 'output-stalled', 'socket-error', 'socket-closed', 'invalid-message']) });
+
+app.get('/api/sessions/:id/terminal-errors', async (request) => {
+  const { id } = sessionIdSchema.parse(request.params);
+  const { machineId, agent } = terminalErrorQuerySchema.parse(request.query);
+  return { events: await readTerminalErrors(id, machineId, agent) };
+});
+
+app.post('/api/sessions/:id/terminal-errors', async (request, reply) => {
+  const { id } = sessionIdSchema.parse(request.params);
+  const { machineId, agent, code } = terminalErrorBodySchema.parse(request.body);
+  const event = { time: new Date().toISOString(), sessionId: id, machineId, agent, code };
+  request.log.warn(event, 'Browser terminal connection issue');
+  await recordTerminalError(event);
+  return reply.code(204).send();
 });
 
 app.get('/api/recycle-bin', async (request) => {

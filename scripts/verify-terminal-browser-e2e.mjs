@@ -302,6 +302,22 @@ async function main() {
     const probeVisibleInTmux = tmuxPaneContains(probeText);
     const submittedMarkerRecorded = await waitForSessionMarker(token);
 
+    let reconnected = null;
+    if (process.env.CURATOR_TERMINAL_VERIFY_RECONNECT === '1') {
+      const readyBefore = terminalEvents.filter((event) => event.type === 'ready').length;
+      detachSessionClients();
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        await delay(500);
+        const status = await evaluate(`document.querySelector('.terminal-toolbar span')?.textContent || ''`);
+        if (terminalEvents.filter((event) => event.type === 'ready').length > readyBefore && status.includes('运行中')) {
+          reconnected = true;
+          break;
+        }
+      }
+      reconnected ??= false;
+    }
+
     if (!submitProbe) {
       await cdpCall(ws, id++, 'Input.dispatchKeyEvent', {
         type: 'keyDown',
@@ -338,7 +354,7 @@ async function main() {
     const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);
     const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux || submittedMarkerRecorded;
     const disconnected = `${before.status}\n${after.status}`.includes('断开');
-    const ok = statusOk && inputOk && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
+    const ok = statusOk && inputOk && reconnected !== false && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
       sessionId,
@@ -357,6 +373,7 @@ async function main() {
       probeInputFrames,
       inputFrameMeta,
       terminalEvents,
+      reconnected,
       exceptions,
       consoleErrors,
       screenshot: screenshotError ? null : screenshotPath,

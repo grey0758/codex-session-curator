@@ -10,7 +10,7 @@ export interface TerminalMessage {
 }
 
 export interface TerminalInput {
-  type: 'input' | 'resize';
+  type: 'input' | 'resize' | 'ping';
   data?: string;
   cols?: number;
   rows?: number;

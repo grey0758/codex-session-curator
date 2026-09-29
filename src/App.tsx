@@ -603,7 +603,7 @@ interface CodexWorkerEvent {
 }
 
 interface TerminalEvent {
-  type: 'ready' | 'output' | 'exit' | 'error';
+  type: 'ready' | 'output' | 'exit' | 'error' | 'pong';
   data?: string;
   code?: number | null;
   signal?: string | number | null;
@@ -679,20 +679,10 @@ function agentLabel(agent: AgentKind | null | undefined): string {
 }
 
 const MACHINE_FILTER_STORAGE_KEY = 'codex-session-curator:last-machine-filter';
-const AGENT_FILTER_STORAGE_KEY = 'codex-session-curator:last-agent-filter';
 
 function readStoredMachineFilter(): string {
   try {
     return window.localStorage.getItem(MACHINE_FILTER_STORAGE_KEY) || 'all';
-  } catch {
-    return 'all';
-  }
-}
-
-function readStoredAgentFilter(): AgentFilter {
-  try {
-    const stored = window.localStorage.getItem(AGENT_FILTER_STORAGE_KEY);
-    return stored === 'codex' || stored === 'claude' ? stored : 'all';
   } catch {
     return 'all';
   }
@@ -1210,6 +1200,11 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const openTimerRef = useRef<number | null>(null);
+  const heartbeatRef = useRef<number | null>(null);
+  const pingSentAtRef = useRef<number | null>(null);
+  const awaitingOutputSinceRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
   const terminalCleanupRef = useRef<(() => void) | null>(null);
   const connectRef = useRef<() => void>(() => {});
   const pendingOutputRef = useRef('');
@@ -1225,6 +1220,8 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const [terminalStatus, setTerminalStatus] = useState<TerminalStatus>('disconnected');
   const [fullscreen, setFullscreen] = useState(false);
   const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
+  const [errorLogOpen, setErrorLogOpen] = useState(false);
+  const [terminalErrors, setTerminalErrors] = useState<Array<{ time: string; code: string; closeCode?: number }>>([]);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
@@ -1245,8 +1242,14 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const closeSocketAndPty = useCallback(() => {
     terminalCleanupRef.current?.();
     terminalCleanupRef.current = null;
-    socketRef.current?.close();
+    socketRef.current?.close(1000);
     socketRef.current = null;
+    if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
+    openTimerRef.current = null;
+    if (heartbeatRef.current !== null) window.clearInterval(heartbeatRef.current);
+    heartbeatRef.current = null;
+    pingSentAtRef.current = null;
+    awaitingOutputSinceRef.current = null;
     resizeObserverRef.current?.disconnect();
     resizeObserverRef.current = null;
     if (resizeTimerRef.current !== null) {
@@ -1280,6 +1283,26 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
 
   useEffect(() => disconnect, [disconnect]);
 
+  const errorLogUrl = `/api/sessions/${encodeURIComponent(session.id)}/terminal-errors`;
+  const reportTerminalError = useCallback((code: 'open-timeout' | 'heartbeat-timeout' | 'output-stalled' | 'socket-error' | 'socket-closed' | 'invalid-message') => {
+    void fetch(errorLogUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machineId: session.machineId, agent: session.agent, code }),
+    }).catch(() => {});
+  }, [errorLogUrl, session.agent, session.machineId]);
+  const loadTerminalErrors = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ machineId: session.machineId, agent: session.agent });
+      const response = await fetch(`${errorLogUrl}?${params}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as { events?: Array<{ time: string; code: string; closeCode?: number }> };
+      setTerminalErrors(payload.events ?? []);
+    } catch {
+      setTerminalNotice('错误日志加载失败');
+    }
+  }, [errorLogUrl, session.agent, session.machineId]);
+
   const pasteIntoTerminal = useCallback(async () => {
     const socket = socketRef.current;
     const terminal = terminalRef.current;
@@ -1293,6 +1316,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
         setTerminalNotice('剪贴板为空');
         return;
       }
+      awaitingOutputSinceRef.current = Date.now();
       socket.send(JSON.stringify({ type: 'input', data: text }));
       terminal.focus();
       setTerminalNotice('已粘贴到终端');
@@ -1378,10 +1402,20 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
     );
     socketRef.current = socket;
     terminalRef.current = terminal;
+    let connectedAt = 0;
+    openTimerRef.current = window.setTimeout(() => {
+      if (socketRef.current !== socket || socket.readyState === WebSocket.OPEN) return;
+      reportTerminalError('open-timeout');
+      setTerminalNotice('终端连接超时，正在重连...');
+      socket.close(4000);
+    }, 20_000);
 
     const container = containerRef.current;
     const writeInput = (data: string) => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }));
+      if (socket.readyState === WebSocket.OPEN) {
+        if (!data.startsWith('\u001b[<')) awaitingOutputSinceRef.current = Date.now();
+        socket.send(JSON.stringify({ type: 'input', data }));
+      }
     };
     const flushOutput = () => {
       outputFlushTimerRef.current = null;
@@ -1521,13 +1555,46 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
     resizeObserverRef.current = resizeObserver;
 
     socket.onopen = () => {
+      if (socketRef.current !== socket) return;
+      if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
+      openTimerRef.current = null;
+      connectedAt = Date.now();
       setTerminalStatus('connected');
       runFit();
       sendResize(terminal.cols || 120, terminal.rows || 40);
+      heartbeatRef.current = window.setInterval(() => {
+        if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN || document.hidden) {
+          pingSentAtRef.current = null;
+          awaitingOutputSinceRef.current = null;
+          return;
+        }
+        if (awaitingOutputSinceRef.current !== null && Date.now() - awaitingOutputSinceRef.current > 45_000) {
+          reportTerminalError('output-stalled');
+          setTerminalNotice('终端输入后长时间无输出，正在重连到 tmux...');
+          socket.close(4000);
+          return;
+        }
+        if (pingSentAtRef.current !== null) {
+          if (Date.now() - pingSentAtRef.current < 30_000) return;
+          reportTerminalError('heartbeat-timeout');
+          setTerminalNotice('终端连接无响应，正在重连到 tmux...');
+          socket.close(4000);
+          return;
+        }
+        pingSentAtRef.current = Date.now();
+        socket.send(JSON.stringify({ type: 'ping' }));
+      }, 15_000);
     };
     socket.onmessage = (event) => {
-      const message = JSON.parse(event.data as string) as TerminalEvent;
-      if (message.type === 'output' && message.data) queueOutput(message.data);
+      if (socketRef.current !== socket) return;
+      let message: TerminalEvent;
+      try { message = JSON.parse(event.data as string) as TerminalEvent; }
+      catch { reportTerminalError('invalid-message'); return; }
+      if (message.type === 'pong') { pingSentAtRef.current = null; return; }
+      if (message.type === 'output' && message.data) {
+        awaitingOutputSinceRef.current = null;
+        queueOutput(message.data);
+      }
       if (message.type === 'ready' && message.data) {
         setTerminalStatus('codex-running');
       }
@@ -1535,24 +1602,29 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       if (message.type === 'exit') {
         terminal.writeln(`\r\n[exit] code=${message.code ?? 'null'} signal=${message.signal ?? 'null'}`);
         setTerminalStatus('disconnected');
+        socket.close(4000);
       }
     };
-    socket.onclose = () => {
-      socketRef.current = null;
-      setTerminalStatus('disconnected');
+    socket.onclose = (event) => {
+      if (socketRef.current !== socket) return;
+      if (event.code !== 1000 && !manualCloseRef.current) reportTerminalError('socket-closed');
+      closeSocketAndPty();
       if (!manualCloseRef.current && activeRef.current) {
         setTerminalNotice('连接已断开，正在自动重连到 tmux...');
+        if (connectedAt && Date.now() - connectedAt > 30_000) reconnectAttemptsRef.current = 0;
+        const delay = Math.min(30_000, 1200 * 2 ** Math.min(reconnectAttemptsRef.current++, 5));
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
           connectRef.current();
-        }, 1200);
+        }, delay);
       }
     };
     socket.onerror = () => {
-      terminal.writeln('\r\n[error] WebSocket 连接失败');
-      setTerminalStatus('disconnected');
+      if (socketRef.current !== socket) return;
+      reportTerminalError('socket-error');
+      socket.close(4000);
     };
-  }, [copyTerminalSelection, pasteIntoTerminal, session]);
+  }, [closeSocketAndPty, copyTerminalSelection, pasteIntoTerminal, reportTerminalError, session]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -1560,6 +1632,9 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
 
   const reconnect = useCallback(() => {
     manualCloseRef.current = false;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+    reconnectAttemptsRef.current = 0;
     closeSocketAndPty();
     window.setTimeout(() => connectRef.current(), 80);
   }, [closeSocketAndPty]);
@@ -1604,6 +1679,9 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
         <button type="button" className="primary-button" onClick={reconnect}>
           重连
         </button>
+        <button type="button" className="primary-button" onClick={() => { setErrorLogOpen((value) => !value); void loadTerminalErrors(); }}>
+          错误日志
+        </button>
         <button type="button" className="danger-button" onClick={disconnect} disabled={terminalStatus === 'disconnected'}>
           断开
         </button>
@@ -1612,6 +1690,14 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
         </button>
       </div>
       <div className={`terminal-notice${terminalNotice ? '' : ' terminal-notice-empty'}`}>{terminalNotice ?? '\u00a0'}</div>
+      {errorLogOpen ? (
+        <div className="terminal-error-log" role="log" aria-label="终端错误日志">
+          <button type="button" onClick={() => void loadTerminalErrors()}>刷新日志</button>
+          {terminalErrors.length ? terminalErrors.map((event, index) => (
+            <div key={`${event.time}-${index}`}>{event.time} · {event.code}{event.closeCode ? ` · ${event.closeCode}` : ''}</div>
+          )) : <div>暂无终端错误</div>}
+        </div>
+      ) : null}
       {contextMenu ? (
         <div className="terminal-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
           <button type="button" onClick={() => { setContextMenu(null); void copyTerminalSelection(); }}>复制</button>
@@ -1824,8 +1910,8 @@ function App() {
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
   const [machineFilter, setMachineFilter] = useState(readStoredMachineFilter);
-  const [agentFilter, setAgentFilter] = useState<AgentFilter>(readStoredAgentFilter);
-  const [listViewMode, setListViewMode] = useState<SessionListViewMode>('folder');
+  const [agentFilter, setAgentFilter] = useState<AgentFilter>('codex');
+  const [listViewMode, setListViewMode] = useState<SessionListViewMode>('activityDate');
   const [query, setQuery] = useState('');
   const [aiSearchQuery, setAiSearchQuery] = useState('');
   const [aiSearchResult, setAiSearchResult] = useState<AiSessionSearchPayload | null>(null);
@@ -1952,9 +2038,11 @@ function App() {
     }
   }, []);
 
-  const loadSessions = useCallback(async (refreshWorkflow = false) => {
-    setLoading(true);
-    setError(null);
+  const loadSessions = useCallback(async (refreshWorkflow = false, silent = false) => {
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     const baseParams = new URLSearchParams();
     if (refreshWorkflow) baseParams.set('refresh', '1');
 
@@ -1968,7 +2056,7 @@ function App() {
       ]);
       if (localResponse.status === 401 || recycleResponse.status === 401) {
         setAuthRequired(true);
-        setLoading(false);
+        if (!silent) setLoading(false);
         return;
       }
       if (!localResponse.ok) throw new Error(`HTTP ${localResponse.status}`);
@@ -1977,10 +2065,18 @@ function App() {
       const recyclePayload = (await recycleResponse.json()) as RecyclePayload;
       setAuthRequired(false);
       setAuthMessage(null);
-      setAllSessions(normalizeSessions(payload.sessions));
+      if (silent) {
+        const remoteMachines = new Set((payload.meta.remoteAgents ?? []).map((agent) => agent.id));
+        setAllSessions((current) => normalizeSessions([
+          ...payload.sessions,
+          ...current.filter((session) => remoteMachines.has(session.machineId)),
+        ]));
+      } else {
+        setAllSessions(normalizeSessions(payload.sessions));
+      }
       setRecycleArchives(recyclePayload.archives);
       setMeta(payload.meta);
-      setLoading(false);
+      if (!silent) setLoading(false);
       void refreshRemoteStatuses();
 
       if (!refreshWorkflow) {
@@ -1992,8 +2088,10 @@ function App() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '加载失败');
-      setLoading(false);
+      if (!silent) {
+        setError(err instanceof Error ? err.message : '加载失败');
+        setLoading(false);
+      }
     }
   }, [refreshRemoteStatuses]);
 
@@ -2425,6 +2523,20 @@ function App() {
   }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadFleetAudit, loadSessions]);
 
   useEffect(() => {
+    if (isTerminalOnlyPage || isFilesOnlyPage || authRequired) return;
+    let refreshing = false;
+    const refresh = () => {
+      if (document.hidden || refreshing) return;
+      refreshing = true;
+      void loadSessions(false, true).finally(() => { refreshing = false; });
+    };
+    const interval = window.setInterval(refresh, 20_000);
+    const onVisibility = () => { if (!document.hidden) refresh(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => { window.clearInterval(interval); document.removeEventListener('visibilitychange', onVisibility); };
+  }, [authRequired, isFilesOnlyPage, isTerminalOnlyPage, loadSessions]);
+
+  useEffect(() => {
     if (
       !terminalOnlySessionId ||
       !terminalOnlyMachineId ||
@@ -2467,14 +2579,6 @@ function App() {
       // Browser storage may be unavailable in private contexts.
     }
   }, [machineFilter]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(AGENT_FILTER_STORAGE_KEY, agentFilter);
-    } catch {
-      // Browser storage may be unavailable in private contexts.
-    }
-  }, [agentFilter]);
 
   useEffect(() => {
     if (!allSessions.length) return;
@@ -2545,6 +2649,13 @@ function App() {
       current.sessions.push(session);
       current.sortTime = Math.max(current.sortTime, group.sortTime);
       groups.set(key, current);
+    }
+    for (const group of groups.values()) {
+      if (listViewMode === 'activityDate') {
+        group.sessions.sort((a, b) =>
+          (Date.parse(b.updatedAt ?? b.startedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? a.startedAt ?? '') || 0)
+        );
+      }
     }
     return [...groups.values()].sort((a, b) =>
       listViewMode === 'activityDate'

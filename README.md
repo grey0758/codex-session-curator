@@ -326,6 +326,16 @@ loginctl enable-linger "$USER"
 
 The app works behind reverse proxies and tunnels as long as WebSocket forwarding is enabled for terminal sessions.
 
+The terminal page checks its WebSocket with a 15 second heartbeat, reconnects
+after a failed handshake, missing heartbeat, or 45 seconds without output after
+input, and reattaches to the same tmux session. Its **错误日志** button shows
+recent connection errors for that session. The server stores only timestamps,
+session identity, and error codes in
+`~/.local/state/codex-session-curator/terminal-errors.jsonl` (mode 0600);
+terminal input and output are never recorded there. The session list refreshes
+every 20 seconds while the page is visible and opens with Codex sessions sorted
+by activity date.
+
 Recommended local origin:
 
 ```text
