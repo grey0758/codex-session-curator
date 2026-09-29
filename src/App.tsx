@@ -3613,6 +3613,10 @@ function App() {
                   ? `检索失败：${aiSearchError}`
                   : aiSearchResult?.mode === 'deepseek'
                     ? `理解为“${aiSearchResult.intent}” · 机器 ${aiSearchResult.routing.machineIds.join('、') || '全部'} · ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
+                    : aiSearchResult?.fallbackReason === 'quota-exhausted'
+                      ? `DeepSeek 密钥额度已耗尽，增强本地索引返回 ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
+                    : aiSearchResult?.fallbackReason === 'rate-limited'
+                      ? `DeepSeek 请求过于频繁，增强本地索引返回 ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
                     : aiSearchResult?.routing.mode === 'deepseek'
                       ? `DeepSeek 已判断机器 ${aiSearchResult.routing.machineIds.join('、') || '全部'}；会话重排超时，增强索引返回 ${aiSearchResult.count} 条 · ${aiSearchResult.latencyMs}ms`
                       : `DeepSeek 暂不可用，增强本地索引返回 ${aiSearchResult?.count ?? 0} 条 · ${aiSearchResult?.latencyMs ?? 0}ms`}

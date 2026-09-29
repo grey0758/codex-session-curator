@@ -183,6 +183,14 @@ When the AI-search base URL or keys are omitted, the server reuses
 AI-search model can still be independently fixed to a faster DeepSeek model.
 The browser never receives these credentials.
 
+If search returns `fallback-local`, inspect `fallbackReason`. `quota-exhausted`
+means the upstream rejected the key with HTTP 429 `apikey_quota_exhausted`;
+restore its quota or replace `CURATOR_AI_SEARCH_API_KEYS` with a working key
+from the project's OpenBao record before restarting the active slot.
+`rate-limited` means another HTTP 429 response. Local results remain available
+in both cases. A fallback model sharing the exhausted key has the same quota
+and cannot restore AI search.
+
 Search uses one compact joint DeepSeek request to infer the likely source
 machine(s), understand the intent, generate semantic expansion terms, and
 rerank a balanced candidate set. Cross-machine safety candidates let the model

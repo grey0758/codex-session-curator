@@ -157,7 +157,7 @@ async function requestSearch(baseUrl: string, query: string) {
   };
 }
 
-async function runApiScenario(mode: 'rank' | 'timeout' | 'retry' | 'invalid-retry' | 'empty-retry') {
+async function runApiScenario(mode: 'rank' | 'timeout' | 'retry' | 'invalid-retry' | 'empty-retry' | 'quota-exhausted') {
   const testRoot = await mkdtemp(join(tmpdir(), `curator-ai-search-${mode}-`));
   const codexHome = join(testRoot, 'codex-home');
   const claudeHome = join(testRoot, 'claude-home');
@@ -231,6 +231,12 @@ async function runApiScenario(mode: 'rank' | 'timeout' | 'retry' | 'invalid-retr
     call.body = body;
     const messages = body.messages as Array<{ content?: string }>;
     const systemPrompt = messages[0]?.content ?? '';
+    if (mode === 'quota-exhausted') {
+      response.statusCode = 429;
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ error: { code: 'apikey_quota_exhausted', message: 'ApiKey已触发限额' } }));
+      return;
+    }
     if (systemPrompt.includes('意图规划器')) {
       const prompt = JSON.parse(messages[1]?.content ?? '{}') as {
         availableMachineIds?: string[];
@@ -493,6 +499,14 @@ test('DeepSeek timeout keeps an explicit registered-machine hint and returns enh
     `timeout fallback escaped its bounded deadline: ${payload.latencyMs}ms`,
   );
   assert.equal(new Set(payload.matches.map((match) => match.identity.key)).size, payload.matches.length);
+  assert.equal(deepSeekCalls.length, 1);
+});
+
+test('DeepSeek exhausted key reports the quota reason while retaining local matches', async () => {
+  const { payload, deepSeekCalls } = await runApiScenario('quota-exhausted');
+  assert.equal(payload.mode, 'fallback-local');
+  assert.equal(payload.fallbackReason, 'quota-exhausted');
+  assert.ok(payload.matches.length > 0);
   assert.equal(deepSeekCalls.length, 1);
 });
 

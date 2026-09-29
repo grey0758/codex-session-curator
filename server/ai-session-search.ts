@@ -72,6 +72,8 @@ export type AiSearchFailureCode =
   | 'not-configured'
   | 'not-deepseek'
   | 'timeout'
+  | 'quota-exhausted'
+  | 'rate-limited'
   | 'request-failed'
   | 'invalid-response';
 
@@ -556,6 +558,11 @@ async function requestDeepSeekJson(
       signal: controller.signal,
     });
     if (!response.ok) {
+      if (response.status === 429) {
+        const payload = await response.json().catch(() => null) as { error?: { code?: unknown } } | null;
+        const code = payload?.error?.code === 'apikey_quota_exhausted' ? 'quota-exhausted' : 'rate-limited';
+        throw new AiSearchUnavailableError(code, `DeepSeek fast search returned HTTP 429 (${code})`);
+      }
       throw new AiSearchUnavailableError('request-failed', `DeepSeek fast search returned HTTP ${response.status}`);
     }
 
