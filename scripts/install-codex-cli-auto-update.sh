@@ -3,7 +3,7 @@ set -euo pipefail
 
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ ${EUID} -ne 0 ]]; then
-  exec sudo -n -- "$0" "$@"
+  exec sudo -n bash "$0" "$@"
 fi
 
 case "${1:-}" in
