@@ -257,6 +257,9 @@ On sgp001, the installer excludes `grey` when the DR pinned-version file is
 present; the existing DR sync keeps that account at the gpl001 version.
 Other installed users on sgp001 are updated normally. Existing Codex processes
 continue with the binary version they started with until restarted.
+If the standalone installer cannot finish, the updater uses the official npm
+package in the same user's `~/.local` prefix so their active `codex` command
+still reaches the latest version.
 
 ## Production Topology
 

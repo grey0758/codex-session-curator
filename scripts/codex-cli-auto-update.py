@@ -79,21 +79,36 @@ def latest_npm_version() -> str:
     return version
 
 
+def install_npm(user: str, prefix: Path, version: str) -> bool:
+    result = run_as(user, ["npm", "install", "--global", "--prefix", str(prefix), f"@openai/codex@{version}"], timeout=900)
+    if result.returncode:
+        print(f"{user}: npm update failed (exit {result.returncode})", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def update(user: str, channel: str, prefix: Path, binary: Path, version: str, current: str | None) -> bool:
     if channel == "npm":
         if current == version:
             print(f"{user}: npm {prefix} already {version}", flush=True)
             return True
-        command = ["npm", "install", "--global", "--prefix", str(prefix), f"@openai/codex@{version}"]
+        if not install_npm(user, prefix, version):
+            return False
     else:
         # The standalone installer is the official update command and selects its own latest release.
         command = ["bash", "-o", "pipefail", "-c", f"curl -fsSL {INSTALLER_URL} | sh"]
-    result = run_as(user, command)
-    if result.returncode:
-        print(f"{user}: {channel} update failed (exit {result.returncode})", file=sys.stderr, flush=True)
-        return False
+        try:
+            result = run_as(user, command, timeout=420)
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is None or result.returncode:
+            print(f"{user}: standalone installer unavailable; trying official npm channel", flush=True)
+            npm_prefix = binary.parent.parent
+            if not install_npm(user, npm_prefix, version):
+                return False
+            channel = "npm fallback"
     after = installed_version(user, binary)
-    if not after or (channel == "npm" and after != version):
+    if not after or (channel != "standalone" and after != version):
         print(f"{user}: {channel} update did not install the expected version", file=sys.stderr, flush=True)
         return False
     print(f"{user}: {channel} {current or 'unknown'} -> {after}", flush=True)
