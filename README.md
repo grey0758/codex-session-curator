@@ -12,7 +12,7 @@ It is designed for people who use Codex heavily and end up with many saved sessi
 - Groups sessions by machine, project directory, or activity date.
 - Copies agent-specific resume commands such as `codex resume <session-id>` and `claude --resume <session-id>`.
 - Keeps parent conversations in normal lists and indexes while hiding Codex/Claude sub-agent threads using session lineage metadata.
-- Shows only the latest real user turns. The server warms recent sessions and caches parsed turns by file signature; the browser prefetches visible sessions, shows cached turns immediately, then revalidates with ETag. The selected session checks for new turns every 12 seconds while the tab is visible. Hub forwards conditional requests to remote workers.
+- Shows only the latest real user turns. The server warms recent sessions and caches parsed turns by file signature; the browser prefetches visible sessions, shows cached turns immediately, then revalidates with ETag. The selected session checks for new turns every 12 seconds while the tab is visible. Hub routes fully identified recent-conversation reads directly to the owning worker and forwards conditional requests.
 - Preserves user whitespace and folds whole injection records plus complete inline skill/environment blocks into optional context details.
 - Shows full session history on demand instead of loading every transcript into the panel.
 - Opens an xterm.js web terminal backed by `node-pty`, SSH, and tmux for continuing real Codex or Claude sessions.

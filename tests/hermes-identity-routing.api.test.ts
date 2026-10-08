@@ -430,6 +430,8 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
     );
     assert.equal(context.status, 200);
     assert.equal(context.payload.contextText, 'REMOTE_CONTEXT_MARKER');
+    const inventoryCallsBeforeRecent = remoteCalls.filter((call) => call.path === '/api/sessions').length;
+    remoteSessionInventoryAvailable = false;
     const recent = await request(
       baseUrl,
       `/api/sessions/${sessionId}/recent-user-messages?${identityQuery}`,
@@ -453,6 +455,8 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
     );
     assert.equal(unchangedRecent.status, 304);
     assert.equal(remoteCalls.filter((call) => call.path.endsWith('/recent-user-messages')).at(-1)?.ifNoneMatch, '"remote-recent-v1"');
+    assert.equal(remoteCalls.filter((call) => call.path === '/api/sessions').length, inventoryCallsBeforeRecent);
+    remoteSessionInventoryAvailable = true;
 
     const recentCallsBeforeFence = remoteCalls.filter(
       (call) => call.path.endsWith('/recent-user-messages'),

@@ -5486,16 +5486,25 @@ app.get('/api/sessions/:id/recent-user-messages', async (request, reply) => {
       remote: z.enum(['0', '1', 'true', 'false']).optional(),
     })
     .parse(request.query);
-  let routed: Awaited<ReturnType<typeof findRoutableSession>>;
-  try {
-    const includeRemote = query.remote !== '0' && query.remote !== 'false';
-    routed = await findRoutableSession(params.id, query.machineId, query.agent, includeRemote);
-  } catch (error) {
-    return sendSessionRoutingError(reply, error, 'Recent conversation lookup failed');
+  const includeRemote = query.remote !== '0' && query.remote !== 'false';
+  // A complete machine/agent identity is enough for this read-only route.
+  // The worker verifies the session ID locally, so avoid fetching its entire
+  // inventory on every revalidation poll.
+  const directRemoteAgent = includeRemote && query.machineId && query.agent &&
+    query.machineId !== service.getMeta().machineId
+    ? remoteAgents.find((agent) => agent.id === query.machineId)
+    : undefined;
+  let routed: Awaited<ReturnType<typeof findRoutableSession>> = null;
+  if (!directRemoteAgent) {
+    try {
+      routed = await findRoutableSession(params.id, query.machineId, query.agent, includeRemote);
+    } catch (error) {
+      return sendSessionRoutingError(reply, error, 'Recent conversation lookup failed');
+    }
+    if (!routed) return reply.code(404).send({ error: 'Session not found' });
   }
-  if (!routed) return reply.code(404).send({ error: 'Session not found' });
 
-  if (routed.kind === 'local') {
+  if (routed?.kind === 'local') {
     try {
       const version = await stat(routed.session.filePath);
       const etag = `"${version.size.toString(16)}-${Math.floor(version.mtimeMs).toString(16)}-${query.limit ?? 4}"`;
@@ -5512,14 +5521,16 @@ app.get('/api/sessions/:id/recent-user-messages', async (request, reply) => {
     }
   }
 
-  const remoteAgent = remoteAgents.find((agent) => agent.id === routed.session.machineId);
-  if (!remoteAgent) {
-    return reply.code(404).send({ error: `Remote machine not configured: ${routed.session.machineId}` });
+  const remoteAgent = directRemoteAgent ?? remoteAgents.find((agent) => agent.id === routed?.session.machineId);
+  const machineId = directRemoteAgent?.id ?? routed?.session.machineId;
+  const agent = query.agent ?? routed?.session.agent;
+  if (!remoteAgent || !machineId || !agent) {
+    return reply.code(404).send({ error: `Remote machine not configured: ${query.machineId ?? routed?.session.machineId}` });
   }
   const remoteQuery = new URLSearchParams({
     limit: String(query.limit ?? 4),
-    machineId: routed.session.machineId,
-    agent: routed.session.agent,
+    machineId,
+    agent,
     remote: '0',
   });
   try {
