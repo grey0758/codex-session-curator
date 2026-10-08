@@ -673,10 +673,11 @@ async function main() {
       expansionAfter.fullHeight &&
       actionMessageBeforeSwitch.length > 0 &&
       actionMessageCleared &&
-      transitionRecent.busy &&
       transitionRecent.selectedRows.length === 1 &&
       transitionRecent.selectedRows[0].sessionId === secondCandidate.sessionId &&
-      transitionRecent.messages.length === 0 &&
+      (transitionRecent.busy
+        ? transitionRecent.messages.length === 0
+        : JSON.stringify(transitionRecent.messages) === JSON.stringify(secondCandidate.messages)) &&
       secondRecent.messages.length >= 1 &&
       secondRecent.messages.length <= 4 &&
       secondRecent.selectedRows.length === 1 &&

@@ -383,6 +383,47 @@ interface RecentUserMessagesState {
 
 const recentUserMessageCache = new Map<string, RecentUserMessagesPayload>();
 const recentUserMessageRequests = new Map<string, Promise<RecentUserMessagesPayload>>();
+const recentUserMessageEtags = new Map<string, string>();
+
+function fetchRecentUserMessages(session: CodexSession): Promise<RecentUserMessagesPayload> {
+  const key = sessionKey(session);
+  const inFlight = recentUserMessageRequests.get(key);
+  if (inFlight) return inFlight;
+  const params = new URLSearchParams({ limit: '4', machineId: session.machineId, agent: session.agent });
+  const url = `/api/sessions/${encodeURIComponent(session.id)}/recent-user-messages?${params}`;
+  const etag = recentUserMessageEtags.get(key);
+  const request = fetch(url, { cache: 'no-cache', headers: etag ? { 'If-None-Match': etag } : {} })
+    .then(async (response) => {
+      if (response.status === 304) {
+        const cached = recentUserMessageCache.get(key);
+        if (cached) return cached;
+        recentUserMessageEtags.delete(key);
+        const retry = await fetch(url, { cache: 'no-cache' });
+        if (!retry.ok) throw new Error(`HTTP ${retry.status}`);
+        const payload = await retry.json() as RecentUserMessagesPayload;
+        const freshEtag = retry.headers.get('ETag');
+        if (freshEtag) recentUserMessageEtags.set(key, freshEtag);
+        recentUserMessageCache.set(key, payload);
+        return payload;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json() as RecentUserMessagesPayload;
+      const freshEtag = response.headers.get('ETag');
+      if (freshEtag) recentUserMessageEtags.set(key, freshEtag);
+      recentUserMessageCache.delete(key);
+      recentUserMessageCache.set(key, payload);
+      while (recentUserMessageCache.size > 64) {
+        const oldestKey = recentUserMessageCache.keys().next().value;
+        if (typeof oldestKey !== 'string') break;
+        recentUserMessageCache.delete(oldestKey);
+        recentUserMessageEtags.delete(oldestKey);
+      }
+      return payload;
+    })
+    .finally(() => { recentUserMessageRequests.delete(key); });
+  recentUserMessageRequests.set(key, request);
+  return request;
+}
 
 interface CodexWorkerGuidance {
   at?: string | null;
@@ -3039,20 +3080,9 @@ function App() {
       return () => window.clearTimeout(resetHandle);
     }
 
-    const sessionId = selectedSummary.id;
     const selectedKey = sessionKey(selectedSummary);
-    const cacheKey = [
-      selectedKey,
-      selectedSummary.updatedAt ?? '',
-      selectedSummary.messageCount,
-    ].join('|||');
-    const params = new URLSearchParams({
-      limit: '4',
-      machineId: selectedSummary.machineId,
-      agent: selectedSummary.agent,
-    });
     let cancelled = false;
-    const cached = recentUserMessageCache.get(cacheKey);
+    const cached = recentUserMessageCache.get(selectedKey);
     const loadingHandle = window.setTimeout(() => {
       if (cancelled) return;
       if (cached) {
@@ -3067,31 +3097,7 @@ function App() {
       }
     }, 0);
 
-    let request = recentUserMessageRequests.get(cacheKey);
-    if (!request) {
-      request = fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/recent-user-messages?${params.toString()}`,
-      )
-      .then((payload) => {
-        if (!payload.ok) throw new Error(`HTTP ${payload.status}`);
-        return payload.json() as Promise<RecentUserMessagesPayload>;
-      })
-      .then((payload) => {
-        recentUserMessageCache.set(cacheKey, payload);
-        while (recentUserMessageCache.size > 64) {
-          const oldestKey = recentUserMessageCache.keys().next().value;
-          if (typeof oldestKey !== 'string') break;
-          recentUserMessageCache.delete(oldestKey);
-        }
-        return payload;
-      })
-      .finally(() => {
-        recentUserMessageRequests.delete(cacheKey);
-      });
-      recentUserMessageRequests.set(cacheKey, request);
-    }
-
-    void request
+    void fetchRecentUserMessages(selectedSummary)
       .then((payload) => {
         if (cancelled) return;
         window.clearTimeout(loadingHandle);
@@ -3101,7 +3107,7 @@ function App() {
       .catch(() => {
         if (cancelled) return;
         window.clearTimeout(loadingHandle);
-        setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: false, error: true });
+        setRecentUserMessages({ sessionKey: selectedKey, messages: cached ? [...cached.messages].reverse() : [], loading: false, error: !cached });
       });
 
     return () => {
@@ -3109,6 +3115,43 @@ function App() {
       window.clearTimeout(loadingHandle);
     };
   }, [activeTab, isTerminalOnlyPage, selectedSummary]);
+
+  useEffect(() => {
+    if (isTerminalOnlyPage || isFilesOnlyPage || activeTab === 'recycle' || !selectedSummary) return;
+    const selectedKey = sessionKey(selectedSummary);
+    let cancelled = false;
+    const refresh = () => {
+      if (document.hidden) return;
+      const previous = recentUserMessageCache.get(selectedKey);
+      void fetchRecentUserMessages(selectedSummary).then((payload) => {
+        if (cancelled || payload === previous) return;
+        setRecentUserMessages({ sessionKey: selectedKey, messages: [...payload.messages].reverse(), loading: false, error: false });
+      }).catch(() => {});
+    };
+    const interval = window.setInterval(refresh, 12_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [activeTab, isFilesOnlyPage, isTerminalOnlyPage, selectedSummary]);
+
+  useEffect(() => {
+    if (isTerminalOnlyPage || isFilesOnlyPage || activeTab === 'recycle' || !allSessions.length) return;
+    let cancelled = false;
+    const candidates = [...allSessions]
+      .sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0))
+      .filter((session) => session.agent === agentFilter && (machineFilter === 'all' || session.machineId === machineFilter))
+      .slice(0, 6);
+    const handle = window.setTimeout(() => {
+      let next = 0;
+      const warm = async () => {
+        while (!cancelled && next < candidates.length) {
+          const session = candidates[next++];
+          if (recentUserMessageCache.has(sessionKey(session))) continue;
+          await fetchRecentUserMessages(session).catch(() => undefined);
+        }
+      };
+      void Promise.all([warm(), warm()]);
+    }, 250);
+    return () => { cancelled = true; window.clearTimeout(handle); };
+  }, [activeTab, agentFilter, allSessions, isFilesOnlyPage, isTerminalOnlyPage, machineFilter]);
 
   useEffect(() => {
     if (!selectedSummary || activeTab === 'recycle') return;

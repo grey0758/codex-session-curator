@@ -25,6 +25,7 @@ import {
   deleteAgentJson,
   deleteAgentSession,
   fetchAgentJson,
+  fetchAgentResponse,
   fetchAgentSessions,
   getRemoteAgents,
   hasPendingHubEvaluation,
@@ -2346,6 +2347,20 @@ async function getLocalSessionsCached(refreshWorkflow: boolean, fast: boolean) {
       });
   }
   return cache.promise;
+}
+
+function warmRecentConversations(sessions: Awaited<ReturnType<SessionService['listSessions']>>): void {
+  const newest = [...sessions]
+    .sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0))
+    .slice(0, 6);
+  let next = 0;
+  const warm = async () => {
+    while (next < newest.length) {
+      const session = newest[next++];
+      await service.getRecentUserMessages(session.filePath, 4).catch(() => undefined);
+    }
+  };
+  void Promise.all([warm(), warm()]);
 }
 
 class SessionRoutingError extends Error {
@@ -5482,11 +5497,13 @@ app.get('/api/sessions/:id/recent-user-messages', async (request, reply) => {
 
   if (routed.kind === 'local') {
     try {
-      const payload = await service.getRecentUserMessages(routed.session.filePath, query.limit ?? 4);
-      const etag = `"${payload.fileSize.toString(16)}-${Math.floor(payload.fileMtimeMs).toString(16)}-${query.limit ?? 4}"`;
+      const version = await stat(routed.session.filePath);
+      const etag = `"${version.size.toString(16)}-${Math.floor(version.mtimeMs).toString(16)}-${query.limit ?? 4}"`;
       reply.header('Cache-Control', 'private, no-cache');
       reply.header('ETag', etag);
       if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+      const payload = await service.getRecentUserMessages(routed.session.filePath, query.limit ?? 4);
+      reply.header('ETag', `"${payload.fileSize.toString(16)}-${Math.floor(payload.fileMtimeMs).toString(16)}-${query.limit ?? 4}"`);
       return payload;
     } catch (error) {
       return reply.code(404).send({
@@ -5506,10 +5523,18 @@ app.get('/api/sessions/:id/recent-user-messages', async (request, reply) => {
     remote: '0',
   });
   try {
-    return await fetchAgentJson(
+    const ifNoneMatch = request.headers['if-none-match'];
+    const response = await fetchAgentResponse(
       remoteAgent,
       `/api/sessions/${encodeURIComponent(params.id)}/recent-user-messages?${remoteQuery.toString()}`,
+      typeof ifNoneMatch === 'string' ? { 'If-None-Match': ifNoneMatch } : {},
     );
+    reply.header('Cache-Control', 'private, no-cache');
+    const etag = response.headers.get('ETag');
+    if (etag) reply.header('ETag', etag);
+    if (response.status === 304) return reply.code(304).send();
+    if (!response.ok) throw new Error(`Remote worker HTTP ${response.status}`);
+    return await response.json();
   } catch (error) {
     return reply.code(404).send({
       error: error instanceof Error ? error.message : 'Recent conversation failed',
@@ -5969,7 +5994,9 @@ const port = Number(process.env.PORT || 54177);
 await app.listen({ host, port });
 app.log.info({ role: curatorRole, capabilities: curatorCapabilities }, `Codex Session Curator listening on http://${host}:${port}`);
 setTimeout(() => {
-  const warmups: Promise<unknown>[] = [getLocalSessionsCached(false, true)];
+  const warmups: Promise<unknown>[] = [getLocalSessionsCached(false, true).then((sessions) => {
+    warmRecentConversations(sessions);
+  })];
   if (curatorRole === 'hub') warmups.push(getRemoteSessionsCached());
   void Promise.all(warmups)
     .then(() => app.log.info({ role: curatorRole }, 'Session list caches warmed'))

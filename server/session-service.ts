@@ -552,7 +552,7 @@ export function resumeCommandForSession(agent: AgentKind, sessionId: string, own
 export function wrapResumeCommandForOwner(command: string, ownerUser: string): string {
   const primaryUser = SESSION_ROOTS[0]?.ownerUser;
   if (!ownerUser || !command || ownerUser === primaryUser) return command;
-  return `sudo -u ${ownerUser} -H bash -lc ${shellQuote(command)}`;
+  return `sudo -iu ${shellQuote(ownerUser)} bash -lc ${shellQuote(command)}`;
 }
 
 function shellQuote(value: string): string {

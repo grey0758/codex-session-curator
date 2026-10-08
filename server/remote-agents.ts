@@ -261,6 +261,18 @@ export async function fetchAgentJson<T>(agent: RemoteAgent, path: string): Promi
   );
 }
 
+export async function fetchAgentResponse(
+  agent: RemoteAgent,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<Response> {
+  return fetchWithTimeout(
+    remoteUrl(agent, path),
+    timeoutMs('CURATOR_REMOTE_JSON_TIMEOUT_MS', DEFAULT_REMOTE_JSON_TIMEOUT_MS),
+    { headers: remoteHeaders(agent, headers) },
+  );
+}
+
 export async function postAgentJson<T>(agent: RemoteAgent, path: string, body: unknown): Promise<T> {
   const response = await fetchWithTimeout(
     remoteUrl(agent, path),

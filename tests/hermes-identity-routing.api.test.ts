@@ -158,7 +158,7 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
   const uniqueSessionFile = join(sessionsDir, `${uniqueSessionId}.jsonl`);
   const now = new Date().toISOString();
   const remoteSession = remoteSessionFixture(sessionId, now);
-  const remoteCalls: Array<{ method: string; path: string; query: string; body: JsonRecord | null }> = [];
+  const remoteCalls: Array<{ method: string; path: string; query: string; body: JsonRecord | null; ifNoneMatch?: string }> = [];
   let remoteSessionInventoryAvailable = true;
 
   const remoteServer = createServer(async (incoming, response) => {
@@ -171,6 +171,7 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
       path: url.pathname,
       query: url.search,
       body,
+      ifNoneMatch: incoming.headers['if-none-match'],
     });
     response.setHeader('content-type', 'application/json');
 
@@ -191,6 +192,12 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
       incoming.method === 'GET' &&
       url.pathname === `/api/sessions/${sessionId}/recent-user-messages`
     ) {
+      response.setHeader('ETag', '"remote-recent-v1"');
+      if (incoming.headers['if-none-match'] === '"remote-recent-v1"') {
+        response.statusCode = 304;
+        response.end();
+        return;
+      }
       response.end(JSON.stringify({
         messages: [{
           index: 0,
@@ -439,6 +446,13 @@ test('Hermes composite identity fails closed for duplicate raw IDs and routes ex
     assert.equal(forwardedRecentQuery.get('machineId'), 'sgp001');
     assert.equal(forwardedRecentQuery.get('agent'), 'claude');
     assert.equal(forwardedRecentQuery.get('remote'), '0');
+    const unchangedRecent = await request(
+      baseUrl,
+      `/api/sessions/${sessionId}/recent-user-messages?${identityQuery}`,
+      { headers: { 'If-None-Match': '"remote-recent-v1"' } },
+    );
+    assert.equal(unchangedRecent.status, 304);
+    assert.equal(remoteCalls.filter((call) => call.path.endsWith('/recent-user-messages')).at(-1)?.ifNoneMatch, '"remote-recent-v1"');
 
     const recentCallsBeforeFence = remoteCalls.filter(
       (call) => call.path.endsWith('/recent-user-messages'),

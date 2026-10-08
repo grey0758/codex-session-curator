@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -203,7 +203,7 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
       hiddenContextMessages: number;
       cached: boolean;
     }>(baseUrl, `/api/sessions/${codexSessionId}/recent-user-messages?limit=4`);
-    assert.equal(recent.cached, false);
+    assert.equal(typeof recent.cached, 'boolean');
     assert.equal(recent.totalUserMessages, 2);
     assert.equal(recent.hiddenContextMessages, 1);
     assert.equal(recent.messages.at(-1)?.text, 'CODEX_WORKER_RECENT\nSECOND_LINE');
@@ -213,6 +213,12 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
       `/api/sessions/${codexSessionId}/recent-user-messages?limit=4`,
     );
     assert.equal(recentCached.cached, true);
+    const recentUrl = `${baseUrl}/api/sessions/${codexSessionId}/recent-user-messages?limit=4`;
+    const firstResponse = await fetch(recentUrl);
+    const etag = firstResponse.headers.get('etag');
+    assert.ok(etag);
+    const unchanged = await fetch(recentUrl, { headers: { 'If-None-Match': etag } });
+    assert.equal(unchanged.status, 304);
     await requestJson<JsonRecord>(baseUrl, '/api/hermes/jobs');
     await requestJson<JsonRecord>(baseUrl, '/api/recycle-bin?remote=0');
     const audit = await requestJson<{ counts: JsonRecord; issues: JsonRecord[]; pending: JsonRecord[]; skipped: JsonRecord[] }>(baseUrl, '/api/audit/completeness');
@@ -259,6 +265,15 @@ test('worker role indexes Codex and Claude locally while Hub-only APIs and front
       state.evaluations[`codex|||${codexSubagentSessionId}`].title,
       'STALE_SUBAGENT_INDEX',
     );
+    await appendFile(codexSessionPath, `${JSON.stringify({
+      type: 'response_item',
+      timestamp: new Date().toISOString(),
+      payload: { role: 'user', content: 'LATEST_AFTER_CACHE' },
+    })}\n`);
+    const refreshed = await fetch(recentUrl, { headers: { 'If-None-Match': etag } });
+    assert.equal(refreshed.status, 200);
+    const latest = await refreshed.json() as { messages: Array<{ text: string }> };
+    assert.equal(latest.messages.at(-1)?.text, 'LATEST_AFTER_CACHE');
   } finally {
     if (worker) await stopServer(worker);
     await rm(testRoot, { recursive: true, force: true });
