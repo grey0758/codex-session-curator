@@ -1,0 +1,11 @@
+[Unit]
+Description=Update official Codex CLI for every installed local user
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/codex-cli-auto-update
+ExecStart=/usr/local/libexec/codex-cli-auto-update
+TimeoutStartSec=45min
+

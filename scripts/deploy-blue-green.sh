@@ -545,6 +545,9 @@ deploy() {
   systemctl --user disable "$APP_NAME-slot@$old_slot.service" >/dev/null 2>&1 || true
 
   prune_releases
+  if [[ -f "$SOURCE_DIR/scripts/install-codex-cli-auto-update.sh" ]]; then
+    bash "$SOURCE_DIR/scripts/install-codex-cli-auto-update.sh"
+  fi
   status
 }
 

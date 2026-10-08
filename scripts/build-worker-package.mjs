@@ -23,6 +23,12 @@ await cp(join(repoRoot, 'worker', 'worker.env.example'), join(outputDir, 'worker
 await cp(join(repoRoot, 'worker', 'client.env.example'), join(outputDir, 'client.env.example'));
 await cp(join(repoRoot, 'control-plane', 'bin', 'curator'), join(outputDir, 'bin', 'curator'));
 await chmod(join(outputDir, 'bin', 'curator'), 0o755);
+await mkdir(join(outputDir, 'scripts'), { recursive: true });
+await mkdir(join(outputDir, 'deploy'), { recursive: true });
+await cp(join(repoRoot, 'scripts', 'codex-cli-auto-update.py'), join(outputDir, 'scripts', 'codex-cli-auto-update.py'));
+await cp(join(repoRoot, 'scripts', 'install-codex-cli-auto-update.sh'), join(outputDir, 'scripts', 'install-codex-cli-auto-update.sh'));
+await cp(join(repoRoot, 'deploy', 'codex-cli-auto-update.service'), join(outputDir, 'deploy', 'codex-cli-auto-update.service'));
+await cp(join(repoRoot, 'deploy', 'codex-cli-auto-update.timer'), join(outputDir, 'deploy', 'codex-cli-auto-update.timer'));
 
 const sourcePackage = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
 await writeFile(

@@ -239,6 +239,25 @@ The artifact contains backend runtime code plus `bin/curator`. It intentionally
 omits React/Vite assets, the full control-plane workspace, the evaluator,
 knowledge storage, and frontend dependencies. See [docs/thin-worker.md](docs/thin-worker.md).
 
+### Codex CLI updates for host users
+
+Hub deployments install the system `codex-cli-auto-update.timer`. Thin-worker
+deployments should run `sudo bash scripts/install-codex-cli-auto-update.sh`
+from the worker artifact after switching its release. The timer checks daily,
+with up to one hour of jitter, for official Codex CLI updates for every local
+login user who already has Codex installed. It updates each npm installation
+under its existing user prefix, and standalone installations through the
+[official Linux installer](https://learn.chatgpt.com/docs/codex/cli). It does
+not install Codex for users who lack it. Inspect discovery with
+`sudo /usr/local/libexec/codex-cli-auto-update --dry-run`, run an immediate
+check with `sudo systemctl start codex-cli-auto-update.service`, and inspect
+results with `journalctl -u codex-cli-auto-update.service --no-pager`.
+
+On sgp001, the installer excludes `grey` when the DR pinned-version file is
+present; the existing DR sync keeps that account at the gpl001 version.
+Other installed users on sgp001 are updated normally. Existing Codex processes
+continue with the binary version they started with until restarted.
+
 ## Production Topology
 
 The deployed Curator service uses an explicit active-passive topology. `gpl001`
