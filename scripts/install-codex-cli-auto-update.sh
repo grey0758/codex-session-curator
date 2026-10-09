@@ -25,5 +25,6 @@ install -Dm755 "$source_dir/scripts/codex-cli-auto-update.py" /usr/local/libexec
 install -Dm644 "$source_dir/deploy/codex-cli-auto-update.service" /etc/systemd/system/codex-cli-auto-update.service
 install -Dm644 "$source_dir/deploy/codex-cli-auto-update.timer" /etc/systemd/system/codex-cli-auto-update.timer
 systemctl daemon-reload
-systemctl enable --now codex-cli-auto-update.timer
+systemctl enable codex-cli-auto-update.timer
+systemctl restart codex-cli-auto-update.timer
 /usr/local/libexec/codex-cli-auto-update --dry-run

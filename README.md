@@ -243,8 +243,8 @@ knowledge storage, and frontend dependencies. See [docs/thin-worker.md](docs/thi
 
 Hub deployments install the system `codex-cli-auto-update.timer`. Thin-worker
 deployments should run `sudo bash scripts/install-codex-cli-auto-update.sh`
-from the worker artifact after switching its release. The timer checks daily,
-with up to one hour of jitter, for official Codex CLI updates for every local
+from the worker artifact after switching its release. The timer checks hourly,
+with up to five minutes of jitter, for official Codex CLI updates for every local
 login user who already has Codex installed. It updates each npm installation
 under its existing user prefix, and standalone installations through the
 [official Linux installer](https://learn.chatgpt.com/docs/codex/cli). It does
