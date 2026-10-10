@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Bell, CheckCheck, Clock3, Copy, Loader2, RefreshCw, Search, Sparkles, Terminal, Undo2 } from 'lucide-react';
+import { RecentUserMessages } from './RecentUserMessages';
+import { sessionKey } from './RecentUserMessagesData';
 import { terminalPageUrl } from './session-files-routing';
 import './FollowUpPage.css';
 
@@ -173,7 +175,7 @@ export function FollowUpPage({ onUnauthorized }: { onUnauthorized: () => void })
           {!payload ? <div className="followup-empty"><Loader2 size={20} className="spin" /> 正在加载提醒</div> : null}
           {payload && !items.length ? <div className="followup-empty">{payload.scanning ? '正在生成提醒，请稍候…' : '当前没有匹配的提醒。新会话结束后会自动检查。'}</div> : null}
           {items.map((item) => (
-            <button key={item.key} type="button" className={`followup-row${selected?.key === item.key ? ' selected' : ''}`} onClick={() => setSelectedKey(item.key)}>
+            <button key={item.key} type="button" className={`followup-row${selected?.key === item.key ? ' selected' : ''}`} data-session-id={item.sessionId} data-machine-id={item.machineId} data-agent={item.agent} onClick={() => setSelectedKey(item.key)}>
               <span className="followup-row-top"><strong>{item.title}</strong><time>{formatTime(item.endedAt)}</time></span>
               <span className="followup-row-summary">{item.previousTaskSummary}</span>
               <span className="followup-row-meta"><i className={`followup-dot ${item.priority}`} /> {item.machineId} · {item.agent === 'codex' ? 'Codex' : 'Claude'}{item.dismissedAt ? ' · 已处理' : !item.needsFollowUp ? ' · 无待办' : ''}</span>
@@ -194,6 +196,13 @@ export function FollowUpPage({ onUnauthorized }: { onUnauthorized: () => void })
             <span>{selected.machineId} · {selected.ownerUser} · {selected.agent}</span>
             {selected.cwd ? <code>{selected.cwd}</code> : null}
           </div>
+          <section className="followup-card followup-recent-card">
+            <p className="followup-kicker">原会话</p><h3>最近对话</h3>
+            <RecentUserMessages
+              key={sessionKey({ id: selected.sessionId, machineId: selected.machineId, agent: selected.agent })}
+              session={{ id: selected.sessionId, machineId: selected.machineId, agent: selected.agent }}
+            />
+          </section>
           <article className="followup-card"><p className="followup-kicker">上一个任务</p><h3>这次会话做了什么</h3><p>{selected.previousTaskSummary}</p></article>
           <article className="followup-card"><p className="followup-kicker">跟进判断</p><h3>{selected.needsFollowUp ? '建议继续跟进' : '暂时无需跟进'}</h3><p>{selected.reason}</p></article>
           <article className="followup-card followup-prompt-card">

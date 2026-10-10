@@ -34,6 +34,9 @@ import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './App.css';
 import { FollowUpPage } from './FollowUpPage';
+import { RecentUserMessages } from './RecentUserMessages';
+import { fetchRecentUserMessages, getCachedRecentUserMessages, sessionKey } from './RecentUserMessagesData';
+import type { HistoryMessage } from './RecentUserMessagesData';
 import {
   filesPageUrl,
   readFilesPageRoute,
@@ -344,87 +347,11 @@ function normalizeSessions(sessions: unknown): CodexSession[] {
   return Array.isArray(sessions) ? sessions.map(normalizeSession) : [];
 }
 
-interface HistoryMessage {
-  index: number;
-  role: 'user' | 'assistant';
-  text: string;
-  timestamp: string | null;
-  injectedContext?: InjectedContextBlock | null;
-  precedingContext?: InjectedContextBlock[];
-}
-
-interface InjectedContextBlock {
-  kind: 'agents_instructions' | 'environment_context' | 'skill';
-  label: string;
-  text: string;
-  characterCount: number;
-}
-
 interface HistoryPayload {
   messages: HistoryMessage[];
   nextBefore: number | null;
   hasMore: boolean;
   totalMessages?: number;
-}
-
-interface RecentUserMessagesPayload {
-  messages: HistoryMessage[];
-  totalUserMessages: number;
-  hiddenContextMessages: number;
-  fileSize: number;
-  fileMtimeMs: number;
-  cached: boolean;
-}
-
-interface RecentUserMessagesState {
-  sessionKey: string | null;
-  messages: HistoryMessage[];
-  loading: boolean;
-  error: boolean;
-}
-
-const recentUserMessageCache = new Map<string, RecentUserMessagesPayload>();
-const recentUserMessageRequests = new Map<string, Promise<RecentUserMessagesPayload>>();
-const recentUserMessageEtags = new Map<string, string>();
-
-function fetchRecentUserMessages(session: CodexSession): Promise<RecentUserMessagesPayload> {
-  const key = sessionKey(session);
-  const inFlight = recentUserMessageRequests.get(key);
-  if (inFlight) return inFlight;
-  const params = new URLSearchParams({ limit: '4', machineId: session.machineId, agent: session.agent });
-  const url = `/api/sessions/${encodeURIComponent(session.id)}/recent-user-messages?${params}`;
-  const etag = recentUserMessageEtags.get(key);
-  const request = fetch(url, { cache: 'no-cache', headers: etag ? { 'If-None-Match': etag } : {} })
-    .then(async (response) => {
-      if (response.status === 304) {
-        const cached = recentUserMessageCache.get(key);
-        if (cached) return cached;
-        recentUserMessageEtags.delete(key);
-        const retry = await fetch(url, { cache: 'no-cache' });
-        if (!retry.ok) throw new Error(`HTTP ${retry.status}`);
-        const payload = await retry.json() as RecentUserMessagesPayload;
-        const freshEtag = retry.headers.get('ETag');
-        if (freshEtag) recentUserMessageEtags.set(key, freshEtag);
-        recentUserMessageCache.set(key, payload);
-        return payload;
-      }
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = await response.json() as RecentUserMessagesPayload;
-      const freshEtag = response.headers.get('ETag');
-      if (freshEtag) recentUserMessageEtags.set(key, freshEtag);
-      recentUserMessageCache.delete(key);
-      recentUserMessageCache.set(key, payload);
-      while (recentUserMessageCache.size > 64) {
-        const oldestKey = recentUserMessageCache.keys().next().value;
-        if (typeof oldestKey !== 'string') break;
-        recentUserMessageCache.delete(oldestKey);
-        recentUserMessageEtags.delete(oldestKey);
-      }
-      return payload;
-    })
-    .finally(() => { recentUserMessageRequests.delete(key); });
-  recentUserMessageRequests.set(key, request);
-  return request;
 }
 
 interface CodexWorkerGuidance {
@@ -881,73 +808,6 @@ function formatDate(value: string | null): string {
   }).format(date);
 }
 
-function RecentUserMessageCard({ sessionId, message }: { sessionId: string; message: HistoryMessage }) {
-  const textRef = useRef<HTMLParagraphElement>(null);
-  const [expanded, setExpanded] = useState(false);
-  const [canExpand, setCanExpand] = useState(message.text.length > 240);
-
-  useEffect(() => {
-    if (expanded || !textRef.current) return;
-    const element = textRef.current;
-    let frame = 0;
-    const measure = () => {
-      window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        setCanExpand(message.text.length > 240 || element.scrollHeight > element.clientHeight + 1);
-      });
-    };
-    measure();
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
-    observer?.observe(element);
-    return () => {
-      observer?.disconnect();
-      window.cancelAnimationFrame(frame);
-    };
-  }, [expanded, message.text]);
-
-  return (
-    <article
-      className={expanded ? 'expanded' : undefined}
-      data-recent-user-message
-      data-role="user"
-      data-session-id={sessionId}
-    >
-      <span>用户发送</span>
-      <p className="recent-message-text" ref={textRef}>{message.text}</p>
-      {message.precedingContext?.length ? (
-        <details className="recent-context-details">
-          <summary>
-            <FileText size={14} />
-            系统上下文 ({message.precedingContext.length})
-          </summary>
-          <div className="recent-context-content">
-            {message.precedingContext.map((context, index) => (
-              <section key={`${context.kind}:${index}`}>
-                <strong>{context.label}</strong>
-                <pre>{context.text}</pre>
-              </section>
-            ))}
-          </div>
-        </details>
-      ) : null}
-      <div className="recent-message-footer">
-        {message.timestamp ? <em>{formatDate(message.timestamp)}</em> : <span />}
-        {canExpand ? (
-          <button
-            type="button"
-            className="recent-message-toggle"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((current) => !current)}
-          >
-            <ChevronDown size={15} />
-            {expanded ? '收起' : '展开'}
-          </button>
-        ) : null}
-      </div>
-    </article>
-  );
-}
-
 function previewText(message: SessionMessagePreview | null, fallback = '暂无记录'): string {
   const text = message?.text.replace(/\s+/g, ' ').trim();
   if (!text) return fallback;
@@ -1110,10 +970,6 @@ function statusLabel(status: string | null | undefined): string {
 
 function machineKey(machineId: string | null | undefined, baseUrl: string | null | undefined): string {
   return `${machineId || 'unknown'}|||${baseUrl || 'local'}`;
-}
-
-function sessionKey(session: Pick<CodexSession, 'id' | 'agent' | 'machineId'>): string {
-  return `${session.machineId || 'unknown'}|||${session.agent}|||${session.id}`;
 }
 
 function LoginPanel({ busy, message, onLogin }: LoginPanelProps) {
@@ -1983,12 +1839,6 @@ function App() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadedSessionKey, setHistoryLoadedSessionKey] = useState<string | null>(null);
-  const [recentUserMessages, setRecentUserMessages] = useState<RecentUserMessagesState>({
-    sessionKey: null,
-    messages: [],
-    loading: false,
-    error: false,
-  });
   const [recycleQuery, setRecycleQuery] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
   const handleFollowUpUnauthorized = useCallback(() => setAuthRequired(true), []);
@@ -3101,66 +2951,6 @@ function App() {
   }, [activeTab, selectedIdentityKey]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || activeTab === 'recycle' || !selectedSummary?.id) {
-      const resetHandle = window.setTimeout(() => {
-        setRecentUserMessages({ sessionKey: null, messages: [], loading: false, error: false });
-      }, 0);
-      return () => window.clearTimeout(resetHandle);
-    }
-
-    const selectedKey = sessionKey(selectedSummary);
-    let cancelled = false;
-    const cached = recentUserMessageCache.get(selectedKey);
-    const loadingHandle = window.setTimeout(() => {
-      if (cancelled) return;
-      if (cached) {
-        setRecentUserMessages({
-          sessionKey: selectedKey,
-          messages: [...cached.messages].reverse(),
-          loading: false,
-          error: false,
-        });
-      } else {
-        setRecentUserMessages({ sessionKey: selectedKey, messages: [], loading: true, error: false });
-      }
-    }, 0);
-
-    void fetchRecentUserMessages(selectedSummary)
-      .then((payload) => {
-        if (cancelled) return;
-        window.clearTimeout(loadingHandle);
-        const messages = [...payload.messages].reverse();
-        setRecentUserMessages({ sessionKey: selectedKey, messages, loading: false, error: false });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        window.clearTimeout(loadingHandle);
-        setRecentUserMessages({ sessionKey: selectedKey, messages: cached ? [...cached.messages].reverse() : [], loading: false, error: !cached });
-      });
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(loadingHandle);
-    };
-  }, [activeTab, isTerminalOnlyPage, selectedSummary]);
-
-  useEffect(() => {
-    if (isTerminalOnlyPage || isFilesOnlyPage || activeTab === 'recycle' || !selectedSummary) return;
-    const selectedKey = sessionKey(selectedSummary);
-    let cancelled = false;
-    const refresh = () => {
-      if (document.hidden) return;
-      const previous = recentUserMessageCache.get(selectedKey);
-      void fetchRecentUserMessages(selectedSummary).then((payload) => {
-        if (cancelled || payload === previous) return;
-        setRecentUserMessages({ sessionKey: selectedKey, messages: [...payload.messages].reverse(), loading: false, error: false });
-      }).catch(() => {});
-    };
-    const interval = window.setInterval(refresh, 12_000);
-    return () => { cancelled = true; window.clearInterval(interval); };
-  }, [activeTab, isFilesOnlyPage, isTerminalOnlyPage, selectedSummary]);
-
-  useEffect(() => {
     if (isTerminalOnlyPage || isFilesOnlyPage || activeTab === 'recycle' || !allSessions.length) return;
     let cancelled = false;
     const candidates = [...allSessions]
@@ -3172,7 +2962,7 @@ function App() {
       const warm = async () => {
         while (!cancelled && next < candidates.length) {
           const session = candidates[next++];
-          if (recentUserMessageCache.has(sessionKey(session))) continue;
+          if (getCachedRecentUserMessages(session)) continue;
           await fetchRecentUserMessages(session).catch(() => undefined);
         }
       };
@@ -4335,33 +4125,7 @@ function App() {
                 <div className="panel-heading">
                   <h3>最近对话</h3>
               </div>
-              <div
-                className="recent-dialogue"
-                data-session-id={selected.id}
-                aria-busy={recentUserMessages.sessionKey !== sessionKey(selected) || recentUserMessages.loading}
-              >
-                {recentUserMessages.sessionKey === sessionKey(selected)
-                  ? recentUserMessages.messages.map((message) => (
-                      <RecentUserMessageCard
-                        key={`${sessionKey(selected)}:${message.index}`}
-                        sessionId={selected.id}
-                        message={message}
-                      />
-                    ))
-                  : null}
-                {recentUserMessages.sessionKey !== sessionKey(selected) || recentUserMessages.loading ? (
-                  <div className="empty compact">正在读取最近用户消息...</div>
-                ) : null}
-                {recentUserMessages.sessionKey === sessionKey(selected) && !recentUserMessages.loading && recentUserMessages.error ? (
-                  <div className="empty compact">最近用户消息读取失败</div>
-                ) : null}
-                {recentUserMessages.sessionKey === sessionKey(selected) &&
-                !recentUserMessages.loading &&
-                !recentUserMessages.error &&
-                !recentUserMessages.messages.length ? (
-                    <div className="empty compact">暂无用户消息</div>
-                  ) : null}
-                </div>
+                <RecentUserMessages key={sessionKey(selected)} session={selected} />
                 {SHOW_ADVANCED_UI ? (
                   <>
                     <div className="workflow">

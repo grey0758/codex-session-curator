@@ -43,6 +43,8 @@
 .followup-card { border: 1px solid #e0e7e7; border-radius: 12px; padding: 22px 25px; background: #fff; box-shadow: 0 4px 20px #1c3a2a08; }
 .followup-card h3 { margin: 7px 0 14px; font-size: 18px; }
 .followup-card > p:last-child { margin: 0; color: #42535b; line-height: 1.75; white-space: pre-wrap; }
+.followup-recent-card .recent-dialogue { border-top: 1px solid #e7ebee; }
+.followup-recent-card .recent-dialogue > .empty { padding: 18px 0; }
 .followup-prompt-card { border-color: #b8d8c8; background: #fcfffd; }
 .followup-prompt-card textarea { width: 100%; min-height: 145px; resize: vertical; border: 1px solid #ceded5; border-radius: 8px; padding: 12px; color: #25443a; background: #fff; font: inherit; font-size: 13px; line-height: 1.65; }
 .followup-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
