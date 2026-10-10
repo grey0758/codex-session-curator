@@ -16,6 +16,7 @@ It is designed for people who use Codex heavily and end up with many saved sessi
 - Preserves user whitespace and folds whole injection records plus complete inline skill/environment blocks into optional context details.
 - Shows full session history on demand instead of loading every transcript into the panel.
 - Opens an xterm.js web terminal backed by `node-pty`, SSH, and tmux for continuing real Codex or Claude sessions.
+- Offers a separate reminder center at `/?view=notifications`. The Hub inspects only conversations whose last assistant reply was within the previous 48 hours and whose session has been quiet for 10 minutes. AI decides whether follow-up is needed, summarizes the previous task, and drafts an editable next message. Reminders sort by the final conversation time, can be marked handled, and reopen if the session changes. The center supports local filtering and AI search; the main panel shows only a count and a link.
 - Supports remote agents so each machine manages its own local Codex files.
 - Archives deleted sessions into a recycle bin before removing them from active Codex directories.
 - Supports manual keep labels, bulk delete, restore, and permanent purge.

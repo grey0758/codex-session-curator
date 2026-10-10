@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import {
   Archive,
   AlertTriangle,
+  Bell,
   ChevronDown,
   ChevronRight,
   CheckCircle2,
@@ -32,6 +33,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import './App.css';
+import { FollowUpPage } from './FollowUpPage';
 import {
   filesPageUrl,
   readFilesPageRoute,
@@ -1916,6 +1918,7 @@ function SessionFileBrowser({
 }
 
 function App() {
+  const [isFollowUpPage] = useState(() => new URLSearchParams(window.location.search).get('view') === 'notifications');
   const [terminalOnlyRoute] = useState(readTerminalPageRoute);
   const terminalOnlySessionId = terminalOnlyRoute.sessionId;
   const terminalOnlyMachineId = terminalOnlyRoute.machineId;
@@ -1950,15 +1953,22 @@ function App() {
   const [remoteStatuses, setRemoteStatuses] = useState<RemoteAgentStatus[]>([]);
   const [meta, setMeta] = useState<ApiPayload['meta'] | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('all');
-  const [machineFilter, setMachineFilter] = useState(readStoredMachineFilter);
-  const [agentFilter, setAgentFilter] = useState<AgentFilter>('codex');
+  const [machineFilter, setMachineFilter] = useState(() => new URLSearchParams(window.location.search).get('machine') || readStoredMachineFilter());
+  const [agentFilter, setAgentFilter] = useState<AgentFilter>(() => new URLSearchParams(window.location.search).get('agent') === 'claude' ? 'claude' : 'codex');
   const [listViewMode, setListViewMode] = useState<SessionListViewMode>('activityDate');
   const [query, setQuery] = useState('');
   const [aiSearchQuery, setAiSearchQuery] = useState('');
   const [aiSearchResult, setAiSearchResult] = useState<AiSessionSearchPayload | null>(null);
   const [aiSearchLoading, setAiSearchLoading] = useState(false);
   const [aiSearchError, setAiSearchError] = useState<string | null>(null);
-  const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null);
+  const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get('session');
+    const machine = params.get('machine');
+    const agent = params.get('agent');
+    return id && machine && (agent === 'codex' || agent === 'claude') ? `${machine}|||${agent}|||${id}` : null;
+  });
+  const [followUpCount, setFollowUpCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1981,6 +1991,7 @@ function App() {
   });
   const [recycleQuery, setRecycleQuery] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
+  const handleFollowUpUnauthorized = useCallback(() => setAuthRequired(true), []);
   const [authBusy, setAuthBusy] = useState(false);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [workerJobs, setWorkerJobs] = useState<CodexWorkerJob[]>([]);
@@ -2522,6 +2533,7 @@ function App() {
         await loadFilesOnlySession();
         return;
       }
+      if (isFollowUpPage) return;
       await loadSessions();
       if (SHOW_ADVANCED_UI) void Promise.all([loadCommanderActions(), loadFleetAudit()]);
     } catch (err) {
@@ -2546,7 +2558,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (isTerminalOnlyPage || isFilesOnlyPage) return;
+    if (isTerminalOnlyPage || isFilesOnlyPage || isFollowUpPage) return;
     let cancelled = false;
     const handle = window.setTimeout(() => {
       if (SHOW_ADVANCED_UI) {
@@ -2561,10 +2573,10 @@ function App() {
       cancelled = true;
       window.clearTimeout(handle);
     };
-  }, [isFilesOnlyPage, isTerminalOnlyPage, loadCommanderActions, loadFleetAudit, loadSessions]);
+  }, [isFilesOnlyPage, isFollowUpPage, isTerminalOnlyPage, loadCommanderActions, loadFleetAudit, loadSessions]);
 
   useEffect(() => {
-    if (isTerminalOnlyPage || isFilesOnlyPage || authRequired) return;
+    if (isTerminalOnlyPage || isFilesOnlyPage || isFollowUpPage || authRequired) return;
     let refreshing = false;
     const refresh = () => {
       if (document.hidden || refreshing) return;
@@ -2575,7 +2587,23 @@ function App() {
     const onVisibility = () => { if (!document.hidden) refresh(); };
     document.addEventListener('visibilitychange', onVisibility);
     return () => { window.clearInterval(interval); document.removeEventListener('visibilitychange', onVisibility); };
-  }, [authRequired, isFilesOnlyPage, isTerminalOnlyPage, loadSessions]);
+  }, [authRequired, isFilesOnlyPage, isFollowUpPage, isTerminalOnlyPage, loadSessions]);
+
+  useEffect(() => {
+    if (isTerminalOnlyPage || isFilesOnlyPage || isFollowUpPage || authRequired) return;
+    const update = async () => {
+      if (document.hidden) return;
+      try {
+        const response = await fetch('/api/follow-ups', { cache: 'no-cache' });
+        if (!response.ok) return;
+        const data = await response.json() as { items?: Array<{ needsFollowUp: boolean; dismissedAt: string | null }> };
+        setFollowUpCount((data.items ?? []).filter((item) => item.needsFollowUp && !item.dismissedAt).length);
+      } catch { /* badge is optional while the hub reconnects */ }
+    };
+    const start = window.setTimeout(() => void update(), 1000);
+    const interval = window.setInterval(() => void update(), 30_000);
+    return () => { window.clearTimeout(start); window.clearInterval(interval); };
+  }, [authRequired, isFilesOnlyPage, isFollowUpPage, isTerminalOnlyPage]);
 
   useEffect(() => {
     if (
@@ -3626,6 +3654,10 @@ function App() {
     return <LoginPanel busy={authBusy} message={authMessage} onLogin={login} />;
   }
 
+  if (isFollowUpPage) {
+    return <FollowUpPage onUnauthorized={handleFollowUpUnauthorized} />;
+  }
+
   if (isFilesOnlyPage && filesOnlySessionId) {
     return (
       <main className="terminal-page-shell">
@@ -3726,6 +3758,12 @@ function App() {
               <p>会话</p>
             </div>
           </div>
+
+          <a className="notification-center-link" href="/?view=notifications">
+            <Bell size={17} />
+            <span>提醒中心</span>
+            {followUpCount > 0 ? <strong>{followUpCount}</strong> : null}
+          </a>
 
           <div className="search-box">
             <Search size={18} />

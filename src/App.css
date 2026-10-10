@@ -132,6 +132,32 @@
   margin: 0;
 }
 
+.notification-center-link {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 14px 20px 0;
+  padding: 10px 12px;
+  border: 1px solid #bcd7c8;
+  border-radius: 8px;
+  background: #edf8f1;
+  color: #215f49;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.notification-center-link strong {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 2px 5px;
+  border-radius: 10px;
+  background: #287756;
+  color: white;
+  text-align: center;
+  font-size: 11px;
+}
+
 .search-box {
   margin: 18px 20px 12px;
   height: 42px;

@@ -29,6 +29,7 @@ const HUB_ONLY_API_PREFIXES = [
   '/api/remote-agents',
   '/api/audit/fleet',
   '/api/sessions/ai-search',
+  '/api/follow-ups',
 ];
 
 export function getCuratorRole(): CuratorRole {

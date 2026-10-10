@@ -19,6 +19,7 @@ import {
 } from './file-ops.js';
 import type { KnowledgeStore } from './knowledge-store.js';
 import { parseSessionHistory } from './session-parser.js';
+import { FollowUpCenter } from './follow-up-center.js';
 import {
   RemoteAgentHttpError,
   checkRemoteAgent,
@@ -144,6 +145,27 @@ const knowledgeStore = await (async (): Promise<KnowledgeStore | null> => {
 })();
 const service = new SessionService(store);
 const remoteAgents = curatorRole === 'hub' ? getRemoteAgents() : [];
+const followUpCenter = curatorRole === 'hub' ? new FollowUpCenter(
+  join(codexHome, 'session-curator-follow-ups.json'),
+  async () => {
+    const local = await getLocalSessionsCached(false, true);
+    const remotes = await Promise.allSettled(remoteAgents.map((agent) => fetchAgentSessions(agent)));
+    return [...local, ...remotes.flatMap((result, index) => result.status === 'fulfilled'
+      ? result.value.map((session) => ({ ...session, machineId: remoteAgents[index].id })) : [])];
+  },
+  async (session) => {
+    if (session.machineId === service.getMeta().machineId) {
+      return (await parseSessionHistory({ filePath: session.filePath, limit: 30 })).messages;
+    }
+    const agent = remoteAgents.find((candidate) => candidate.id === session.machineId);
+    if (!agent) throw new Error(`Remote machine unavailable: ${session.machineId}`);
+    const query = new URLSearchParams({ limit: '30', machineId: session.machineId, agent: session.agent, remote: '0' });
+    const payload = await fetchAgentJson<{ messages: import('./types.js').HistoryMessage[] }>(
+      agent, `/api/sessions/${encodeURIComponent(session.id)}/history?${query}`,
+    );
+    return payload.messages ?? [];
+  },
+) : null;
 
 function requireKnowledgeStore(): KnowledgeStore {
   if (!knowledgeStore) throw new Error('Knowledge store is unavailable in worker role');
@@ -5296,6 +5318,66 @@ app.get('/api/sessions', async (request) => {
   };
 });
 
+app.get('/api/follow-ups', async () => {
+  if (!followUpCenter) return { items: [], scanning: false, lastScanAt: null, error: 'Hub only', windowHours: 48 };
+  void followUpCenter.scan().catch((error) => app.log.warn({ error }, 'Follow-up scan failed'));
+  return followUpCenter.snapshot();
+});
+
+app.post('/api/follow-ups/refresh', async () => {
+  if (!followUpCenter) return { error: 'Hub only' };
+  void followUpCenter.scan(true).catch((error) => app.log.warn({ error }, 'Follow-up scan failed'));
+  return { ...followUpCenter.snapshot(), accepted: true };
+});
+
+app.post('/api/follow-ups/dismiss', async (request, reply) => {
+  const body = z.object({
+    key: z.string().min(1).max(500),
+    version: z.string().min(1).max(500),
+    dismissed: z.boolean(),
+  }).parse(request.body);
+  const item = await followUpCenter?.dismiss(body.key, body.version, body.dismissed);
+  if (!item) return reply.code(409).send({ error: 'Follow-up changed; refresh the center' });
+  return { item };
+});
+
+app.post('/api/follow-ups/search', async (request) => {
+  const body = z.object({ query: z.string().trim().min(2).max(500), limit: z.number().int().min(1).max(50).optional() }).parse(request.body);
+  const items = followUpCenter?.snapshot().items ?? [];
+  if (!items.length) return { keys: [], mode: 'local', intent: body.query };
+  const candidates: AiSearchCandidate[] = items.map((item, index) => ({
+    candidateId: `n${index}`,
+    sessionId: item.sessionId,
+    machineId: item.machineId,
+    agent: item.agent,
+    title: item.title,
+    summary: item.previousTaskSummary,
+    detailedSummary: `${item.reason}\n${item.suggestedPrompt}`,
+    cwd: item.cwd,
+    keywords: [],
+    techStack: [],
+    updatedAt: item.endedAt,
+    lastUserMessage: item.suggestedPrompt,
+    kept: false,
+    localScore: 0,
+  }));
+  const limit = body.limit ?? 20;
+  try {
+    const ranked = await rankAiSearchCandidates(body.query, candidates, limit, { timeoutMs: 8_000 });
+    const keys = ranked.matches
+      .filter((match) => match.confidence >= 0.35)
+      .map((match) => items[Number(match.candidateId.slice(1))]?.key)
+      .filter((key): key is string => Boolean(key));
+    return { keys, mode: 'ai', intent: ranked.intent };
+  } catch (error) {
+    const keys = candidates.map((candidate, index) => ({
+      key: items[index].key,
+      score: scoreAiSearchCandidate(candidate, body.query),
+    })).filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map((entry) => entry.key);
+    return { keys, mode: 'local', intent: body.query, error: error instanceof Error ? error.message : 'AI search unavailable' };
+  }
+});
+
 app.get('/api/remote-agents', async () => ({
   agents: await Promise.all(remoteAgents.map((agent) => checkRemoteAgent(agent))),
 }));
@@ -6002,6 +6084,7 @@ if (curatorRole === 'hub' && existsSync(distPath)) {
 const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 54177);
 
+if (followUpCenter) await followUpCenter.load();
 await app.listen({ host, port });
 app.log.info({ role: curatorRole, capabilities: curatorCapabilities }, `Codex Session Curator listening on http://${host}:${port}`);
 setTimeout(() => {
@@ -6013,3 +6096,7 @@ setTimeout(() => {
     .then(() => app.log.info({ role: curatorRole }, 'Session list caches warmed'))
     .catch((error) => app.log.warn({ error, role: curatorRole }, 'Session list cache warmup failed'));
 }, 100).unref();
+if (followUpCenter) {
+  setTimeout(() => void followUpCenter.scan().catch((error) => app.log.warn({ error }, 'Follow-up scan failed')), 10_000).unref();
+  setInterval(() => void followUpCenter.scan().catch((error) => app.log.warn({ error }, 'Follow-up scan failed')), 60_000).unref();
+}
