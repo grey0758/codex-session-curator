@@ -97,8 +97,9 @@ export async function analyzeFollowUp(session: CodexSession, history: HistoryMes
             { role: 'user', content: prompt },
           ],
           temperature: 0.2,
-          max_tokens: 900,
+          max_tokens: 1600,
           stream: false,
+          ...(endpoint.model.toLowerCase().includes('flash') ? { thinking: { type: 'disabled' } } : {}),
         }),
         signal: controller.signal,
       });

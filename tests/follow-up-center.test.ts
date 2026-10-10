@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { FollowUpCenter, isFollowUpCandidate } from '../server/follow-up-center.js';
+import { FollowUpCenter, analyzeFollowUp, isFollowUpCandidate } from '../server/follow-up-center.js';
 import type { CodexSession, HistoryMessage } from '../server/types.js';
 
 function session(endedAt: number, version = 1): CodexSession {
@@ -64,5 +64,36 @@ test('verdict persists, dismissal survives reload, and a new turn reopens the re
     assert.equal((JSON.parse(await readFile(file, 'utf8')) as { items: unknown[] }).items.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('flash assessment disables thinking so the answer has room for JSON', async () => {
+  const names = ['CURATOR_LLM_BASE_URL', 'CURATOR_LLM_MODEL', 'CURATOR_LLM_API_KEY'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | null = null;
+  try {
+    process.env.CURATOR_LLM_BASE_URL = 'https://example.invalid/v1';
+    process.env.CURATOR_LLM_MODEL = 'deepseek-v4.1-flash';
+    process.env.CURATOR_LLM_API_KEY = 'fixture-only';
+    globalThis.fetch = async (_url, options) => {
+      requestBody = JSON.parse(String(options?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        needsFollowUp: true, priority: 'normal', previousTaskSummary: 'Fixed the UI',
+        reason: 'Deployment pending', suggestedPrompt: 'Please deploy and verify.',
+      }) } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    const current = session(Date.now() - 20 * 60_000);
+    const verdict = await analyzeFollowUp(current, [{ index: 0, role: 'assistant', text: 'Fix complete, deploy pending', timestamp: current.updatedAt }]);
+    assert.equal(verdict.needsFollowUp, true);
+    assert.deepEqual(requestBody?.thinking, { type: 'disabled' });
+    assert.equal(requestBody?.max_tokens, 1600);
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const name of names) {
+      const value = previous[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
