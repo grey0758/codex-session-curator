@@ -67,16 +67,22 @@ async function main() {
       async function waitFor(expression, predicate, label) {
         const deadline = Date.now() + 30_000;
         while (Date.now() < deadline) {
-          const result = await evaluate(expression);
-          if (predicate(result)) return result;
+          try {
+            const result = await evaluate(expression);
+            if (predicate(result)) return result;
+          } catch { /* navigation may still be in progress */ }
           await delay(150);
         }
-        throw new Error(`${label} timed out`);
+        const diagnostic = await evaluate(`({ rows: document.querySelectorAll('.followup-row').length,
+          loginVisible: Boolean(document.querySelector('.login-panel')),
+          detailVisible: Boolean(document.querySelector('.followup-detail')),
+          allActive: document.querySelector('.followup-controls button:nth-child(2)')?.classList.contains('active') || false })`);
+        throw new Error(`${label} timed out: ${JSON.stringify(diagnostic)}`);
       }
 
       await cdp('Runtime.enable');
       await cdp('Page.enable');
-      await delay(700);
+      await waitFor('fetch("/api/follow-ups").then((response) => response.status)', (status) => status === 200, 'authenticated API');
       await cdp('Page.navigate', { url: baseUrl });
       await waitFor('Boolean(document.querySelector(".followup-controls button"))', Boolean, 'reminder controls');
       await evaluate('document.querySelector(".followup-controls button:nth-child(2)")?.click()');
