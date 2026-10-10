@@ -64,7 +64,7 @@ function parseJson(text: string): unknown {
 }
 
 export async function analyzeFollowUp(session: CodexSession, history: HistoryMessage[]): Promise<z.infer<typeof verdictSchema> & { model: string }> {
-  const endpoints = getEvaluatorEndpoints();
+  const endpoints = getEvaluatorEndpoints().sort((a, b) => Number(b.model.toLowerCase().includes('flash')) - Number(a.model.toLowerCase().includes('flash')));
   if (!endpoints.length) throw new Error('No Curator LLM endpoint configured');
   const conversation = history
     .filter((message) => !message.injectedContext)
@@ -85,7 +85,7 @@ export async function analyzeFollowUp(session: CodexSession, history: HistoryMes
   let lastError = 'AI response unavailable';
   for (const endpoint of endpoints) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 25_000);
+    const timer = setTimeout(() => controller.abort(), 15_000);
     try {
       const response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -205,7 +205,7 @@ export class FollowUpCenter {
       await this.save();
       let assessed = 0;
       for (const session of candidates) {
-        if (assessed >= 3) break;
+        if (assessed >= 6) break;
         const key = followUpKey(session);
         const version = followUpVersion(session);
         if (this.items.get(key)?.version === version || (this.failedUntil.get(`${key}:${version}`) ?? 0) > Date.now()) continue;

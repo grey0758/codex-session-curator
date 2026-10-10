@@ -151,7 +151,7 @@ export function FollowUpPage({ onUnauthorized }: { onUnauthorized: () => void })
         </header>
         <div className="followup-intro">
           <strong>{pendingCount} 条待跟进</strong>
-          <span>仅分析最近 48 小时结束的会话；安静 10 分钟后开始判断。</span>
+          <span>{payload?.scanning ? '正在分析最近两天的会话 · ' : ''}仅分析最近 48 小时结束的会话；安静 10 分钟后开始判断。</span>
         </div>
         <form className="followup-search" onSubmit={(event) => void searchWithAi(event)}>
           <Search size={17} />
@@ -171,7 +171,7 @@ export function FollowUpPage({ onUnauthorized }: { onUnauthorized: () => void })
         </div>
         <div className="followup-list">
           {!payload ? <div className="followup-empty"><Loader2 size={20} className="spin" /> 正在加载提醒</div> : null}
-          {payload && !items.length ? <div className="followup-empty">当前没有匹配的提醒。新会话结束后会自动检查。</div> : null}
+          {payload && !items.length ? <div className="followup-empty">{payload.scanning ? '正在生成提醒，请稍候…' : '当前没有匹配的提醒。新会话结束后会自动检查。'}</div> : null}
           {items.map((item) => (
             <button key={item.key} type="button" className={`followup-row${selected?.key === item.key ? ' selected' : ''}`} onClick={() => setSelectedKey(item.key)}>
               <span className="followup-row-top"><strong>{item.title}</strong><time>{formatTime(item.endedAt)}</time></span>
