@@ -242,7 +242,9 @@ export class TerminalWatch {
         record.awaitingErrorClear = false;
         record.lastReason = 'new-user-task';
       }
-      const sustainedProgress = record.pendingAt && laterThan(probe.taskStartedAt, record.pendingAt) &&
+      // Codex can append task_started while send-keys is still returning. Allow that small overlap.
+      const sustainedProgress = record.pendingAt &&
+        Date.parse(probe.taskStartedAt ?? '') >= Date.parse(record.pendingAt) - 5_000 &&
         Date.parse(probe.lastActivityAt ?? '') - Date.parse(record.pendingAt) > 60_000;
       if (record.pendingAt && ((laterThan(probe.taskCompleteAt, record.pendingAt) && !probe.failedComplete) || sustainedProgress)) {
         record.attempts = 0;
@@ -306,6 +308,7 @@ export class TerminalWatch {
       }
       if (!this.isLeader()) return;
       const message = probe.goalStatus === 'active' ? '/goal resume' : '继续';
+      const dispatchAt = new Date().toISOString();
       const sent = await this.runner(record.session, 'send', [probe.taskStartedAt ?? '', message, aiConfirmed ? probe.diagnostic ?? '' : '']);
       if (!sent.sent) {
         record.status = 'unknown';
@@ -314,7 +317,7 @@ export class TerminalWatch {
         return;
       }
       record.attempts += 1;
-      record.pendingAt = new Date().toISOString();
+      record.pendingAt = dispatchAt;
       record.lastAction = message;
       record.lastReason = 'upstream-healthy-recovery-sent';
       record.status = 'recovering';
