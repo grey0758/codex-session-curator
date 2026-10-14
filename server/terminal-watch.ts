@@ -29,6 +29,7 @@ interface Probe {
   goalStatus?: string | null;
   taskStartedAt?: string;
   taskCompleteAt?: string;
+  failedComplete?: boolean;
   abortedAt?: string;
   lastActivityAt?: string;
   lastUserAt?: string;
@@ -72,8 +73,9 @@ function laterThan(value: string | undefined | null, reference: string | undefin
 
 export function recoveryDecision(record: WatchRecord, probe: Probe, now: number): 'skip' | 'confirm' | 'health' | 'blocked' {
   if (!probe.pane || probe.status === 'closed' || probe.status === 'manual-paused' || probe.status === 'retrying') return 'skip';
-  if (!probe.upstreamError || !probe.promptVisible || probe.status !== 'running') return 'skip';
-  if (!probe.taskStartedAt || !laterThan(probe.taskStartedAt, probe.taskCompleteAt)) return 'skip';
+  if (!probe.upstreamError || !probe.promptVisible ||
+      (probe.status !== 'running' && !(probe.status === 'idle' && probe.failedComplete))) return 'skip';
+  if (!probe.taskStartedAt || (!probe.failedComplete && !laterThan(probe.taskStartedAt, probe.taskCompleteAt))) return 'skip';
   const lastActivity = Date.parse(probe.lastActivityAt || probe.taskStartedAt);
   if (!Number.isFinite(lastActivity) || now - lastActivity < QUIET_MS) return 'skip';
   if (record.pendingAt && now - Date.parse(record.pendingAt) < RETRY_MS) return 'skip';
@@ -242,7 +244,7 @@ export class TerminalWatch {
       }
       const sustainedProgress = record.pendingAt && laterThan(probe.taskStartedAt, record.pendingAt) &&
         Date.parse(probe.lastActivityAt ?? '') - Date.parse(record.pendingAt) > 60_000;
-      if (record.pendingAt && (laterThan(probe.taskCompleteAt, record.pendingAt) || sustainedProgress)) {
+      if (record.pendingAt && ((laterThan(probe.taskCompleteAt, record.pendingAt) && !probe.failedComplete) || sustainedProgress)) {
         record.attempts = 0;
         record.pendingAt = null;
         record.suspectedAt = null;

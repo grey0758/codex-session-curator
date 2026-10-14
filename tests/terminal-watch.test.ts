@@ -35,6 +35,9 @@ test('recovery gates require an idle prompt, an unfinished task, and a confirmed
   assert.equal(recoveryDecision(state(), observation({ promptVisible: false }), now), 'skip');
   assert.equal(recoveryDecision(state(), observation({ lastActivityAt: ago(30_000) }), now), 'skip');
   assert.equal(recoveryDecision(state(), observation({ taskCompleteAt: ago(2_000) }), now), 'skip');
+  assert.equal(recoveryDecision(state(), observation({ status: 'idle', taskCompleteAt: ago(2_000), failedComplete: true }), now), 'health');
+  assert.equal(recoveryDecision(state(), observation({ status: 'idle', taskCompleteAt: ago(2_000), failedComplete: true, upstreamError: false }), now), 'skip');
+  assert.equal(recoveryDecision(state(), observation({ status: 'manual-paused', taskCompleteAt: ago(2_000), failedComplete: true }), now), 'skip');
   assert.equal(recoveryDecision(state({ suspectedAt: null }), observation(), now), 'confirm');
   assert.equal(recoveryDecision(state({ attempts: 3 }), observation(), now), 'blocked');
   assert.equal(recoveryDecision(state({ pendingAt: ago(30_000) }), observation(), now), 'skip');
@@ -87,6 +90,32 @@ test('unhealthy provider never receives a recovery instruction', async () => {
     assert.equal(watcher.get(session)?.status, 'upstream-unhealthy');
     assert.equal(watcher.get(session)?.attempts, 0);
     assert.deepEqual(calls, ['inspect', 'inspect', 'health']);
+  } finally {
+    watcher.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a task completed by an upstream failure receives continue when the channel recovers', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'curator-terminal-watch-'));
+  const calls: Array<{ mode: string; args?: string[] }> = [];
+  const watcher = new TerminalWatch(join(dir, 'state.json'), async (_session, mode, args) => {
+    calls.push({ mode, args });
+    if (mode === 'inspect') return observation({
+      status: 'idle', goalStatus: null, taskCompleteAt: ago(5 * 60_000), failedComplete: true,
+    });
+    if (mode === 'health') return { healthy: true, reason: 'ok' };
+    return { sent: true, reason: 'ok' };
+  });
+  try {
+    await watcher.watch(session);
+    const record = (watcher as unknown as { records: Map<string, { suspectedAt: string }> }).records.values().next().value!;
+    record.suspectedAt = ago(2 * 60_000);
+    await watcher.scan();
+    assert.equal(watcher.get(session)?.status, 'recovering');
+    assert.equal(watcher.get(session)?.attempts, 1);
+    assert.deepEqual(calls.map((call) => call.mode), ['inspect', 'inspect', 'health', 'send']);
+    assert.equal(calls.at(-1)?.args?.[1], '继续');
   } finally {
     watcher.stop();
     await rm(dir, { recursive: true, force: true });
@@ -194,7 +223,7 @@ test('real probe distinguishes a manual interruption from an upstream failure', 
     const { stdout } = await execFileAsync('python3', [join(process.cwd(), 'server/terminal-watch-probe.py'), 'inspect', session.id, filePath], {
       env: { ...process.env, PATH: `${binaryDir}:${process.env.PATH}`, CURATOR_WATCH_TEST_PANE: pane },
     });
-    return JSON.parse(stdout) as { status: string; upstreamError: boolean; promptVisible: boolean; goalStatus: string };
+    return JSON.parse(stdout) as { status: string; upstreamError: boolean; promptVisible: boolean; goalStatus: string; failedComplete: boolean };
   };
   try {
     await writeFile(filePath, [
@@ -216,6 +245,24 @@ test('real probe distinguishes a manual interruption from an upstream failure', 
     assert.equal(upstream.goalStatus, 'active');
     assert.equal(upstream.upstreamError, true);
     assert.equal(upstream.promptVisible, true);
+
+    await writeFile(filePath, [
+      event('task_started', started),
+      event('item_completed', ago(8 * 60_000), { item: { type: 'CommandExecution', status: 'completed' } }),
+      event('task_complete', ago(4 * 60_000)),
+    ].join('\n'));
+    const failedComplete = await inspect('■ HTTP 503 Service Unavailable\n› ');
+    assert.equal(failedComplete.status, 'idle');
+    assert.equal(failedComplete.failedComplete, true);
+    assert.equal(recoveryDecision(state(), { ...failedComplete, pane: true, taskStartedAt: started, lastActivityAt: ago(8 * 60_000), taskCompleteAt: ago(4 * 60_000) }, Date.now()), 'health');
+
+    await writeFile(filePath, [
+      event('task_started', started),
+      event('item_completed', ago(5 * 60_000), { item: { type: 'AgentMessage', phase: 'final_answer' } }),
+      event('task_complete', ago(4 * 60_000)),
+    ].join('\n'));
+    const successful = await inspect('■ HTTP 503 Service Unavailable\n› ');
+    assert.equal(successful.failedComplete, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

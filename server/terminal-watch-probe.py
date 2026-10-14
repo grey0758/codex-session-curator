@@ -62,6 +62,7 @@ def inspect(session_id, file_path):
     aborted = ""
     last_activity = ""
     last_user = ""
+    final_answer = ""
     with path.open(encoding="utf8", errors="replace") as stream:
         for line in stream:
             try:
@@ -76,12 +77,17 @@ def inspect(session_id, file_path):
                     goal = (payload.get("goal") or {}).get("status")
                 elif kind == "task_started":
                     task_started = timestamp
+                    final_answer = ""
                 elif kind == "task_complete":
                     task_complete = timestamp
                 elif kind == "turn_aborted":
                     aborted = timestamp
                 elif kind in ("item_completed", "token_count"):
                     last_activity = timestamp
+                    if kind == "item_completed":
+                        item = payload.get("item") or {}
+                        if item.get("type") == "AgentMessage" and item.get("phase") in ("final_answer", "final"):
+                            final_answer = timestamp
             elif event.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
                 last_user = timestamp
 
@@ -96,11 +102,17 @@ def inspect(session_id, file_path):
         status = "running"
     else:
         status = "idle"
+    failed_complete = bool(
+        status == "idle" and task_started and task_complete >= task_started
+        and final_answer < task_started and upstream_error and prompt
+        and not (last_user and last_user > task_complete)
+    )
     return {
         "pane": True, "status": status, "goalStatus": goal,
         "taskStartedAt": task_started, "taskCompleteAt": task_complete,
         "abortedAt": aborted, "lastActivityAt": last_activity, "lastUserAt": last_user,
         "upstreamError": upstream_error, "promptVisible": prompt,
+        "failedComplete": failed_complete,
         "diagnostic": diagnostic,
     }
 

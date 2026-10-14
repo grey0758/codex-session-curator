@@ -15,7 +15,9 @@ transcript to the Hub.
 Recovery requires all of the following:
 
 1. A Codex task is unfinished and has produced no activity for at least three
-   minutes.
+   minutes. A task that Codex marked complete after an upstream failure also
+   qualifies when it has no final answer and the terminal still shows the
+   upstream error and prompt.
 2. The terminal shows an upstream/transport failure and an input prompt. A
    second scan confirms the failure at least one minute later. Unknown error
    text may be classified by the configured DeepSeek endpoint; uncertainty
