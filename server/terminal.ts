@@ -67,28 +67,44 @@ function envEntryForMachine(
 }
 
 export function terminalTransportForSession(
-  session: CodexSession,
+  session: Pick<CodexSession, 'machineId'>,
   env: NodeJS.ProcessEnv = process.env
 ): TerminalTransport {
   const configured = envEntryForMachine('CURATOR_TERMINAL_TRANSPORT', session.machineId, env)?.value.toLowerCase();
   return configured === 'ssh' || configured === 'local' || configured === 'auto' ? configured : 'auto';
 }
 
-function sshTargetForSession(session: CodexSession): string | null {
+function sshTargetForSession(session: Pick<CodexSession, 'machineId'>): string | null {
   const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_TARGET', session.machineId);
   const configured = (machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_TARGET;
   return configured?.trim() || null;
 }
 
-function sshCommandForSession(session: CodexSession): string {
+function sshCommandForSession(session: Pick<CodexSession, 'machineId'>): string {
   const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_COMMAND', session.machineId);
   return ((machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_COMMAND || 'ssh').trim();
 }
 
-function sshHostFirstForSession(session: CodexSession): boolean {
+function sshHostFirstForSession(session: Pick<CodexSession, 'machineId'>): boolean {
   const machineEnvName = envNameForMachine('CURATOR_TERMINAL_SSH_HOST_FIRST', session.machineId);
   const configured = (machineEnvName ? process.env[machineEnvName] : null) || process.env.CURATOR_TERMINAL_SSH_HOST_FIRST;
   return configured === '1' || configured === 'true';
+}
+
+export function terminalProbeTarget(session: Pick<CodexSession, 'machineId'>): {
+  remote: boolean;
+  sshTarget: string | null;
+  sshCommand: string;
+  hostFirst: boolean;
+} {
+  const transport = terminalTransportForSession(session);
+  const sshTarget = sshTargetForSession(session);
+  return {
+    remote: transport === 'ssh' || (transport === 'auto' && Boolean(sshTarget)),
+    sshTarget,
+    sshCommand: sshCommandForSession(session),
+    hostFirst: sshHostFirstForSession(session),
+  };
 }
 
 function canRunCommand(command: string, env: NodeJS.ProcessEnv): boolean {

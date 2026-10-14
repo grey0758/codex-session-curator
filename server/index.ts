@@ -3,9 +3,9 @@ import compress from '@fastify/compress';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 import type { FastifyReply, FastifyRequest } from 'fastify';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { constants as fsConstants, createReadStream } from 'node:fs';
+import { constants as fsConstants, createReadStream, readFileSync } from 'node:fs';
 import { existsSync } from 'node:fs';
 import { mkdir, open, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
@@ -45,6 +45,7 @@ import {
 import { compareSessionVisibility, readSessionAuditEvents, recordSessionAuditEvent } from './session-audit.js';
 import { CuratorStore } from './store.js';
 import { startCodexTerminal, type TerminalInput } from './terminal.js';
+import { TerminalWatch } from './terminal-watch.js';
 import { readTerminalErrors, recordTerminalError } from './terminal-error-log.js';
 import type {
   AgentKind,
@@ -144,6 +145,24 @@ const knowledgeStore = await (async (): Promise<KnowledgeStore | null> => {
   return new HubKnowledgeStore(getKnowledgeDbPath(codexHome));
 })();
 const service = new SessionService(store);
+function isActiveTerminalWatchSlot(): boolean {
+  const port = Number(process.env.PORT || 54177);
+  const slotFile = process.env.CURATOR_TERMINAL_WATCH_SLOT_FILE ||
+    '/home/grey/data/apps/codex-session-curator-blue-green/state/current-slot';
+  if (!existsSync(slotFile)) return true;
+  const slot = port === 54187 ? 'blue' : port === 54188 ? 'green' : null;
+  try {
+    if (!slot || readFileSync(slotFile, 'utf8').trim() !== slot) return false;
+  } catch { return false; }
+  const otherSlot = slot === 'blue' ? 'green' : 'blue';
+  const other = spawnSync('systemctl', ['--user', 'is-active', `codex-session-curator-slot@${otherSlot}.service`], {
+    encoding: 'utf8', timeout: 3_000,
+  });
+  return ['inactive', 'failed', 'unknown'].includes(other.stdout?.trim() ?? '');
+}
+const terminalWatch = curatorRole === 'hub' ? new TerminalWatch(
+  join(codexHome, 'session-curator-terminal-watch.json'), undefined, isActiveTerminalWatchSlot,
+) : null;
 const remoteAgents = curatorRole === 'hub' ? getRemoteAgents() : [];
 const followUpCenter = curatorRole === 'hub' ? new FollowUpCenter(
   join(codexHome, 'session-curator-follow-ups.json'),
@@ -5727,6 +5746,10 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
     return;
   }
 
+  if (terminalWatch && routed.session.agent === 'codex') {
+    void terminalWatch.watch(routed.session).catch((error) => request.log.warn({ error }, 'Terminal watch registration failed'));
+  }
+
   const terminal = startCodexTerminal(routed.session, (message) => {
     if (message.type === 'error') logTerminalError('pty-error');
     if (message.type === 'exit' && message.code !== 0) logTerminalError('pty-exit', message.code ?? undefined);
@@ -5757,6 +5780,35 @@ app.get('/api/sessions/:id/terminal-errors', async (request) => {
   const { id } = sessionIdSchema.parse(request.params);
   const { machineId, agent } = terminalErrorQuerySchema.parse(request.query);
   return { events: await readTerminalErrors(id, machineId, agent) };
+});
+
+app.get('/api/sessions/:id/terminal-watch', async (request) => {
+  const { id } = sessionIdSchema.parse(request.params);
+  const { machineId, agent } = terminalErrorQuerySchema.parse(request.query);
+  return { watch: terminalWatch?.get({ id, machineId, agent, filePath: '' }) ?? null };
+});
+
+app.get('/api/terminal-watch', async () => ({ watches: terminalWatch?.list() ?? [] }));
+
+app.post('/api/sessions/:id/terminal-watch', async (request, reply) => {
+  const { id } = sessionIdSchema.parse(request.params);
+  const { machineId, agent } = terminalErrorQuerySchema.parse(request.body);
+  if (!terminalWatch || agent !== 'codex') return reply.code(400).send({ error: 'Codex hub terminal watch only' });
+  const routed = await findRoutableSession(id, machineId, agent);
+  if (!routed || routed.session.machineId !== machineId || routed.session.agent !== agent) {
+    return reply.code(404).send({ error: 'Session not found' });
+  }
+  await terminalWatch.watch(routed.session);
+  return { watch: terminalWatch.get(routed.session) };
+});
+
+app.post('/api/sessions/:id/terminal-watch/reset', async (request, reply) => {
+  const { id } = sessionIdSchema.parse(request.params);
+  const { machineId, agent } = terminalErrorQuerySchema.parse(request.body);
+  if (!terminalWatch || !await terminalWatch.reset({ id, machineId, agent, filePath: '' })) {
+    return reply.code(404).send({ error: 'Terminal watch not found' });
+  }
+  return { watch: terminalWatch.get({ id, machineId, agent, filePath: '' }) };
 });
 
 app.post('/api/sessions/:id/terminal-errors', async (request, reply) => {
@@ -6085,7 +6137,24 @@ const host = process.env.HOST || '127.0.0.1';
 const port = Number(process.env.PORT || 54177);
 
 if (followUpCenter) await followUpCenter.load();
+if (terminalWatch) await terminalWatch.load();
 await app.listen({ host, port });
+terminalWatch?.start();
+if (terminalWatch) {
+  const enroll = () => {
+    void (async () => {
+      const local = await getLocalSessionsCached(false, true);
+      const agents = remoteAgents.filter((agent) => agent.id !== 'us002');
+      const remote = await Promise.allSettled(agents.map((agent) => fetchAgentSessions(agent)));
+      const sessions = [...local, ...remote.flatMap((result, index) => result.status === 'fulfilled'
+        ? result.value.map((session) => ({ ...session, machineId: agents[index].id })) : [])];
+      const registered = await terminalWatch.enrollExisting(sessions);
+      app.log.info({ registered }, 'Existing panel terminals enrolled in session watch');
+    })().catch((error) => app.log.warn({ error }, 'Panel terminal watch enrollment failed'));
+  };
+  setTimeout(enroll, 45_000).unref();
+  setInterval(enroll, 5 * 60_000).unref();
+}
 app.log.info({ role: curatorRole, capabilities: curatorCapabilities }, `Codex Session Curator listening on http://${host}:${port}`);
 setTimeout(() => {
   const warmups: Promise<unknown>[] = [getLocalSessionsCached(false, true).then((sessions) => {

@@ -2052,6 +2052,22 @@
   font: 12px/1.5 var(--mono);
 }
 
+.terminal-watch-status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 15px;
+  padding: 6px 12px;
+  border-top: 1px solid #263244;
+  background: #172033;
+  color: #a7f3d0;
+  font-size: 11px;
+}
+
+.terminal-watch-status time { color: #94a3b8; }
+.terminal-watch-status button { border: 1px solid #6ee7b7; border-radius: 5px; background: transparent; color: #a7f3d0; cursor: pointer; }
+
 .terminal-error-log button {
   margin-bottom: 4px;
 }

@@ -12,6 +12,7 @@
     "test:server-identity": "node --import tsx --test tests/server-identity-api.test.ts",
     "test:store": "node --import tsx --test tests/store-concurrency.test.ts",
     "test:worker-role": "node --import tsx --test tests/worker-role.api.test.ts",
+    "test:terminal-watch": "node --import tsx --test tests/terminal-watch.test.ts",
     "test:remote-evaluation": "node --import tsx --test tests/remote-evaluation-audit.api.test.ts",
     "test:ai-search": "node --import tsx --test --test-concurrency=1 tests/ai-session-search.api.test.ts",
     "test:deploy-blue-green": "bash tests/deploy-blue-green-transaction.test.sh",

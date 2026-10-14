@@ -301,6 +301,16 @@ async function main() {
     }))()`);
     const probeVisibleInTmux = tmuxPaneContains(probeText);
     const submittedMarkerRecorded = await waitForSessionMarker(token);
+    let watchOk = null;
+    if (process.env.CURATOR_TERMINAL_VERIFY_EXPECT_WATCH === '1' && agent === 'codex') {
+      const deadline = Date.now() + 25_000;
+      watchOk = false;
+      while (Date.now() < deadline) {
+        const label = await evaluate(`document.querySelector('.terminal-watch-status')?.textContent || ''`);
+        if (label.includes('会话巡检：')) { watchOk = true; break; }
+        await delay(500);
+      }
+    }
 
     let reconnected = null;
     if (process.env.CURATOR_TERMINAL_VERIFY_RECONNECT === '1') {
@@ -354,7 +364,7 @@ async function main() {
     const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);
     const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux || submittedMarkerRecorded;
     const disconnected = `${before.status}\n${after.status}`.includes('断开');
-    const ok = statusOk && inputOk && reconnected !== false && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
+    const ok = statusOk && inputOk && watchOk !== false && reconnected !== false && !disconnected && exceptions.length === 0 && consoleErrors.length === 0;
     const report = {
       ok,
       sessionId,
@@ -368,6 +378,7 @@ async function main() {
       after,
       clients,
       probeVisibleInTmux,
+      watchOk,
       submittedMarkerRecorded,
       probeFrameSent,
       probeInputFrames,

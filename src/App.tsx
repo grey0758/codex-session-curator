@@ -590,6 +590,25 @@ interface RemoteAgentStatus {
 
 type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
 
+interface TerminalWatchStatus {
+  status: 'checking' | 'running' | 'idle' | 'manual-paused' | 'closed' | 'upstream-unhealthy' |
+    'suspected-upstream-error' | 'recovering' | 'recovered' | 'waiting-for-user' | 'unknown';
+  goalStatus: string | null;
+  attempts: number;
+  lastCheckedAt: string | null;
+  providerHealthy: boolean | null;
+  providerReason: string | null;
+  lastAction: string | null;
+  lastReason: string | null;
+}
+
+const terminalWatchLabel: Record<TerminalWatchStatus['status'], string> = {
+  checking: '巡检中', running: '任务中', idle: '待命', 'manual-paused': '人工暂停',
+  closed: '会话已退出', 'upstream-unhealthy': '上游暂不可用',
+  'suspected-upstream-error': '等待确认异常', recovering: '已发送恢复指令',
+  recovered: '恢复成功', 'waiting-for-user': '等待人工处理', unknown: '状态未知',
+};
+
 interface TerminalSessionTarget {
   id: string;
   agent: AgentKind;
@@ -1121,6 +1140,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
   const [errorLogOpen, setErrorLogOpen] = useState(false);
   const [terminalErrors, setTerminalErrors] = useState<Array<{ time: string; code: string; closeCode?: number }>>([]);
+  const [watchStatus, setWatchStatus] = useState<TerminalWatchStatus | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
@@ -1201,6 +1221,41 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       setTerminalNotice('错误日志加载失败');
     }
   }, [errorLogUrl, session.agent, session.machineId]);
+
+  const watchUrl = `/api/sessions/${encodeURIComponent(session.id)}/terminal-watch`;
+  const loadWatchStatus = useCallback(async () => {
+    if (session.agent !== 'codex') return;
+    const params = new URLSearchParams({ machineId: session.machineId, agent: session.agent });
+    try {
+      const response = await fetch(`${watchUrl}?${params}`, { cache: 'no-cache' });
+      if (!response.ok) return;
+      const payload = await response.json() as { watch: TerminalWatchStatus | null };
+      setWatchStatus(payload.watch);
+    } catch { /* next poll retries */ }
+  }, [session.agent, session.machineId, watchUrl]);
+
+  useEffect(() => {
+    if (!active || session.agent !== 'codex') return;
+    const start = window.setTimeout(() => {
+      void fetch(watchUrl, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId: session.machineId, agent: session.agent }),
+      }).then(() => loadWatchStatus()).catch(() => {});
+    }, 1500);
+    const interval = window.setInterval(() => { if (!document.hidden) void loadWatchStatus(); }, 15_000);
+    return () => { window.clearTimeout(start); window.clearInterval(interval); };
+  }, [active, loadWatchStatus, session.agent, session.machineId, watchUrl]);
+
+  const resetWatch = useCallback(async () => {
+    try {
+      const response = await fetch(`${watchUrl}/reset`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId: session.machineId, agent: session.agent }),
+      });
+      if (!response.ok) throw new Error('reset failed');
+      await loadWatchStatus();
+    } catch { setTerminalNotice('恢复巡检失败，请稍后重试'); }
+  }, [loadWatchStatus, session.agent, session.machineId, watchUrl]);
 
   const pasteIntoTerminal = useCallback(async () => {
     const socket = socketRef.current;
@@ -1589,6 +1644,15 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
         </button>
       </div>
       <div className={`terminal-notice${terminalNotice ? '' : ' terminal-notice-empty'}`}>{terminalNotice ?? '\u00a0'}</div>
+      {session.agent === 'codex' && watchStatus ? (
+        <div className="terminal-watch-status" role="status">
+          <span>会话巡检：{terminalWatchLabel[watchStatus.status]}{watchStatus.goalStatus === 'active' ? ' · Goal' : ''}</span>
+          {watchStatus.attempts ? <span>恢复尝试 {watchStatus.attempts}/3</span> : null}
+          {watchStatus.providerHealthy === false ? <span>请求渠道：{watchStatus.providerReason ?? '不可用'}</span> : null}
+          {watchStatus.lastCheckedAt ? <time>检查于 {formatDate(watchStatus.lastCheckedAt)}</time> : null}
+          {watchStatus.status === 'waiting-for-user' ? <button type="button" onClick={() => void resetWatch()}>人工处理后恢复巡检</button> : null}
+        </div>
+      ) : null}
       {errorLogOpen ? (
         <div className="terminal-error-log" role="log" aria-label="终端错误日志">
           <button type="button" onClick={() => void loadTerminalErrors()}>刷新日志</button>
