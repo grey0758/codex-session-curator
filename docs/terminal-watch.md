@@ -24,7 +24,10 @@ Recovery requires all of the following:
    stops recovery.
 3. The session is neither explicitly paused nor manually interrupted (including
    `Conversation interrupted - use /feedback if something went wrong`), and
-   Codex is not already retrying.
+   Codex is not already retrying. Codex's own `Automatic reconnect could not
+   restore this session` / `Server connection could not be restored` state
+   requires the user to preserve any editable draft and reconnect the CLI;
+   the monitor does not send a message into that state.
 4. A small authenticated request to that user's configured model and Responses
    endpoint succeeds. A failed/limited/unavailable channel postpones recovery.
 

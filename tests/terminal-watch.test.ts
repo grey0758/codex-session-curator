@@ -31,6 +31,7 @@ test('recovery gates require an idle prompt, an unfinished task, and a confirmed
   const now = Date.now();
   assert.equal(recoveryDecision(state(), observation(), now), 'health');
   assert.equal(recoveryDecision(state(), observation({ status: 'manual-paused' }), now), 'skip');
+  assert.equal(recoveryDecision(state(), observation({ status: 'client-connection-failed' }), now), 'skip');
   assert.equal(recoveryDecision(state(), observation({ upstreamError: false }), now), 'skip');
   assert.equal(recoveryDecision(state(), observation({ promptVisible: false }), now), 'skip');
   assert.equal(recoveryDecision(state(), observation({ lastActivityAt: ago(30_000) }), now), 'skip');
@@ -265,6 +266,19 @@ test('real probe distinguishes a manual interruption from an upstream failure', 
     ].join('\n'));
     const successful = await inspect('■ HTTP 503 Service Unavailable\n› ');
     assert.equal(successful.failedComplete, false);
+
+    await writeFile(filePath, [
+      event('task_started', started),
+      event('item_completed', ago(8 * 60_000)),
+    ].join('\n'));
+    const clientFailure = await inspect('■ Automatic reconnect could not restore this session. Your draft is still editable.\n■ Server connection could not be restored\n› ');
+    assert.equal(clientFailure.status, 'client-connection-failed');
+    assert.equal(recoveryDecision(state(), { ...clientFailure, pane: true, taskStartedAt: started, lastActivityAt: ago(8 * 60_000), upstreamError: true }, Date.now()), 'skip');
+    const { stdout } = await execFileAsync('python3', [join(process.cwd(), 'server/terminal-watch-probe.py'),
+      'send', session.id, filePath, started, '继续'], {
+      env: { ...process.env, PATH: `${binaryDir}:${process.env.PATH}`, CURATOR_WATCH_TEST_PANE: '■ Server connection could not be restored\n› ' },
+    });
+    assert.deepEqual(JSON.parse(stdout), { sent: false, reason: 'state-changed' });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

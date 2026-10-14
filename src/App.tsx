@@ -591,7 +591,7 @@ interface RemoteAgentStatus {
 type TerminalStatus = 'disconnected' | 'connecting' | 'connected' | 'codex-running';
 
 interface TerminalWatchStatus {
-  status: 'checking' | 'running' | 'idle' | 'manual-paused' | 'closed' | 'upstream-unhealthy' |
+  status: 'checking' | 'running' | 'idle' | 'manual-paused' | 'client-connection-failed' | 'closed' | 'upstream-unhealthy' |
     'suspected-upstream-error' | 'recovering' | 'recovered' | 'waiting-for-user' | 'unknown';
   goalStatus: string | null;
   attempts: number;
@@ -604,6 +604,7 @@ interface TerminalWatchStatus {
 
 const terminalWatchLabel: Record<TerminalWatchStatus['status'], string> = {
   checking: '巡检中', running: '任务中', idle: '待命', 'manual-paused': '人工暂停',
+  'client-connection-failed': 'Codex 内部连接失败，需人工重连',
   closed: '会话已退出', 'upstream-unhealthy': '上游暂不可用',
   'suspected-upstream-error': '等待确认异常', recovering: '已发送恢复指令',
   recovered: '恢复成功', 'waiting-for-user': '等待人工处理', unknown: '状态未知',
@@ -1649,6 +1650,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
           <span>会话巡检：{terminalWatchLabel[watchStatus.status]}{watchStatus.goalStatus === 'active' ? ' · Goal' : ''}</span>
           {watchStatus.attempts ? <span>恢复尝试 {watchStatus.attempts}/3</span> : null}
           {watchStatus.providerHealthy === false ? <span>请求渠道：{watchStatus.providerReason ?? '不可用'}</span> : null}
+          {watchStatus.status === 'client-connection-failed' ? <span>请先复制未发送的草稿，再按 Codex 提示退出并重连；巡检不会发送消息。</span> : null}
           {watchStatus.lastCheckedAt ? <time>检查于 {formatDate(watchStatus.lastCheckedAt)}</time> : null}
           {watchStatus.status === 'waiting-for-user' ? <button type="button" onClick={() => void resetWatch()}>人工处理后恢复巡检</button> : null}
         </div>

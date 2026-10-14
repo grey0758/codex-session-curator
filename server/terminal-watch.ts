@@ -19,7 +19,7 @@ const RETRY_MS = 180_000;
 const MAX_ATTEMPTS = 3;
 
 type MonitoredSession = Pick<CodexSession, 'id' | 'agent' | 'machineId' | 'filePath'>;
-type WatchStatus = 'checking' | 'running' | 'idle' | 'manual-paused' | 'closed' | 'upstream-unhealthy' |
+type WatchStatus = 'checking' | 'running' | 'idle' | 'manual-paused' | 'client-connection-failed' | 'closed' | 'upstream-unhealthy' |
   'suspected-upstream-error' | 'recovering' | 'recovered' | 'waiting-for-user' | 'unknown';
 
 interface Probe {
@@ -72,7 +72,8 @@ function laterThan(value: string | undefined | null, reference: string | undefin
 }
 
 export function recoveryDecision(record: WatchRecord, probe: Probe, now: number): 'skip' | 'confirm' | 'health' | 'blocked' {
-  if (!probe.pane || probe.status === 'closed' || probe.status === 'manual-paused' || probe.status === 'retrying') return 'skip';
+  if (!probe.pane || probe.status === 'closed' || probe.status === 'manual-paused' ||
+      probe.status === 'client-connection-failed' || probe.status === 'retrying') return 'skip';
   if (!probe.upstreamError || !probe.promptVisible ||
       (probe.status !== 'running' && !(probe.status === 'idle' && probe.failedComplete))) return 'skip';
   if (!probe.taskStartedAt || (!probe.failedComplete && !laterThan(probe.taskStartedAt, probe.taskCompleteAt))) return 'skip';
@@ -276,7 +277,11 @@ export class TerminalWatch {
       }
       const decision = recoveryDecision(record, probe, now);
       if (decision === 'skip') {
-        record.status = probe.status === 'manual-paused' ? 'manual-paused' : probe.status === 'closed' ? 'closed' : probe.status === 'idle' ? 'idle' : probe.status === 'running' || probe.status === 'retrying' ? 'running' : 'unknown';
+        record.status = probe.status === 'manual-paused' ? 'manual-paused' :
+          probe.status === 'client-connection-failed' ? 'client-connection-failed' :
+          probe.status === 'closed' ? 'closed' : probe.status === 'idle' ? 'idle' :
+          probe.status === 'running' || probe.status === 'retrying' ? 'running' : 'unknown';
+        if (probe.status === 'client-connection-failed') record.lastReason = 'codex-client-reconnect-failed';
         if (!probe.upstreamError) {
           record.suspectedAt = null;
           record.providerHealthy = null;

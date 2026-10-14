@@ -39,6 +39,9 @@ def inspect(session_id, file_path):
     last_lines = [line.strip() for line in screen.splitlines() if line.strip()]
     manual_banner = bool(re.search(r"Conversation interrupted\s*[-–]\s*use /feedback", "\n".join(last_lines[-45:]), re.I))
     screen_tail = "\n".join(last_lines[-16:])
+    client_connection_failed = bool(re.search(
+        r"Automatic reconnect could not restore this session|Server connection could not be restored",
+        screen_tail, re.I))
     upstream_error = bool(re.search(
         r"stream disconnected|connection reset|connection refused|network error|upstream.*(?:error|failed)|"
         r"(?:HTTP|status)\s*(?:429|500|502|503|504)\b|rate limit|service unavailable|"
@@ -96,6 +99,8 @@ def inspect(session_id, file_path):
         status = "manual-paused"
     elif manual:
         status = "manual-paused"
+    elif client_connection_failed:
+        status = "client-connection-failed"
     elif retrying:
         status = "retrying"
     elif task_started and task_started > max(task_complete, aborted):
@@ -170,7 +175,8 @@ def main():
         current = inspect(session_id, file_path)
         error_confirmed = current.get("upstreamError") or (expected_diagnostic and current.get("diagnostic") == expected_diagnostic)
         if (current.get("taskStartedAt") != expected_task or not error_confirmed or
-                not current.get("promptVisible") or current.get("status") in ("closed", "manual-paused", "retrying")):
+                not current.get("promptVisible") or current.get("status") in
+                ("closed", "manual-paused", "client-connection-failed", "retrying")):
             emit({"sent": False, "reason": "state-changed"})
             return
         name = "codex-curator-" + session_id
