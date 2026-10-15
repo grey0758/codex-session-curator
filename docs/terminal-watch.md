@@ -11,6 +11,8 @@ Codex JSONL on the owning machine, using the same SSH target/login environment
 as the terminal. The probe returns structured state and, for unknown failures,
 one shortened, redacted diagnostic line. It never returns the pane or session
 transcript to the Hub.
+The probe reports its observation time so recovery progress is compared after
+accounting for clock drift between the Hub and the owning machine.
 
 Recovery requires all of the following:
 

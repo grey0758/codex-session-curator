@@ -26,6 +26,8 @@ interface Probe {
   sessions?: string[];
   pane?: boolean;
   status?: string;
+  observedAt?: string;
+  clockOffsetMs?: number;
   goalStatus?: string | null;
   taskStartedAt?: string;
   taskCompleteAt?: string;
@@ -78,7 +80,7 @@ export function recoveryDecision(record: WatchRecord, probe: Probe, now: number)
       (probe.status !== 'running' && !(probe.status === 'idle' && probe.failedComplete))) return 'skip';
   if (!probe.taskStartedAt || (!probe.failedComplete && !laterThan(probe.taskStartedAt, probe.taskCompleteAt))) return 'skip';
   const lastActivity = Date.parse(probe.lastActivityAt || probe.taskStartedAt);
-  if (!Number.isFinite(lastActivity) || now - lastActivity < QUIET_MS) return 'skip';
+  if (!Number.isFinite(lastActivity) || now - (lastActivity + (probe.clockOffsetMs ?? 0)) < QUIET_MS) return 'skip';
   if (record.pendingAt && now - Date.parse(record.pendingAt) < RETRY_MS) return 'skip';
   if (record.attempts >= MAX_ATTEMPTS) return 'blocked';
   if (!record.suspectedAt || now - Date.parse(record.suspectedAt) < CONFIRM_MS) return 'confirm';
@@ -235,7 +237,8 @@ export class TerminalWatch {
       record.goalStatus = probe.goalStatus ?? null;
       record.taskStartedAt = probe.taskStartedAt || null;
       record.lastActivityAt = probe.lastActivityAt || null;
-      if (record.blockedAt && laterThan(probe.lastUserAt, record.blockedAt)) {
+      const remoteTime = (timestamp: string | undefined) => Date.parse(timestamp ?? '') + (probe.clockOffsetMs ?? 0);
+      if (record.blockedAt && remoteTime(probe.lastUserAt) > Date.parse(record.blockedAt)) {
         record.attempts = 0;
         record.blockedAt = null;
         record.pendingAt = null;
@@ -243,11 +246,12 @@ export class TerminalWatch {
         record.awaitingErrorClear = false;
         record.lastReason = 'new-user-task';
       }
-      // Codex can append task_started while send-keys is still returning. Allow that small overlap.
+      // Remote clocks can drift; compare rollout timestamps in the Hub clock domain.
+      // Codex can append task_started while send-keys is returning, so allow a small overlap.
       const sustainedProgress = record.pendingAt &&
-        Date.parse(probe.taskStartedAt ?? '') >= Date.parse(record.pendingAt) - 5_000 &&
-        Date.parse(probe.lastActivityAt ?? '') - Date.parse(record.pendingAt) > 60_000;
-      if (record.pendingAt && ((laterThan(probe.taskCompleteAt, record.pendingAt) && !probe.failedComplete) || sustainedProgress)) {
+        remoteTime(probe.taskStartedAt) >= Date.parse(record.pendingAt) - 5_000 &&
+        remoteTime(probe.lastActivityAt) - Date.parse(record.pendingAt) > 60_000;
+      if (record.pendingAt && ((remoteTime(probe.taskCompleteAt) > Date.parse(record.pendingAt) && !probe.failedComplete) || sustainedProgress)) {
         record.attempts = 0;
         record.pendingAt = null;
         record.suspectedAt = null;
@@ -352,6 +356,7 @@ export async function runProbe(session: MonitoredSession, mode: 'inspect' | 'hea
   const localMachineId = process.env.CURATOR_MACHINE_ID || hostname().split('.')[0];
   if (!target.remote && session.machineId !== localMachineId) return { status: 'unknown', reason: 'remote-target-unavailable' };
   const command = `exec "\${SHELL:-/bin/bash}" -lc ${shellQuote(`python3 -c "import base64;exec(base64.b64decode('${probeCode}'))" ${[mode, session.id, session.filePath, ...args].map(shellQuote).join(' ')}`)}`;
+  const probeStartedAt = Date.now();
   let executable: string;
   let argv: string[];
   if (target.remote && target.sshTarget) {
@@ -368,5 +373,10 @@ export async function runProbe(session: MonitoredSession, mode: 'inspect' | 'hea
   });
   const line = stdout.trim().split('\n').at(-1);
   if (!line) throw new Error('Probe returned no result');
-  return JSON.parse(line) as Probe;
+  const probe = JSON.parse(line) as Probe;
+  if (mode === 'inspect' && probe.observedAt) {
+    const remoteObservedAt = Date.parse(probe.observedAt);
+    if (Number.isFinite(remoteObservedAt)) probe.clockOffsetMs = Math.round((probeStartedAt + Date.now()) / 2 - remoteObservedAt);
+  }
+  return probe;
 }

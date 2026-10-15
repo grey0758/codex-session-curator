@@ -4,6 +4,7 @@ Only structured status leaves this process. No transcript or pane text is return
 """
 
 import json
+import datetime
 import os
 import pathlib
 import re
@@ -116,6 +117,7 @@ def inspect(session_id, file_path):
     )
     return {
         "pane": True, "status": status, "goalStatus": goal,
+        "observedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "taskStartedAt": task_started, "taskCompleteAt": task_complete,
         "abortedAt": aborted, "lastActivityAt": last_activity, "lastUserAt": last_user,
         "upstreamError": upstream_error, "promptVisible": prompt,

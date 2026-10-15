@@ -162,7 +162,7 @@ test('an accepted recovery is not sent again while the old error remains on scre
   let recoveredTaskStartedAt = '';
   const watcher = new TerminalWatch(join(dir, 'state.json'), async (_session, mode) => {
     if (mode === 'inspect') return observation(recovered ? {
-      taskStartedAt: recoveredTaskStartedAt, lastActivityAt: ago(60_000),
+      taskStartedAt: recoveredTaskStartedAt, lastActivityAt: ago(60_000), clockOffsetMs: 11_000,
     } : {});
     if (mode === 'health') return { healthy: true, reason: 'ok' };
     sent += 1;
@@ -175,7 +175,7 @@ test('an accepted recovery is not sent again while the old error remains on scre
     await watcher.scan();
     assert.equal(sent, 1);
     record.pendingAt = ago(4 * 60_000);
-    recoveredTaskStartedAt = new Date(Date.parse(record.pendingAt) - 8).toISOString();
+    recoveredTaskStartedAt = new Date(Date.parse(record.pendingAt) - 11_008).toISOString();
     recovered = true;
     await watcher.scan();
     assert.equal(watcher.get(session)?.status, 'recovered');
