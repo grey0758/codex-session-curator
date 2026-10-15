@@ -13,6 +13,7 @@ const agent = process.env.CURATOR_TERMINAL_VERIFY_AGENT === 'claude' ? 'claude' 
 const machineId = process.env.CURATOR_TERMINAL_VERIFY_MACHINE_ID || 'gpl001';
 const sshTarget = process.env.CURATOR_TERMINAL_VERIFY_SSH_TARGET || '';
 const sshCommand = process.env.CURATOR_TERMINAL_VERIFY_SSH_COMMAND || 'ssh';
+const ownerUser = process.env.CURATOR_TERMINAL_VERIFY_OWNER_USER || '';
 const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
 const tmuxSession = `${agent}-curator-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)}`;
 const probeText = process.env.CURATOR_TERMINAL_VERIFY_PROBE || `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
@@ -79,12 +80,15 @@ async function cdpCall(ws, id, method, params = {}) {
 }
 
 function runTmux(args) {
+  const command = ownerUser
+    ? ['sudo', '-n', '-iu', ownerUser, 'tmux', '-L', tmuxSocket, ...args]
+    : ['tmux', '-L', tmuxSocket, ...args];
   if (sshTarget) {
     const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
-    const remoteCommand = ['tmux', '-L', tmuxSocket, ...args].map(quote).join(' ');
+    const remoteCommand = command.map(quote).join(' ');
     return execFileSync(sshCommand, [sshTarget, remoteCommand], { encoding: 'utf8' });
   }
-  return execFileSync('tmux', ['-L', tmuxSocket, ...args], { encoding: 'utf8' });
+  return execFileSync(command[0], command.slice(1), { encoding: 'utf8' });
 }
 
 function tmuxClients() {
@@ -122,7 +126,6 @@ async function main() {
   targetUrl.searchParams.set('agent', agent);
   targetUrl.searchParams.set('admin_token', token);
 
-  detachSessionClients();
   const chrome = spawn(
     chromeBin,
     [
@@ -358,7 +361,6 @@ async function main() {
     ws.close();
     await delay(300);
     const clients = tmuxClients();
-    detachSessionClients();
 
     const expectedStatus = `${agent === 'claude' ? 'Claude' : 'Codex'} 运行中`;
     const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);

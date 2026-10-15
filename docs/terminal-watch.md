@@ -11,6 +11,11 @@ Codex JSONL on the owning machine, using the same SSH target/login environment
 as the terminal. The probe returns structured state and, for unknown failures,
 one shortened, redacted diagnostic line. It never returns the pane or session
 transcript to the Hub.
+For sessions owned by another OS user, both the browser terminal and probe run
+under that user's login account and isolated tmux socket. Opening a terminal
+registers it for the next scheduled inspection without a second synchronous
+probe; the browser only polls the current watch status. Local gpl001 probes
+skip the loopback SSH hop.
 The probe reports its observation time so recovery progress is compared after
 accounting for clock drift between the Hub and the owning machine.
 

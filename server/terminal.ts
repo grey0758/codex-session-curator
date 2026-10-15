@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { spawn as spawnPty } from 'node-pty';
 import type { CodexSession } from './types.js';
+import { getSessionRoots } from './file-ops.js';
 
 export interface TerminalMessage {
   type: 'ready' | 'output' | 'exit' | 'error';
@@ -47,6 +48,16 @@ function shellQuote(value: string): string {
 
 function shellCommandWord(value: string): string {
   return /^[a-zA-Z0-9_./-]+$/.test(value) ? value : shellQuote(value);
+}
+
+export function terminalSessionOwner(session: Pick<CodexSession, 'filePath'> & { ownerUser?: string }): string | null {
+  const roots = getSessionRoots();
+  const root = roots.find((entry) =>
+    session.filePath.startsWith(`${entry.sessionsRoot}/`) ||
+    session.filePath.startsWith(`${entry.claudeProjectsRoot}/`));
+  const owner = root?.ownerUser ?? session.ownerUser;
+  if (!owner || !/^[a-z_][a-z0-9_-]*[$]?$/i.test(owner)) return null;
+  return owner === roots[0]?.ownerUser ? null : owner;
 }
 
 function envNameForMachine(prefix: string, machineId: string | null | undefined): string | null {
@@ -375,7 +386,10 @@ export function remoteAgentCommand(
     `exec ${resumeCommand}`,
   ].join('\n');
 
-  return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
+  const owner = terminalSessionOwner(session);
+  return owner
+    ? `exec sudo -n -iu ${shellQuote(owner)} bash -lc ${shellQuote(script)}`
+    : `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
 }
 
 function createSshAgentPty(

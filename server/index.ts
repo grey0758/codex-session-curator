@@ -5747,7 +5747,7 @@ app.get('/api/sessions/:id/terminal', { websocket: true }, async (socket, reques
   }
 
   if (terminalWatch && routed.session.agent === 'codex') {
-    void terminalWatch.watch(routed.session).catch((error) => request.log.warn({ error }, 'Terminal watch registration failed'));
+    void terminalWatch.watch(routed.session, false).catch((error) => request.log.warn({ error }, 'Terminal watch registration failed'));
   }
 
   const terminal = startCodexTerminal(routed.session, (message) => {

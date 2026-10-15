@@ -154,6 +154,17 @@ test('remote resume uses the target login shell without forwarding panel configu
   assert.doesNotMatch(command, /terminal-codex\.env|curator-terminal|model_provider|--model|secret-must-not-appear/);
 });
 
+test('a session owned by ds resumes inside the ds login and tmux environment', () => {
+  const target = session('codex');
+  target.ownerUser = 'ds';
+  target.filePath = '/home/ds/.codex/sessions/2026/10/15/rollout-owned.jsonl';
+  target.machineId = 'gpl001';
+  const command = remoteAgentCommand(target, 160, 42);
+  assert.match(command, /exec sudo -n -iu 'ds' bash -lc/);
+  assert.match(command, /codex resume/);
+  assert.match(command, /tmux/);
+});
+
 test('remote resume without a recorded cwd uses the target grey home', () => {
   const target = session('codex');
   target.cwd = null;

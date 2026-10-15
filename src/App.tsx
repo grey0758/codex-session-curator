@@ -1237,12 +1237,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
 
   useEffect(() => {
     if (!active || session.agent !== 'codex') return;
-    const start = window.setTimeout(() => {
-      void fetch(watchUrl, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ machineId: session.machineId, agent: session.agent }),
-      }).then(() => loadWatchStatus()).catch(() => {});
-    }, 1500);
+    const start = window.setTimeout(() => { void loadWatchStatus(); }, 1500);
     const interval = window.setInterval(() => { if (!document.hidden) void loadWatchStatus(); }, 15_000);
     return () => { window.clearTimeout(start); window.clearInterval(interval); };
   }, [active, loadWatchStatus, session.agent, session.machineId, watchUrl]);
@@ -1557,7 +1552,13 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       if (message.type === 'exit') {
         terminal.writeln(`\r\n[exit] code=${message.code ?? 'null'} signal=${message.signal ?? 'null'}`);
         setTerminalStatus('disconnected');
-        socket.close(4000);
+        if (message.code === 0) {
+          manualCloseRef.current = true;
+          setTerminalNotice('会话已退出，可点击重连重新打开');
+          socket.close(1000);
+        } else {
+          socket.close(4000);
+        }
       }
     };
     socket.onclose = (event) => {
@@ -1851,7 +1852,10 @@ function App() {
   const filesOnlyAgent = filesOnlyRoute.agent;
   const isTerminalOnlyPage = Boolean(terminalOnlySessionId);
   const isFilesOnlyPage = Boolean(filesOnlySessionId);
-  const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(null);
+  const [terminalOnlySession, setTerminalOnlySession] = useState<TerminalSessionTarget | null>(() =>
+    terminalOnlySessionId && terminalOnlyMachineId && terminalOnlyAgent
+      ? { id: terminalOnlySessionId, machineId: terminalOnlyMachineId, agent: terminalOnlyAgent, cwd: null }
+      : null);
   const [terminalOnlyLoading, setTerminalOnlyLoading] = useState(
     Boolean(terminalOnlySessionId && terminalOnlyMachineId && terminalOnlyAgent)
   );

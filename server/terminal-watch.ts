@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { promisify } from 'node:util';
 import type { CodexSession } from './types.js';
-import { createTerminalEnv, terminalProbeTarget } from './terminal.js';
+import { createTerminalEnv, terminalProbeTarget, terminalSessionOwner } from './terminal.js';
 import { classifyUnknownTerminalError } from './terminal-watch-ai.js';
 
 const execFileAsync = promisify(execFile);
@@ -18,7 +18,7 @@ const CONFIRM_MS = 60_000;
 const RETRY_MS = 180_000;
 const MAX_ATTEMPTS = 3;
 
-type MonitoredSession = Pick<CodexSession, 'id' | 'agent' | 'machineId' | 'filePath'>;
+type MonitoredSession = Pick<CodexSession, 'id' | 'agent' | 'machineId' | 'filePath'> & { ownerUser?: string };
 type WatchStatus = 'checking' | 'running' | 'idle' | 'manual-paused' | 'client-connection-failed' | 'closed' | 'upstream-unhealthy' |
   'suspected-upstream-error' | 'recovering' | 'recovered' | 'waiting-for-user' | 'unknown';
 
@@ -128,7 +128,7 @@ export class TerminalWatch {
     this.timer = null;
   }
 
-  list(): Array<Omit<WatchRecord, 'session'> & { session: Omit<MonitoredSession, 'filePath'> }> {
+  list(): Array<Omit<WatchRecord, 'session'> & { session: Pick<MonitoredSession, 'id' | 'machineId' | 'agent'> }> {
     return [...this.records.values()].map(({ session, ...rest }) => ({
       ...rest,
       session: { id: session.id, machineId: session.machineId, agent: session.agent },
@@ -154,7 +154,7 @@ export class TerminalWatch {
   async watch(session: CodexSession, inspectNow = true): Promise<void> {
     if (!await this.ensureLeader()) return;
     if (session.agent !== 'codex') return;
-    const identity: MonitoredSession = { id: session.id, agent: session.agent, machineId: session.machineId, filePath: session.filePath };
+    const identity: MonitoredSession = { id: session.id, agent: session.agent, machineId: session.machineId, filePath: session.filePath, ownerUser: session.ownerUser };
     const key = keyOf(identity);
     const existing = this.records.get(key);
     if (existing) {
@@ -176,9 +176,10 @@ export class TerminalWatch {
     const byMachine = new Map<string, CodexSession[]>();
     for (const session of sessions) {
       if (session.agent !== 'codex') continue;
-      const entries = byMachine.get(session.machineId) ?? [];
+      const group = `${session.machineId}|||${terminalSessionOwner(session) ?? ''}`;
+      const entries = byMachine.get(group) ?? [];
       entries.push(session);
-      byMachine.set(session.machineId, entries);
+      byMachine.set(group, entries);
     }
     let registered = 0;
     for (const entries of byMachine.values()) {
@@ -352,14 +353,20 @@ export class TerminalWatch {
 
 export async function runProbe(session: MonitoredSession, mode: 'inspect' | 'health' | 'send' | 'list', args: string[] = []): Promise<Probe> {
   const target = terminalProbeTarget(session);
-  if (target.remote && !target.sshTarget) return { status: 'unknown', reason: 'ssh-target-unavailable' };
   const localMachineId = process.env.CURATOR_MACHINE_ID || hostname().split('.')[0];
+  if (target.remote && !target.sshTarget) return { status: 'unknown', reason: 'ssh-target-unavailable' };
   if (!target.remote && session.machineId !== localMachineId) return { status: 'unknown', reason: 'remote-target-unavailable' };
-  const command = `exec "\${SHELL:-/bin/bash}" -lc ${shellQuote(`python3 -c "import base64;exec(base64.b64decode('${probeCode}'))" ${[mode, session.id, session.filePath, ...args].map(shellQuote).join(' ')}`)}`;
+  const probeCommand = `python3 -c "import base64;exec(base64.b64decode('${probeCode}'))" ${[mode, session.id, session.filePath, ...args].map(shellQuote).join(' ')}`;
+  const owner = terminalSessionOwner(session);
+  const command = owner
+    ? `exec sudo -n -iu ${shellQuote(owner)} bash -lc ${shellQuote(probeCommand)}`
+    : `exec "\${SHELL:-/bin/bash}" -lc ${shellQuote(probeCommand)}`;
   const probeStartedAt = Date.now();
   let executable: string;
   let argv: string[];
-  if (target.remote && target.sshTarget) {
+  // The gpl001 SSH alias points back to this host; local probes avoid dozens of
+  // unnecessary SSH handshakes each minute without changing the terminal path.
+  if (target.remote && target.sshTarget && !(session.machineId === localMachineId && target.sshTarget === 'curator-localhost')) {
     executable = target.sshCommand;
     argv = target.hostFirst ? [target.sshTarget, command] : [
       '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', target.sshTarget, command,
