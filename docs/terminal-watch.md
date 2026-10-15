@@ -16,6 +16,10 @@ under that user's login account and isolated tmux socket. Opening a terminal
 registers it for the next scheduled inspection without a second synchronous
 probe; the browser only polls the current watch status. Local gpl001 probes
 skip the loopback SSH hop.
+The terminal reports ready after the backend has attached; input waits for that
+signal. If a tmux client detaches while its session is still alive, the SSH
+command exits with code 75 and the browser reconnects. A completed tmux session
+exits normally, so the browser leaves it closed until the user clicks reconnect.
 The probe reports its observation time so recovery progress is compared after
 accounting for clock drift between the Hub and the owning machine.
 

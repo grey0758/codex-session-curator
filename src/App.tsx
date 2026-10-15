@@ -1136,6 +1136,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const selectionStartedRef = useRef(false);
   const activeRef = useRef(active);
   const manualCloseRef = useRef(false);
+  const terminalReadyRef = useRef(false);
   const [terminalStatus, setTerminalStatus] = useState<TerminalStatus>('disconnected');
   const [fullscreen, setFullscreen] = useState(false);
   const [terminalNotice, setTerminalNotice] = useState<string | null>(null);
@@ -1181,6 +1182,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       outputFlushTimerRef.current = null;
     }
     pendingOutputRef.current = '';
+    terminalReadyRef.current = false;
     terminalRef.current?.dispose();
     terminalRef.current = null;
     fitRef.current = null;
@@ -1256,8 +1258,8 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const pasteIntoTerminal = useCallback(async () => {
     const socket = socketRef.current;
     const terminal = terminalRef.current;
-    if (!socket || !terminal || socket.readyState !== WebSocket.OPEN) {
-      setTerminalNotice('终端未连接');
+    if (!socket || !terminal || socket.readyState !== WebSocket.OPEN || !terminalReadyRef.current) {
+      setTerminalNotice('会话尚未就绪，请稍候再粘贴');
       return;
     }
     try {
@@ -1297,6 +1299,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
   const connect = useCallback(() => {
     if (!containerRef.current || socketRef.current) return;
     manualCloseRef.current = false;
+    terminalReadyRef.current = false;
     setTerminalStatus('connecting');
     setTerminalNotice(null);
     const terminal = new XTerm({
@@ -1363,6 +1366,10 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
     const container = containerRef.current;
     const writeInput = (data: string) => {
       if (socket.readyState === WebSocket.OPEN) {
+        if (!terminalReadyRef.current) {
+          setTerminalNotice('正在启动会话，请稍候再输入');
+          return;
+        }
         if (!data.startsWith('\u001b[<')) awaitingOutputSinceRef.current = Date.now();
         socket.send(JSON.stringify({ type: 'input', data }));
       }
@@ -1509,7 +1516,7 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
       if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
       openTimerRef.current = null;
       connectedAt = Date.now();
-      setTerminalStatus('connected');
+      setTerminalNotice('SSH 已连接，正在启动会话...');
       runFit();
       sendResize(terminal.cols || 120, terminal.rows || 40);
       heartbeatRef.current = window.setInterval(() => {
@@ -1546,7 +1553,9 @@ function TerminalConsole({ session, active, onClose }: { session: TerminalSessio
         queueOutput(message.data);
       }
       if (message.type === 'ready' && message.data) {
+        terminalReadyRef.current = true;
         setTerminalStatus('codex-running');
+        setTerminalNotice(null);
       }
       if (message.type === 'error') terminal.writeln(`\r\n[error] ${message.data ?? 'unknown error'}`);
       if (message.type === 'exit') {

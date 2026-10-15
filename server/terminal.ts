@@ -381,7 +381,12 @@ export function remoteAgentCommand(
     `  tmux_cmd unbind-key -T root MouseDown3Pane >/dev/null 2>&1 || true`,
     `  tmux_cmd unbind-key -T root M-MouseDown3Pane >/dev/null 2>&1 || true`,
     `  tmux_cmd resize-window -t ${shellQuote(tmuxName)} -x ${shellQuote(String(cols))} -y ${shellQuote(String(rows))} >/dev/null 2>&1 || true`,
-    `  exec tmux -L "$TMUX_SOCKET" attach-session -t ${shellQuote(tmuxName)}`,
+    '  attach_status=0',
+    `  tmux -L "$TMUX_SOCKET" attach-session -t ${shellQuote(tmuxName)} || attach_status=$?`,
+    // A detached client leaves the tmux session alive. Use a distinct exit
+    // code so the browser reconnects; an ended agent removes the session.
+    `  if tmux_cmd has-session -t ${shellQuote(tmuxName)} 2>/dev/null; then exit 75; fi`,
+    '  exit "$attach_status"',
     'fi',
     `exec ${resumeCommand}`,
   ].join('\n');
