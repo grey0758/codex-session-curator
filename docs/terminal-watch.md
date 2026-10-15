@@ -21,7 +21,9 @@ Recovery requires all of the following:
 2. The terminal shows an upstream/transport failure and an input prompt. A
    second scan confirms the failure at least one minute later. Unknown error
    text may be classified by the configured DeepSeek endpoint; uncertainty
-   stops recovery.
+   stops recovery. A Codex `unexpected status 403 Forbidden` response is
+   eligible only after a fresh authenticated request to that user's configured
+   model succeeds; an unhealthy channel remains on hold.
 3. The session is neither explicitly paused nor manually interrupted (including
    `Conversation interrupted - use /feedback if something went wrong`), and
    Codex is not already retrying. Codex's own `Automatic reconnect could not

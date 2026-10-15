@@ -270,6 +270,17 @@ test('real probe distinguishes a manual interruption from an upstream failure', 
     await writeFile(filePath, [
       event('task_started', started),
       event('item_completed', ago(8 * 60_000)),
+      event('task_complete', ago(4 * 60_000)),
+    ].join('\n'));
+    const forbidden = await inspect('■ unexpected status 403 Forbidden\n› ');
+    assert.equal(forbidden.status, 'idle');
+    assert.equal(forbidden.upstreamError, true);
+    assert.equal(forbidden.failedComplete, true);
+    assert.equal(recoveryDecision(state(), { ...forbidden, pane: true, taskStartedAt: started, lastActivityAt: ago(8 * 60_000), taskCompleteAt: ago(4 * 60_000) }, Date.now()), 'health');
+
+    await writeFile(filePath, [
+      event('task_started', started),
+      event('item_completed', ago(8 * 60_000)),
     ].join('\n'));
     const clientFailure = await inspect('■ Automatic reconnect could not restore this session. Your draft is still editable.\n■ Server connection could not be restored\n› ');
     assert.equal(clientFailure.status, 'client-connection-failed');

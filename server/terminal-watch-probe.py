@@ -44,7 +44,9 @@ def inspect(session_id, file_path):
         screen_tail, re.I))
     upstream_error = bool(re.search(
         r"stream disconnected|connection reset|connection refused|network error|upstream.*(?:error|failed)|"
-        r"(?:HTTP|status)\s*(?:429|500|502|503|504)\b|rate limit|service unavailable|"
+        r"(?:HTTP|status)\s*(?:429|500|502|503|504)\b|"
+        r"(?:unexpected\s+status|HTTP\s+status)\s*:?\s*403\s+Forbidden\b|"
+        r"rate limit|service unavailable|"
         r"request timed out|transport error|error sending request", screen_tail, re.I))
     retrying = bool(re.search(r"\bretrying\b|正在重试", "\n".join(last_lines[-5:]), re.I))
     prompt = bool(re.search(r"(?:^|\s)[›❯](?:\s|$)|^>(?:\s|$)", "\n".join(last_lines[-10:]), re.M))
