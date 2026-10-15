@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ const sshCommand = process.env.CURATOR_TERMINAL_VERIFY_SSH_COMMAND || 'ssh';
 const ownerUser = process.env.CURATOR_TERMINAL_VERIFY_OWNER_USER || '';
 const tmuxSocket = process.env.CURATOR_TERMINAL_VERIFY_TMUX_SOCKET || 'codex-curator';
 const tmuxSession = `${agent}-curator-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)}`;
-const probeText = process.env.CURATOR_TERMINAL_VERIFY_PROBE || `CURATOR_TERMINAL_E2E_${'abcdefghij'.repeat(18)}`;
+const probeText = process.env.CURATOR_TERMINAL_VERIFY_PROBE || `CURATOR_TERMINAL_E2E_${randomUUID().replaceAll('-', '').repeat(5)}`;
 const submitProbe = process.env.CURATOR_TERMINAL_VERIFY_SUBMIT === '1';
 
 function readAdminToken() {
@@ -233,8 +234,6 @@ async function main() {
     await cdpCall(ws, id++, 'Runtime.enable');
     await cdpCall(ws, id++, 'Page.enable');
     await cdpCall(ws, id++, 'Network.enable');
-    await delay(Number(process.env.CURATOR_TERMINAL_VERIFY_WAIT_MS || 9000));
-
     async function evaluate(expression) {
       const result = await cdpCall(ws, id++, 'Runtime.evaluate', {
         expression,
@@ -243,6 +242,15 @@ async function main() {
       });
       return result.result.value;
     }
+
+    const readyDeadline = Date.now() + Number(process.env.CURATOR_TERMINAL_VERIFY_READY_TIMEOUT_MS || 30000);
+    const expectedStatus = `${agent === 'claude' ? 'Claude' : 'Codex'} 运行中`;
+    while (Date.now() < readyDeadline) {
+      const status = await evaluate(`document.querySelector('.terminal-toolbar span')?.textContent || ''`);
+      if (status.includes(expectedStatus)) break;
+      await delay(250);
+    }
+    await delay(Number(process.env.CURATOR_TERMINAL_VERIFY_WAIT_MS || 500));
 
     const before = await evaluate(`(() => {
       const q = (selector) => document.querySelector(selector);
@@ -362,7 +370,6 @@ async function main() {
     await delay(300);
     const clients = tmuxClients();
 
-    const expectedStatus = `${agent === 'claude' ? 'Claude' : 'Codex'} 运行中`;
     const statusOk = before.status.includes(expectedStatus) && after.status.includes(expectedStatus);
     const inputOk = after.bodyTail.includes('CURATOR_TERMINAL_E2E_') || probeVisibleInTmux || submittedMarkerRecorded;
     const disconnected = `${before.status}\n${after.status}`.includes('断开');
