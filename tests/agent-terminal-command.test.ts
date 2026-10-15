@@ -161,8 +161,11 @@ test('a session owned by ds resumes inside the ds login and tmux environment', (
   target.machineId = 'gpl001';
   const command = remoteAgentCommand(target, 160, 42);
   assert.match(command, /exec sudo -n -iu 'ds' bash -lc/);
-  assert.match(command, /codex resume/);
-  assert.match(command, /tmux/);
+  const encoded = command.match(/printf %s ([A-Za-z0-9+/=]+) \| base64 -d/)?.[1];
+  assert.ok(encoded);
+  const script = Buffer.from(encoded, 'base64').toString();
+  assert.match(script, /codex resume/);
+  assert.match(script, /tmux/);
 });
 
 test('remote resume without a recorded cwd uses the target grey home', () => {

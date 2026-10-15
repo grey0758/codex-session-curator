@@ -387,9 +387,13 @@ export function remoteAgentCommand(
   ].join('\n');
 
   const owner = terminalSessionOwner(session);
-  return owner
-    ? `exec sudo -n -iu ${shellQuote(owner)} bash -lc ${shellQuote(script)}`
-    : `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
+  if (owner) {
+    // sudo -i passes the command through the target user's login shell once
+    // more. Encode the script so its nested tmux/Codex quotes survive that hop.
+    const encodedScript = Buffer.from(script).toString('base64');
+    return `exec sudo -n -iu ${shellQuote(owner)} bash -lc ${shellQuote(`eval "$(printf %s ${encodedScript} | base64 -d)"`)}`;
+  }
+  return `exec "\${SHELL:-/bin/bash}" -l -c ${shellQuote(script)}`;
 }
 
 function createSshAgentPty(
